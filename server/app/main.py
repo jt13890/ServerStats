@@ -1,9 +1,11 @@
 """ServerStats web app."""
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,10 +19,27 @@ from .schema import normalize
 from .ssh_poller import AGENT_SCRIPT, SSHPoller, load_or_create_key
 from .store import Store
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 STATIC = Path(__file__).parent / "static"
 INSTALL_SH = AGENT_SCRIPT.parent / "install.sh"
 MAX_INGEST_BYTES = 4 * 1024 * 1024
+
+# The agent this server hands out: agents update to it when you ask them to.
+_agent_code = AGENT_SCRIPT.read_bytes()
+AGENT_SHA256 = hashlib.sha256(_agent_code).hexdigest()
+AGENT_VERSION = re.search(rb'^VERSION = "([0-9.]+)"', _agent_code, re.M).group(1).decode()
+# State-changing UI requests must carry this header. Browsers won't send a
+# custom header cross-site without a CORS preflight (which we never allow), so
+# another site can't trigger updates through a signed-in user's browser.
+ACTION_HEADER = "X-ServerStats-Action"
+MAX_UPDATE_OFFERS = 3
+
+
+def _version_tuple(v: str | None) -> tuple:
+    try:
+        return tuple(int(x) for x in (v or "").split("."))
+    except ValueError:
+        return ()
 
 # Paths that must stay reachable without the SSO session. Agents use a
 # per-host bearer token instead. Mirror these in Authentik's
@@ -47,6 +66,9 @@ async def lifespan(app: FastAPI):
 
     app.state.conf = conf
     app.state.store = store
+    # host -> times the update was offered; it's offered on each report until
+    # the agent runs the new version, at most MAX_UPDATE_OFFERS times.
+    app.state.update_pending = {}
     app.state.public_key = key.export_public_key("openssh").decode().strip()
     poller.start()
 
@@ -132,6 +154,9 @@ def _summary(request: Request, host: cfg.Host, with_processes: bool = False) -> 
         error=st.error if st.error and (st.received_at is None or st.error_at > st.received_at) else None,
         host_key=st.host_key,
         server_time=now,
+        update_pending=host.name in request.app.state.update_pending,
+        update_available=host.mode == "agent" and bool(data)
+        and _version_tuple(data.get("agent_version")) < _version_tuple(AGENT_VERSION),
     )
     if with_processes:
         out["processes"] = data.get("processes") or []
@@ -157,6 +182,7 @@ async def meta(request: Request):
         "ssh_public_key": request.app.state.public_key,
         "stale_after": settings.stale_after,
         "retention_days": settings.retention_days,
+        "agent_version": AGENT_VERSION,
     }
 
 
@@ -183,6 +209,53 @@ async def get_trends(request: Request):
     trends = request.app.state.store.trends()
     trends["hosts"] = {k: v for k, v in trends["hosts"].items() if k in known}
     return trends
+
+
+def _require_action_header(request: Request) -> None:
+    if request.headers.get(ACTION_HEADER) != "1":
+        raise HTTPException(403, f"missing {ACTION_HEADER} header")
+
+
+def _request_update(request: Request, host: cfg.Host) -> str | None:
+    """Queue an update; returns why it can't be done, or None."""
+    data = request.app.state.store.state(host.name).data or {}
+    if host.mode != "agent":
+        return "SSH hosts run the collector installed on them; rerun the installer there to update it"
+    if not data:
+        return "this agent hasn't reported yet"
+    if _version_tuple(data.get("agent_version")) >= _version_tuple(AGENT_VERSION):
+        return "already up to date"
+    if data.get("update_failed") == AGENT_VERSION:
+        return f"{AGENT_VERSION} failed to start on this host before; check its log, then rerun the installer to retry"
+    if not data.get("updates"):
+        return "this agent doesn't accept remote updates (installed with --no-updates, or older than 1.2.0); rerun the installer on it"
+    request.app.state.update_pending[host.name] = 0
+    return None
+
+
+@app.post("/api/hosts/{name}/update")
+async def update_host(request: Request, name: str):
+    _require_action_header(request)
+    reason = _request_update(request, _host_or_404(request, name))
+    if reason:
+        raise HTTPException(409, reason)
+    return {"ok": True, "pending": True}
+
+
+@app.post("/api/update-agents")
+async def update_all(request: Request):
+    """Queue updates for every outdated agent that accepts them."""
+    _require_action_header(request)
+    queued, skipped = [], {}
+    for host in request.app.state.conf.hosts:
+        if host.mode != "agent":
+            continue
+        reason = _request_update(request, host)
+        if reason is None:
+            queued.append(host.name)
+        elif reason != "already up to date":
+            skipped[host.name] = reason
+    return {"queued": queued, "skipped": skipped}
 
 
 # -- agent endpoints (bypass SSO, token-authenticated) ---------------------
@@ -217,8 +290,19 @@ async def ingest(request: Request):
     if not isinstance(data, dict):
         raise HTTPException(400, "unexpected payload")
 
-    request.app.state.store.record(host.name, normalize(data, request.app.state.conf.settings.max_procs))
-    return {"ok": True, "host": host.name}
+    sample = normalize(data, request.app.state.conf.settings.max_procs)
+    request.app.state.store.record(host.name, sample)
+    reply = {"ok": True, "host": host.name}
+    pending = request.app.state.update_pending
+    if host.name in pending:
+        done = _version_tuple(sample["agent_version"]) >= _version_tuple(AGENT_VERSION)
+        failed = sample["update_failed"] == AGENT_VERSION  # agent won't retry it anyway
+        if done or failed or not sample["updates"] or pending[host.name] >= MAX_UPDATE_OFFERS:
+            pending.pop(host.name)  # done, not possible, or not taking (see update_failed)
+        else:
+            pending[host.name] += 1
+            reply["update"] = {"version": AGENT_VERSION, "sha256": AGENT_SHA256}
+    return reply
 
 
 @app.get("/api/agent/serverstats_agent.py")

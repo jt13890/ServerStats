@@ -122,6 +122,19 @@ async function api(path) {
   return res.json();
 }
 
+// State-changing requests carry this header; the server refuses them without
+// it, which stops other sites from triggering them via a signed-in browser.
+async function apiPost(path) {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { Accept: 'application/json', 'X-ServerStats-Action': '1' },
+    credentials: 'same-origin',
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+  return body;
+}
+
 function connectionLost(lost) {
   $('#conn-banner').hidden = !lost;
 }
@@ -237,9 +250,35 @@ function renderOverview() {
   filter.value = state.hostFilter;
   filter.addEventListener('input', () => { state.hostFilter = filter.value; draw(); });
 
+  const updateBtn = $('#update-all');
+  const updateNote = $('#update-all-note');
+  const updatable = () => state.hosts.filter((x) => x.mode === 'agent' && x.update_available && x.updates && !x.update_pending
+    && !(state.meta && x.update_failed === state.meta.agent_version));
+  updateBtn.addEventListener('click', async () => {
+    const list = updatable();
+    const version = state.meta ? state.meta.agent_version : 'the latest version';
+    if (!list.length || !confirm(`Update ${list.length} agent${list.length > 1 ? 's' : ''} to ${version}?\n\n`
+      + `${list.map((x) => x.name).join(', ')}\n\nThey will download and run the agent code this server provides.`)) return;
+    updateBtn.disabled = true;
+    try {
+      const r = await apiPost('/api/update-agents');
+      const skipped = Object.keys(r.skipped || {});
+      updateNote.textContent = `Update requested for ${r.queued.length}` + (skipped.length ? `; skipped ${skipped.join(', ')}` : '');
+      await refreshHosts();
+      draw();
+    } catch (e) {
+      updateNote.textContent = `Update failed: ${e.message}`;
+    } finally {
+      updateBtn.disabled = false;
+    }
+  });
+
   function draw() {
     const q = state.hostFilter.trim().toLowerCase();
     $('#empty').hidden = state.hosts.length > 0;
+    const n = updatable().length;
+    updateBtn.hidden = n === 0;
+    updateBtn.textContent = `Update agents (${n})`;
     const seen = new Set();
     state.hosts.forEach((host, i) => {
       let card = cards.get(host.name);
@@ -399,8 +438,41 @@ function renderDetail(name) {
     }
   }
 
+  const updateBtn = $('#d-update-btn');
+  updateBtn.addEventListener('click', async () => {
+    const version = state.meta ? state.meta.agent_version : 'the latest version';
+    if (!confirm(`Update ${name}'s agent to ${version}? It will download and run the agent code this server provides.`)) return;
+    updateBtn.disabled = true;
+    try {
+      await apiPost(`/api/hosts/${enc}/update`);
+      await loadHost();
+    } catch (e) {
+      $('#d-update-text').textContent = `Couldn't request the update: ${e.message}`;
+    } finally {
+      updateBtn.disabled = false;
+    }
+  });
+
+  function drawUpdate() {
+    const row = $('#d-update');
+    const latest = state.meta && state.meta.agent_version;
+    let text = '', button = '';
+    if (host.mode === 'agent' && host.agent_version) {
+      if (host.update_failed && host.update_failed === latest) text = `The update to ${latest} failed to start on this host, so it's running ${host.agent_version}. Check its log, then rerun the installer to retry.`;
+      else if (host.update_pending) text = `Update to ${latest} requested; the agent picks it up on its next report.`;
+      else if (host.update_failed) text = `The update to ${host.update_failed} failed to start on this host, so it's running ${host.agent_version}. Check its log.`;
+      else if (host.update_available && host.updates) { text = `Agent ${host.agent_version} · ${latest} is available.`; button = `Update agent to ${latest}`; }
+      else if (host.update_available) text = `Agent ${host.agent_version} · ${latest} is available. This agent doesn't accept remote updates; rerun the installer on the host.`;
+    }
+    row.hidden = !text;
+    $('#d-update-text').textContent = text;
+    updateBtn.hidden = !button;
+    updateBtn.textContent = button;
+  }
+
   function drawHost() {
     markRange();
+    drawUpdate();
     setStatus($('#d-status'), host.status);
     const sub = [
       host.description,

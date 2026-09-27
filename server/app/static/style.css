@@ -317,3 +317,11 @@ td .meter { grid-template-columns: 1fr 52px; }
 .container-row .stack-name { padding-left: 28px; }
 .container-row .stack-name .muted { font-family: var(--mono); font-size: 11.5px; }
 .dialog-docker { margin-top: 16px; }
+
+/* -- agent updates ----------------------------------------------------- */
+.update-row {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin: -6px 0 16px; padding: 8px 12px; border-radius: 8px;
+  background: var(--surface-2); border: 1px solid var(--border); font-size: 13px; color: var(--ink-2);
+}
+.update-note { font-size: 12.5px; }

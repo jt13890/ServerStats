@@ -13,12 +13,14 @@ Modes:
 Agent settings can come from flags or environment variables:
   SERVERSTATS_URL, SERVERSTATS_TOKEN, SERVERSTATS_INTERVAL,
   SERVERSTATS_CA_FILE, SERVERSTATS_MAX_PROCS
+(or from a KEY=VALUE file given with --env-file).
 
 Docker containers are reported too when this account can read the Docker
 socket (i.e. is in the docker group); set SERVERSTATS_DOCKER=0 to turn that off.
 """
 
 import argparse
+import hashlib
 import http.client
 import json
 import os
@@ -33,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -608,6 +610,7 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
 
 
 def _post(opener, url, token, payload, timeout=15):
+    """Send one report; returns the server's JSON reply (a dict, maybe empty)."""
     body = json.dumps(payload, separators=(",", ":")).encode()
     req = urllib.request.Request(
         url.rstrip("/") + "/api/ingest",
@@ -620,31 +623,163 @@ def _post(opener, url, token, payload, timeout=15):
         },
     )
     with opener.open(req, timeout=timeout) as resp:
-        resp.read()
+        raw = resp.read(65536)
+    try:
+        reply = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return {}
+    return reply if isinstance(reply, dict) else {}
 
 
-def run_agent(args):
+# -- remote updates ------------------------------------------------------------
+#
+# When you click "Update agent" in the UI, the server answers the next report
+# with {"update": {"version", "sha256"}}. The agent downloads the new code from
+# the same server, checks it against that hash, saves it in its own state
+# directory and restarts into it. It still runs as the same unprivileged user.
+# NOTE: this trusts the server - whoever controls it can push code to agents
+# that have updates enabled (the default; install with --no-updates to refuse).
+# The installed copy stays in place: if an update fails to start three times,
+# the agent drops it and falls back to the installed version.
+
+MAX_UPDATE_ATTEMPTS = 3
+_VERSION_RE = re.compile(r'^VERSION = "([0-9.]+)"', re.M)
+
+
+def _version_tuple(v):
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except ValueError:
+        return ()
+
+
+def _state_dir():
+    d = os.environ.get("STATE_DIRECTORY") or os.environ.get("SERVERSTATS_STATE_DIR")
+    return d.split(":")[0] if d else None
+
+
+def updates_enabled():
+    d = _state_dir()
+    return os.environ.get("SERVERSTATS_UPDATES", "1") != "0" and bool(d) and os.access(d, os.W_OK)
+
+
+def _update_paths():
+    d = _state_dir()
+    return os.path.join(d, "serverstats_agent.py"), os.path.join(d, "update-attempts")
+
+
+def _write(path, text):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def maybe_run_updated_copy(argv):
+    """At startup: hand over to a newer, downloaded copy if there is one."""
+    if os.environ.get("SERVERSTATS_RUNNING_UPDATE") or not updates_enabled():
+        return
+    code_path, attempts_path = _update_paths()
+    try:
+        code = _read(code_path)
+    except OSError:
+        return
+    m = _VERSION_RE.search(code)
+    if not m or _version_tuple(m.group(1)) <= _version_tuple(VERSION):
+        os.remove(code_path)  # stale: the installed version is as new or newer
+        return
+    try:
+        attempts = int(_read(attempts_path).strip() or 0)
+    except (OSError, ValueError):
+        attempts = 0
+    if attempts >= MAX_UPDATE_ATTEMPTS:
+        print("update to %s failed to start %d times; using installed %s" % (m.group(1), attempts, VERSION),
+              file=sys.stderr, flush=True)
+        os.replace(code_path, code_path + ".failed")  # remembered, so it isn't retried
+        return
+    _write(attempts_path, str(attempts + 1))
+    os.environ["SERVERSTATS_RUNNING_UPDATE"] = "1"
+    os.environ.setdefault("SERVERSTATS_ENTRY", os.path.abspath(sys.argv[0]))
+    os.execv(sys.executable, [sys.executable, code_path] + list(argv))
+
+
+_healthy = False
+
+
+def _mark_update_healthy():
+    """The updated copy reported successfully: reset its failed-start count."""
+    global _healthy
+    if os.environ.get("SERVERSTATS_RUNNING_UPDATE") and not _healthy:
+        try:
+            _write(_update_paths()[1], "0")
+            _healthy = True
+        except OSError:
+            pass
+
+
+def failed_update_version():
+    """Version of an update that failed to start here, if any."""
+    try:
+        m = _VERSION_RE.search(_read(_update_paths()[0] + ".failed"))
+    except (OSError, TypeError):
+        return None
+    return m.group(1) if m else None
+
+
+def _apply_update(opener, url, update, argv):
+    version, want = str(update.get("version", "")), str(update.get("sha256", "")).lower()
+    if not re.match(r"^[0-9a-f]{64}$", want) or _version_tuple(version) <= _version_tuple(VERSION):
+        return
+    if version == failed_update_version():
+        print("not updating to %s: it failed to start here before" % version, file=sys.stderr, flush=True)
+        return
+    with opener.open(url.rstrip("/") + "/api/agent/serverstats_agent.py", timeout=30) as resp:
+        code = resp.read(4 * 1024 * 1024)
+    if hashlib.sha256(code).hexdigest() != want:
+        raise ValueError("downloaded update doesn't match the announced hash")
+    text = code.decode("utf-8")
+    compile(text, "serverstats_agent.py", "exec")  # refuse anything that isn't valid Python
+    code_path, attempts_path = _update_paths()
+    _write(code_path, text)
+    _write(attempts_path, "0")
+    print("updating %s -> %s" % (VERSION, version), flush=True)
+    entry = os.environ.get("SERVERSTATS_ENTRY") or os.path.abspath(sys.argv[0])
+    env = dict(os.environ)
+    env.pop("SERVERSTATS_RUNNING_UPDATE", None)
+    os.execve(sys.executable, [sys.executable, entry] + list(argv), env)
+
+
+def run_agent(args, argv):
     if not args.url or not args.token:
         sys.exit("agent mode needs --url and --token (or SERVERSTATS_URL / SERVERSTATS_TOKEN)")
     ctx = ssl.create_default_context(cafile=args.ca_file or None)
-    # The agent only ever sends data; it never acts on anything the server
-    # returns, so a compromised server can't run code on this host.
     opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx), _NoRedirects())
     interval = max(args.interval, 2.0)
     sample = min(args.sample, interval / 2)
     failures = 0
     snapshot = None
+    can_update = updates_enabled()
     _DOCKER.refresh_disk_in_background()
-    print("serverstats-agent %s reporting to %s every %ss" % (VERSION, args.url, interval), flush=True)
+    print("serverstats-agent %s reporting to %s every %ss (remote updates %s)"
+          % (VERSION, args.url, interval, "on" if can_update else "off"), flush=True)
     while True:
         started = time.monotonic()
         try:
             sample_data, snapshot = collect(sample, args.max_procs, snapshot)
             sample_data["interval"] = interval  # lets the server judge staleness
-            _post(opener, args.url, args.token, sample_data)
+            sample_data["updates"] = can_update
+            if can_update:
+                sample_data["update_failed"] = failed_update_version()
+            reply = _post(opener, args.url, args.token, sample_data)
             if failures:
                 print("reporting recovered after %d failure(s)" % failures, flush=True)
             failures = 0
+            _mark_update_healthy()
+            if can_update and isinstance(reply.get("update"), dict):
+                try:
+                    _apply_update(opener, args.url, reply["update"], argv)
+                except Exception as e:
+                    print("update failed: %s" % e, file=sys.stderr, flush=True)
         except urllib.error.HTTPError as e:
             failures += 1
             print("server rejected report: HTTP %d %s" % (e.code, e.reason), file=sys.stderr, flush=True)
@@ -658,9 +793,41 @@ def run_agent(args):
         time.sleep(max(wait - (time.monotonic() - started), 0.5))
 
 
+def _load_env_file(argv):
+    """Apply KEY=VALUE lines from --env-file PATH before reading settings.
+
+    Used under OpenRC, where the token must not appear on the command line
+    (visible in `ps`); the file is readable only by root and the agent user.
+    Variables already set in the environment win.
+    """
+    path = None
+    for i, a in enumerate(argv):
+        if a == "--env-file" and i + 1 < len(argv):
+            path = argv[i + 1]
+        elif a.startswith("--env-file="):
+            path = a.split("=", 1)[1]
+    if not path:
+        return
+    try:
+        lines = _read(path).splitlines()
+    except OSError as e:
+        sys.exit("cannot read --env-file %s: %s" % (path, e))
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        os.environ.setdefault(key.strip(), value)
+
+
 def main():
+    _load_env_file(sys.argv[1:])
     env = os.environ.get
     ap = argparse.ArgumentParser(description="ServerStats agent / collector")
+    ap.add_argument("--env-file", help="read SERVERSTATS_* settings from this KEY=VALUE file")
     ap.add_argument("--once", action="store_true", help="print one JSON sample to stdout and exit")
     ap.add_argument("--url", default=env("SERVERSTATS_URL"), help="server base URL, e.g. https://stats.example.com")
     ap.add_argument("--token", default=env("SERVERSTATS_TOKEN"), help="per-host token from the server config")
@@ -675,8 +842,9 @@ def main():
         json.dump(collect(args.sample, args.max_procs)[0], sys.stdout, separators=(",", ":"))
         sys.stdout.write("\n")
         return
+    maybe_run_updated_copy(sys.argv[1:])
     try:
-        run_agent(args)
+        run_agent(args, sys.argv[1:])
     except KeyboardInterrupt:
         pass
 
