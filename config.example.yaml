@@ -5,8 +5,9 @@ settings:
   # Mark a host offline when it hasn't reported for this many seconds, or for
   # 3x its reporting/poll interval if that's longer.
   stale_after: 60
-  # How long to keep history for the charts (hours). 168 = 7 days.
-  history_hours: 168
+  # How long to keep history (days). The charts go up to a year. Older data is
+  # kept as hourly averages, so this costs only a few MB per host.
+  retention_days: 400
   # Default poll interval for SSH hosts (seconds).
   ssh_interval: 15
   # Report at most this many processes per host (busiest first).
@@ -28,13 +29,13 @@ hosts:
     mode: agent
     token: CHANGE-ME-0123456789abcdef0123456789abcdef
 
-  # SSH pull: no install needed, just python3 on the host and the server's
-  # public key (shown under "Add host" in the UI) in authorized_keys.
+  # SSH pull: run the installer on the host with --ssh-key (the "Add host"
+  # button shows the command). The key is locked to the collector with a
+  # forced command; hosts where it isn't are refused.
   - name: pi
     mode: ssh
     address: 192.168.1.20
     port: 22
     user: serverstats
     # interval: 30            # override ssh_interval for this host
-    # python: /usr/bin/python3
     # host_key: "SHA256:..."  # pin the host key instead of trust-on-first-use

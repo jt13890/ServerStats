@@ -1,5 +1,6 @@
 """Loads and validates config.yaml."""
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -11,6 +12,9 @@ CONFIG_PATH = Path(os.environ.get("SERVERSTATS_CONFIG", "/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("SERVERSTATS_DATA", "/data"))
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+log = logging.getLogger("serverstats")
 
 
 class ConfigError(Exception):
@@ -25,7 +29,6 @@ class Host:
     address: str | None = None
     port: int = 22
     user: str = "serverstats"
-    python: str = "python3"
     interval: float = 15.0
     host_key: str | None = None  # optional pinned SHA256 fingerprint
     description: str = ""
@@ -34,7 +37,7 @@ class Host:
 @dataclass
 class Settings:
     stale_after: float = 60.0
-    history_hours: float = 168.0
+    retention_days: float = 400.0
     ssh_interval: float = 15.0
     ssh_key: Path = field(default_factory=lambda: DATA_DIR / "ssh" / "id_ed25519")
     max_procs: int = 500
@@ -59,13 +62,18 @@ def load(path: Path = CONFIG_PATH) -> Config:
     s = raw.get("settings") or {}
     settings = Settings(
         stale_after=float(s.get("stale_after", 60)),
-        history_hours=float(s.get("history_hours", 168)),
+        retention_days=float(s.get("retention_days", 400)),
         ssh_interval=float(s.get("ssh_interval", 15)),
         ssh_key=Path(s["ssh_key"]) if s.get("ssh_key") else DATA_DIR / "ssh" / "id_ed25519",
         max_procs=int(s.get("max_procs", 500)),
         auth_header=str(s.get("auth_header", "X-authentik-username")),
         require_auth_header=bool(s.get("require_auth_header", True)),
     )
+
+    if "history_hours" in s:
+        log.warning("settings.history_hours is no longer used; history is kept for retention_days (default 400)")
+    if settings.retention_days < 1:
+        raise ConfigError("settings.retention_days must be at least 1")
 
     hosts: list[Host] = []
     seen_names: set[str] = set()
@@ -94,7 +102,6 @@ def load(path: Path = CONFIG_PATH) -> Config:
             host.address = str(h["address"])
             host.port = int(h.get("port", 22))
             host.user = str(h.get("user", "serverstats"))
-            host.python = str(h.get("python", "python3"))
             host.interval = float(h.get("interval", settings.ssh_interval))
             host.host_key = h.get("host_key")
         else:

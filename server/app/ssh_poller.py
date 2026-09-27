@@ -1,16 +1,21 @@
-"""Pull mode: run the collector on remote hosts over SSH.
+"""Pull mode: collect stats from hosts over SSH without ever sending code.
 
-The collector script is piped to `python3 -` on the remote side, so nothing
-has to be installed there beyond Python 3 and our public key. For hardening,
-the key can be restricted with a forced command in authorized_keys that runs
-an installed copy of the agent with `--once`; it then simply ignores stdin.
+The server never asks a host to run the collector, let alone code of its own.
+Each host must pin the ServerStats key to the collector in authorized_keys:
+
+    restrict,command="/usr/local/bin/serverstats-agent --once" ssh-ed25519 AAAA...
+
+sshd then ignores whatever command the client requests and runs exactly that,
+so the key (and anyone who steals it from this server) can do nothing else.
+The only command we request is a harmless `echo` marker: a correctly locked
+host answers with collector JSON; a host without the forced command runs our
+echo instead, and we refuse to use it until it's fixed.
 """
 
 import asyncio
 import json
 import logging
 import os
-import shlex
 from pathlib import Path
 
 import asyncssh
@@ -28,6 +33,9 @@ if not AGENT_SCRIPT.exists():
 
 KNOWN_HOSTS = DATA_DIR / "known_hosts.json"
 MAX_OUTPUT = 8 * 1024 * 1024
+UNRESTRICTED_MARKER = "serverstats-key-not-restricted"
+PROBE_COMMAND = f"echo {UNRESTRICTED_MARKER}"
+FORCED_COMMAND = "/usr/local/bin/serverstats-agent --once"
 
 
 def load_or_create_key(path: Path) -> asyncssh.SSHKey:
@@ -46,13 +54,31 @@ class HostKeyError(Exception):
     pass
 
 
+class UnrestrictedKeyError(Exception):
+    pass
+
+
+async def _read_limited(stream, limit: int, truncate: bool = False) -> bytes:
+    """Read a stream to EOF without ever buffering more than `limit` bytes."""
+    buf = bytearray()
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            return bytes(buf)
+        room = limit - len(buf)
+        if len(chunk) > room:
+            if not truncate:
+                raise RuntimeError("collector output too large")
+            chunk = chunk[:max(room, 0)]
+        buf += chunk
+
+
 class SSHPoller:
     def __init__(self, hosts: list[Host], store: Store, key: asyncssh.SSHKey, max_procs: int):
         self.hosts = hosts
         self.store = store
         self.key = key
         self.max_procs = max_procs
-        self.script = AGENT_SCRIPT.read_text()
         self._tasks: list[asyncio.Task] = []
         self._known = self._load_known()
 
@@ -119,20 +145,31 @@ class SSHPoller:
         return conn
 
     async def _collect(self, conn: asyncssh.SSHClientConnection, host: Host) -> dict:
-        cmd = f"{shlex.quote(host.python)} - --once --max-procs {int(self.max_procs)}"
-        result = await asyncio.wait_for(conn.run(cmd, input=self.script, check=False), timeout=45)
-        stdout = result.stdout or ""
-        if result.exit_status is None:
+        async def run():
+            async with conn.create_process(PROBE_COMMAND, stdin=asyncssh.DEVNULL, encoding=None) as proc:
+                out, err = await asyncio.gather(
+                    _read_limited(proc.stdout, MAX_OUTPUT),
+                    _read_limited(proc.stderr, 4096, truncate=True),
+                )
+                await proc.wait()
+                return out, err, proc.exit_status
+
+        out, err, status = await asyncio.wait_for(run(), timeout=45)
+        text = out.decode("utf-8", "replace").strip()
+        if text == UNRESTRICTED_MARKER:
+            raise UnrestrictedKeyError(
+                "refusing to use this host: its authorized_keys entry for ServerStats lets the key run any "
+                f'command. Prefix it with restrict,command="{FORCED_COMMAND}" (see Add host → SSH).'
+            )
+        if status is None:
             raise RuntimeError("SSH session closed before the collector finished")
-        if result.exit_status != 0:
-            err = (result.stderr or "").strip().splitlines()
-            detail = err[-1] if err else f"exit status {result.exit_status}"
-            if result.exit_status == 127:
-                detail = f"{host.python} not found on host ({detail})"
+        if status != 0:
+            lines = err.decode("utf-8", "replace").strip().splitlines()
+            detail = lines[-1] if lines else f"exit status {status}"
+            if status == 127:
+                detail = f"collector not installed at {FORCED_COMMAND.split()[0]} ({detail})"
             raise RuntimeError(f"collector failed: {detail}")
-        if len(stdout) > MAX_OUTPUT:
-            raise RuntimeError("collector output too large")
-        data = json.loads(stdout)
+        data = json.loads(text)
         if not isinstance(data, dict):
             raise RuntimeError("collector returned unexpected output")
         return normalize(data, self.max_procs)
@@ -170,12 +207,12 @@ def _describe(e: Exception, host: Host) -> str:
         return f"SSH authentication failed for {host.user}@{host.address} - is the ServerStats public key in authorized_keys?"
     if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
         return "timed out"
-    if isinstance(e, HostKeyError):
+    if isinstance(e, (HostKeyError, UnrestrictedKeyError)):
         return str(e)
     if isinstance(e, asyncssh.Error):
         return f"SSH error: {e.reason}"
     if isinstance(e, OSError):
         return f"connection failed: {e.strerror or e}"
-    if isinstance(e, json.JSONDecodeError):
+    if isinstance(e, (json.JSONDecodeError, RecursionError)):
         return "collector returned invalid JSON"
     return str(e) or e.__class__.__name__

@@ -41,7 +41,7 @@ logging.getLogger("asyncssh").setLevel(logging.WARNING)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     conf = cfg.load()
-    store = Store(cfg.DATA_DIR / "serverstats.db", conf.settings.history_hours)
+    store = Store(cfg.DATA_DIR / "serverstats.db", conf.settings.retention_days)
     key = load_or_create_key(conf.settings.ssh_key)
     poller = SSHPoller(conf.hosts, store, key, conf.settings.max_procs)
 
@@ -50,15 +50,17 @@ async def lifespan(app: FastAPI):
     app.state.public_key = key.export_public_key("openssh").decode().strip()
     poller.start()
 
-    async def prune_loop():
+    async def maintenance():
+        # Roll samples up into the 5-minute/hourly tiers, then apply retention.
         while True:
             try:
+                store.rollup()
                 store.prune({h.name for h in conf.hosts})
             except Exception:
-                log.exception("prune failed")
-            await asyncio.sleep(3600)
+                log.exception("history maintenance failed")
+            await asyncio.sleep(300)
 
-    pruner = asyncio.create_task(prune_loop())
+    pruner = asyncio.create_task(maintenance())
     log.info("loaded %d host(s): %d agent, %d ssh", len(conf.hosts),
              sum(h.mode == "agent" for h in conf.hosts), sum(h.mode == "ssh" for h in conf.hosts))
     yield
@@ -114,7 +116,8 @@ def _summary(request: Request, host: cfg.Host, with_processes: bool = False) -> 
     st = request.app.state.store.state(host.name)
     now = time.time()
     data = st.data or {}
-    out = {k: v for k, v in data.items() if k != "processes"}
+    # Per-process and per-container data is only sent for the host detail view.
+    out = {k: v for k, v in data.items() if k not in ("processes", "docker")}
     out.update(
         name=host.name,
         mode=host.mode,
@@ -129,6 +132,7 @@ def _summary(request: Request, host: cfg.Host, with_processes: bool = False) -> 
     )
     if with_processes:
         out["processes"] = data.get("processes") or []
+        out["docker"] = data.get("docker")
     return out
 
 
@@ -149,7 +153,7 @@ async def meta(request: Request):
         "user": request.headers.get(settings.auth_header),
         "ssh_public_key": request.app.state.public_key,
         "stale_after": settings.stale_after,
-        "history_hours": settings.history_hours,
+        "retention_days": settings.retention_days,
     }
 
 
@@ -167,6 +171,15 @@ async def get_host(request: Request, name: str):
 async def get_history(request: Request, name: str, hours: float = 1.0):
     host = _host_or_404(request, name)
     return request.app.state.store.history(host.name, hours)
+
+
+@app.get("/api/trends")
+async def get_trends(request: Request):
+    """Last hour of CPU/memory/disk/storage for every host, for the overview."""
+    known = {h.name for h in request.app.state.conf.hosts}
+    trends = request.app.state.store.trends()
+    trends["hosts"] = {k: v for k, v in trends["hosts"].items() if k in known}
+    return trends
 
 
 # -- agent endpoints (bypass SSO, token-authenticated) ---------------------
@@ -196,7 +209,7 @@ async def ingest(request: Request):
             raise HTTPException(413, "payload too large")
     try:
         data = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):  # RecursionError: absurdly nested JSON
         raise HTTPException(400, "invalid JSON")
     if not isinstance(data, dict):
         raise HTTPException(400, "unexpected payload")
