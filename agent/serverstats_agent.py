@@ -13,16 +13,22 @@ Modes:
 Agent settings can come from flags or environment variables:
   SERVERSTATS_URL, SERVERSTATS_TOKEN, SERVERSTATS_INTERVAL,
   SERVERSTATS_CA_FILE, SERVERSTATS_MAX_PROCS
+
+Docker containers are reported too when this account can read the Docker
+socket (i.e. is in the docker group); set SERVERSTATS_DOCKER=0 to turn that off.
 """
 
 import argparse
+import http.client
 import json
 import os
 import platform
 import pwd
+import re
 import socket
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -60,10 +66,10 @@ def _cpu_times():
     return total, idle, btime
 
 
-def _net_bytes():
+def _net_bytes(path="/proc/net/dev"):
     rx = tx = 0
     try:
-        lines = _read("/proc/net/dev").splitlines()[2:]
+        lines = _read(path).splitlines()[2:]
     except OSError:
         return 0, 0
     for line in lines:
@@ -258,6 +264,230 @@ def _user(uid):
     return _user_cache[uid]
 
 
+# -- Docker (optional) ---------------------------------------------------------
+#
+# Grouping containers into compose stacks needs their labels, which only the
+# Docker API has. Reading it is opt-in (this account must be in the docker
+# group) and only these fixed, read-only GET requests are ever sent. Resource
+# usage itself comes from the containers' cgroups, not from Docker.
+
+DOCKER_SOCK = os.environ.get("SERVERSTATS_DOCKER_SOCK", "/var/run/docker.sock")
+CGROUP_ROOT = os.environ.get("SERVERSTATS_CGROUP_ROOT", "/sys/fs/cgroup")
+DOCKER_DISK_EVERY = 900  # seconds between (slow) disk usage scans
+_CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, path, timeout):
+        http.client.HTTPConnection.__init__(self, "localhost", timeout=timeout)
+        self._path = path
+
+    def connect(self):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(self._path)
+        self.sock = sock
+
+
+def _docker_get(path, timeout=5):
+    conn = _UnixHTTPConnection(DOCKER_SOCK, timeout)
+    try:
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read(64 * 1024 * 1024)
+        if resp.status != 200:
+            raise OSError("Docker API returned HTTP %d for %s" % (resp.status, path))
+        return json.loads(body.decode("utf-8", "replace"))
+    finally:
+        conn.close()
+
+
+def _kv_file(path):
+    out = {}
+    for line in _read(path).splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            out[parts[0]] = int(parts[1])
+    return out
+
+
+def _cgroup_counters(pid):
+    """(cpu ns, memory bytes, bytes read, bytes written) for a process's cgroup."""
+    v2, v1 = None, {}
+    for line in _read("/proc/%d/cgroup" % pid).splitlines():
+        hid, ctrls, path = line.split(":", 2)
+        if hid == "0" and not ctrls:
+            v2 = os.path.join(CGROUP_ROOT, path.lstrip("/"))
+        for c in ctrls.split(","):
+            if c:
+                v1[c] = path.lstrip("/")
+
+    if v2 and os.path.exists(os.path.join(v2, "memory.current")):  # cgroup v2
+        cpu = _kv_file(os.path.join(v2, "cpu.stat")).get("usage_usec", 0) * 1000
+        mem = int(_read(os.path.join(v2, "memory.current")))
+        # Like `docker stats`: don't count reclaimable page cache.
+        mem -= _kv_file(os.path.join(v2, "memory.stat")).get("inactive_file", 0)
+        rd = wr = 0
+        try:
+            for line in _read(os.path.join(v2, "io.stat")).splitlines():
+                for field in line.split()[1:]:
+                    k, _, v = field.partition("=")
+                    if k == "rbytes":
+                        rd += int(v)
+                    elif k == "wbytes":
+                        wr += int(v)
+        except OSError:
+            pass
+        return cpu, max(mem, 0), rd, wr
+
+    def v1_dir(controller, *mounts):  # cgroup v1: each controller has its own tree
+        for m in mounts:
+            d = os.path.join(CGROUP_ROOT, m, v1.get(controller, ""))
+            if os.path.isdir(d):
+                return d
+        raise OSError("no %s cgroup for pid %d" % (controller, pid))
+
+    cpu = int(_read(os.path.join(v1_dir("cpuacct", "cpuacct", "cpu,cpuacct", "cpuacct,cpu"), "cpuacct.usage")))
+    mdir = v1_dir("memory", "memory")
+    mem = int(_read(os.path.join(mdir, "memory.usage_in_bytes")))
+    mem -= _kv_file(os.path.join(mdir, "memory.stat")).get("total_inactive_file", 0)
+    rd = wr = 0
+    try:
+        for line in _read(os.path.join(v1_dir("blkio", "blkio"), "blkio.throttle.io_service_bytes")).splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[1] == "Read":
+                rd += int(parts[2])
+            elif len(parts) == 3 and parts[1] == "Write":
+                wr += int(parts[2])
+    except OSError:
+        pass
+    return cpu, max(mem, 0), rd, wr
+
+
+class _Docker(object):
+    def __init__(self):
+        self.pids = {}  # container id -> (pid, host networking?)
+        self.disk = None
+        self._disk_thread = None
+
+    def snapshot(self):
+        """Raw per-container counters, None if Docker isn't there, or an error."""
+        if os.environ.get("SERVERSTATS_DOCKER", "1") == "0":
+            return None
+        try:
+            listed = _docker_get("/containers/json")
+        except (FileNotFoundError, ConnectionRefusedError):
+            return None  # Docker not installed / not running
+        except PermissionError:
+            return {"error": "no permission to read the Docker socket; add this account to the docker group to see containers"}
+        except (OSError, ValueError) as e:
+            return {"error": "Docker API error: %s" % e}
+
+        containers = {}
+        for c in listed if isinstance(listed, list) else []:
+            cid = c.get("Id", "")
+            if not _CONTAINER_ID.match(cid):
+                continue
+            try:
+                if cid not in self.pids:
+                    info = _docker_get("/containers/%s/json" % cid)
+                    host_net = (info.get("HostConfig") or {}).get("NetworkMode") == "host"
+                    self.pids[cid] = (int((info.get("State") or {}).get("Pid") or 0), host_net)
+                pid, host_net = self.pids[cid]
+                counters = _cgroup_counters(pid) if pid else None
+                net = None if host_net or not pid else _net_bytes("/proc/%d/net/dev" % pid)
+            except (OSError, ValueError):
+                self.pids.pop(cid, None)
+                counters = net = None
+            labels = c.get("Labels") or {}
+            containers[cid] = {
+                "name": ((c.get("Names") or ["/?"])[0]).lstrip("/"),
+                "project": labels.get("com.docker.compose.project"),
+                "service": labels.get("com.docker.compose.service"),
+                "image": c.get("Image"),
+                "status": c.get("Status"),
+                "counters": counters,
+                "net": net,
+                "volumes": [m.get("Name") for m in c.get("Mounts") or [] if m.get("Type") == "volume"],
+            }
+        for cid in list(self.pids):
+            if cid not in containers:
+                del self.pids[cid]
+        return {"containers": containers}
+
+    def refresh_disk_in_background(self):
+        """Disk usage (`docker system df`) can take a while; poll it off-thread."""
+        def loop():
+            while True:
+                try:
+                    df = _docker_get("/system/df", timeout=300)
+                    self.disk = {
+                        "at": time.time(),
+                        "containers": {c.get("Id"): c.get("SizeRw") or 0 for c in df.get("Containers") or []},
+                        "volumes": [
+                            {
+                                "name": v.get("Name"),
+                                "project": (v.get("Labels") or {}).get("com.docker.compose.project"),
+                                "size": max((v.get("UsageData") or {}).get("Size") or 0, 0),
+                            }
+                            for v in df.get("Volumes") or []
+                        ],
+                    }
+                except Exception:
+                    pass
+                time.sleep(DOCKER_DISK_EVERY)
+
+        if self._disk_thread is None:
+            self._disk_thread = threading.Thread(target=loop, name="docker-df", daemon=True)
+            self._disk_thread.start()
+
+
+_DOCKER = _Docker()
+
+
+def _docker_delta(before, after, elapsed, mem_total):
+    if after is None or "error" in after:
+        return after
+    prev = (before or {}).get("containers") or {}
+    disk = _DOCKER.disk or {}
+    out = []
+    for cid, c in after["containers"].items():
+        p = prev.get(cid) or {}
+        cur, old = c["counters"], p.get("counters")
+        entry = {
+            "id": cid[:12], "name": c["name"], "project": c["project"], "service": c["service"],
+            "image": c["image"], "status": c["status"],
+            "cpu": None, "mem": None, "mem_percent": None,
+            "read_rate": None, "write_rate": None, "rx_rate": None, "tx_rate": None,
+            "disk": (disk.get("containers") or {}).get(cid),
+        }
+        if cur:
+            entry["mem"] = cur[1]
+            entry["mem_percent"] = round(100.0 * cur[1] / mem_total, 2) if mem_total else None
+        if cur and old:
+            entry["cpu"] = round(100.0 * max(cur[0] - old[0], 0) / (elapsed * 1e9), 2)  # 100% = one core
+            entry["read_rate"] = max(cur[2] - old[2], 0) / elapsed
+            entry["write_rate"] = max(cur[3] - old[3], 0) / elapsed
+        if c["net"] and p.get("net"):
+            entry["rx_rate"] = max(c["net"][0] - p["net"][0], 0) / elapsed
+            entry["tx_rate"] = max(c["net"][1] - p["net"][1], 0) / elapsed
+        out.append(entry)
+    out.sort(key=lambda e: ((e["project"] or ""), e["name"]))
+    # Anonymous volumes carry no compose label; attribute them to the stack
+    # (or standalone container) that mounts them.
+    owner = {}
+    for c in after["containers"].values():
+        for v in c["volumes"]:
+            owner.setdefault(v, (c["project"], None if c["project"] else c["name"]))
+    volumes = None
+    if disk.get("volumes") is not None:
+        volumes = []
+        for v in disk["volumes"]:
+            project, container = (v["project"], None) if v["project"] else owner.get(v["name"], (None, None))
+            volumes.append(dict(v, project=project, container=container))
+    return {"containers": out, "volumes": volumes, "disk_at": disk.get("at")}
+
+
 def _snapshot():
     total, idle, btime = _cpu_times()
     return {
@@ -267,6 +497,7 @@ def _snapshot():
         "procs": _proc_snapshot(),
         "net": _net_bytes(),
         "io": _diskstats(),
+        "docker": _DOCKER.snapshot(),
     }
 
 
@@ -288,6 +519,7 @@ def collect(sample_seconds=1.0, max_procs=500, prev=None):
     procs0, procs1 = prev["procs"], cur["procs"]
     (rx0, tx0), (rx1, tx1) = prev["net"], cur["net"]
     io0, io1 = prev["io"], cur["io"]
+    docker0, docker1 = prev["docker"], cur["docker"]
     btime = cur["btime"]
 
     elapsed = max(t1 - t0, 1e-6)
@@ -341,6 +573,7 @@ def collect(sample_seconds=1.0, max_procs=500, prev=None):
         "memory": mem,
         "disks": _disks(),
         "disk_io": _disk_io(io0, io1, elapsed),
+        "docker": _docker_delta(docker0, docker1, elapsed, mem["total"]),
         "net": {
             "rx_rate": max(rx1 - rx0, 0) / elapsed,
             "tx_rate": max(tx1 - tx0, 0) / elapsed,
@@ -356,7 +589,19 @@ def collect(sample_seconds=1.0, max_procs=500, prev=None):
     }, cur
 
 
-def _post(url, token, payload, ctx, timeout=15):
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Treat redirects as errors: never resend the token elsewhere, and don't
+    mistake an SSO login page for a successful report."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code,
+            "redirected to %s - is /api/ingest excluded from your SSO proxy?" % newurl.split("?")[0],
+            headers, fp,
+        )
+
+
+def _post(opener, url, token, payload, timeout=15):
     body = json.dumps(payload, separators=(",", ":")).encode()
     req = urllib.request.Request(
         url.rstrip("/") + "/api/ingest",
@@ -368,7 +613,7 @@ def _post(url, token, payload, ctx, timeout=15):
             "User-Agent": "serverstats-agent/" + VERSION,
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+    with opener.open(req, timeout=timeout) as resp:
         resp.read()
 
 
@@ -376,17 +621,21 @@ def run_agent(args):
     if not args.url or not args.token:
         sys.exit("agent mode needs --url and --token (or SERVERSTATS_URL / SERVERSTATS_TOKEN)")
     ctx = ssl.create_default_context(cafile=args.ca_file or None)
+    # The agent only ever sends data; it never acts on anything the server
+    # returns, so a compromised server can't run code on this host.
+    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx), _NoRedirects())
     interval = max(args.interval, 2.0)
     sample = min(args.sample, interval / 2)
     failures = 0
     snapshot = None
+    _DOCKER.refresh_disk_in_background()
     print("serverstats-agent %s reporting to %s every %ss" % (VERSION, args.url, interval), flush=True)
     while True:
         started = time.monotonic()
         try:
             sample_data, snapshot = collect(sample, args.max_procs, snapshot)
             sample_data["interval"] = interval  # lets the server judge staleness
-            _post(args.url, args.token, sample_data, ctx)
+            _post(opener, args.url, args.token, sample_data)
             if failures:
                 print("reporting recovered after %d failure(s)" % failures, flush=True)
             failures = 0

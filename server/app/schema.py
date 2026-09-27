@@ -10,6 +10,8 @@ import math
 
 MAX_DISKS = 64
 MAX_DEVICES = 64
+MAX_CONTAINERS = 500
+MAX_VOLUMES = 1000
 
 
 def _num(v, default=0.0):
@@ -34,6 +36,44 @@ def _dict(v):
 
 def _list(v):
     return v if isinstance(v, list) else []
+
+
+def _opt(v):
+    """A number, or None when the host couldn't measure it."""
+    return _num(v, None)
+
+
+def _docker(v):
+    if not isinstance(v, dict):
+        return None
+    if v.get("error"):
+        return {"error": _str(v.get("error"), 300)}
+    containers = []
+    for c in _list(v.get("containers"))[:MAX_CONTAINERS]:
+        if not isinstance(c, dict):
+            continue
+        containers.append({
+            "id": _str(c.get("id"), 12),
+            "name": _str(c.get("name")),
+            "project": _str(c.get("project")) or None,
+            "service": _str(c.get("service")) or None,
+            "image": _str(c.get("image"), 256),
+            "status": _str(c.get("status"), 64),
+            **{k: _opt(c.get(k)) for k in ("cpu", "mem", "mem_percent", "read_rate", "write_rate", "rx_rate", "tx_rate", "disk")},
+        })
+    volumes = None
+    if isinstance(v.get("volumes"), list):
+        volumes = [
+            {
+                "name": _str(x.get("name"), 256),
+                "project": _str(x.get("project")) or None,
+                "container": _str(x.get("container")) or None,
+                "size": _num(x.get("size")),
+            }
+            for x in v["volumes"][:MAX_VOLUMES]
+            if isinstance(x, dict)
+        ]
+    return {"containers": containers, "volumes": volumes, "disk_at": _opt(v.get("disk_at"))}
 
 
 def normalize(d: dict, max_procs: int) -> dict:
@@ -111,5 +151,6 @@ def normalize(d: dict, max_procs: int) -> dict:
         },
         "net": {"rx_rate": _num(net.get("rx_rate")), "tx_rate": _num(net.get("tx_rate"))},
         "tasks": {k: _int(tasks.get(k)) for k in ("total", "running", "sleeping", "zombie", "threads")},
+        "docker": _docker(d.get("docker")),
         "processes": processes,
     }

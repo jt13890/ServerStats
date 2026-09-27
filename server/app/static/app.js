@@ -157,17 +157,53 @@ function setStatus(elm, status) {
   $('.status-label', elm).textContent = STATUS_LABEL[status] || status;
 }
 
-function meter(label, pct, title) {
+// `trend` (optional): [{t, v}] percentages to draw as a sparkline above the bar.
+// `valueText` (optional): replaces the percentage shown next to the bar.
+function meter(label, pct, title, trend, valueText) {
   const fill = h('div', { class: 'meter-fill', 'data-level': level(pct || 0) });
   fill.style.width = Math.max(0, Math.min(100, pct || 0)) + '%';
   const track = h('div', {
     class: 'meter-track', role: 'meter', 'aria-valuemin': 0, 'aria-valuemax': 100,
     'aria-valuenow': pct == null ? 0 : pct, 'aria-label': label || title,
   }, fill);
+  let middle = track;
+  if (trend) {
+    const vals = trend.map((p) => p.v);
+    if (vals.length) title += ` · last hour ${fmtPct(Math.min(...vals))}–${fmtPct(Math.max(...vals))}`;
+    middle = h('div', { class: 'meter-viz' }, sparkline(trend), track);
+  }
   return h('div', { class: 'meter', title },
     label != null && h('span', { class: 'meter-label', text: label }),
-    track,
-    h('span', { class: 'meter-value', text: fmtPct(pct) }));
+    middle,
+    h('span', { class: 'meter-value', text: valueText || fmtPct(pct) }));
+}
+
+// Last-hour trend on a fixed 0-100% scale, so hosts compare honestly.
+function sparkline(points) {
+  const W = 120, H = 22;
+  const x1 = serverNow(), x0 = x1 - 3600;
+  const X = (t) => ((t - x0) / (x1 - x0)) * W;
+  const Y = (v) => H - 1 - (Math.max(0, Math.min(100, v)) / 100) * (H - 2);
+  const root = svg('svg', { class: 'spark', viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none', 'aria-hidden': 'true' });
+  const pts = points.filter((p) => p.t >= x0);
+  if (!pts.length) return root;
+  const gap = Math.max(180, 3 * cadence(pts.map((p) => p.t)));
+  let line = '', area = '', seg = [];
+  const flush = () => {
+    if (!seg.length) return;
+    const xs = seg.map((p) => X(p.t).toFixed(1));
+    const ys = seg.map((p) => Y(p.v).toFixed(1));
+    line += 'M' + xs.map((x, i) => `${x},${ys[i]}`).join('L') + (seg.length === 1 ? 'h1' : '');
+    area += `M${xs[0]},${H}L` + xs.map((x, i) => `${x},${ys[i]}`).join('L') + `L${xs[xs.length - 1]},${H}Z`;
+    seg = [];
+  };
+  pts.forEach((p, i) => {
+    if (i && p.t - pts[i - 1].t > gap) flush();
+    seg.push(p);
+  });
+  flush();
+  root.append(svg('path', { class: 'spark-area', d: area }), svg('path', { class: 'spark-line', d: line, 'vector-effect': 'non-scaling-stroke' }));
+  return root;
 }
 
 function tile(label, value, sub) {
@@ -211,7 +247,7 @@ function renderOverview() {
         card = $('#tpl-card').content.firstElementChild.cloneNode(true);
         cards.set(host.name, card);
       }
-      updateCard(card, host);
+      updateCard(card, host, trendFor(host.name));
       card.hidden = !!q && ![host.name, host.hostname, host.os, host.description, host.target]
         .some((x) => x && x.toLowerCase().includes(q));
       if (grid.children[i] !== card) grid.insertBefore(card, grid.children[i] || null);
@@ -222,10 +258,19 @@ function renderOverview() {
     }
   }
 
+  let trends = null;
+  function trendFor(name) {
+    const tr = trends && trends.hosts[name];
+    if (!tr) return {};
+    const series = (key) => tr.t.map((t, i) => ({ t, v: tr[key][i] })).filter((p) => p.v != null);
+    return { cpu: series('cpu'), mem: series('mem'), disk: series('disk_util'), storage: series('storage') };
+  }
+
   every(5000, async () => { await refreshHosts(); draw(); });
+  every(30000, async () => { trends = await api('/api/trends'); draw(); });
 }
 
-function updateCard(card, host) {
+function updateCard(card, host, trend = {}) {
   card.href = '#/host/' + encodeURIComponent(host.name);
   card.classList.toggle('is-offline', host.status !== 'online');
   $('.host-name', card).textContent = host.name;
@@ -237,12 +282,14 @@ function updateCard(card, host) {
     const disk = fullestDisk(host);
     const mem = host.memory || {};
     meters.push(
-      meter('CPU', host.cpu.percent, `${host.cpu.count} cores`),
-      meter('Memory', mem.percent, `${fmtBytes(mem.used)} of ${fmtBytes(mem.total)} used`),
+      meter('CPU', host.cpu.percent, `${host.cpu.count} cores`, trend.cpu || []),
+      meter('Memory', mem.percent, `${fmtBytes(mem.used)} of ${fmtBytes(mem.total)} used`, trend.mem || []),
       meter('Disk I/O', host.disk_io ? host.disk_io.util : null,
-        host.disk_io ? `Busiest disk. Read ${fmtRate(host.disk_io.read_rate)}, write ${fmtRate(host.disk_io.write_rate)}` : 'Not reported'),
+        host.disk_io ? `Busiest disk. Read ${fmtRate(host.disk_io.read_rate)}, write ${fmtRate(host.disk_io.write_rate)}` : 'Not reported',
+        trend.disk || []),
       meter('Storage', disk ? disk.percent : null,
-        disk ? `Fullest filesystem: ${disk.mount} (${fmtBytes(disk.used)} of ${fmtBytes(disk.total)})` : 'No filesystems'),
+        disk ? `Fullest filesystem: ${disk.mount} (${fmtBytes(disk.used)} of ${fmtBytes(disk.total)})` : 'No filesystems',
+        trend.storage || []),
     );
   }
   $('.meters', card).replaceChildren(...meters);
@@ -277,13 +324,20 @@ function renderDetail(name) {
 
   // range selector
   const rangeBtns = [...document.querySelectorAll('#range button')];
-  const markRange = () => rangeBtns.forEach((b) => b.setAttribute('aria-checked', String(Number(b.dataset.hours) === state.range)));
+  const markRange = () => rangeBtns.forEach((b) => {
+    const hours = Number(b.dataset.hours);
+    b.setAttribute('aria-checked', String(hours === state.range));
+    // Ranges longer than the configured retention would only ever be partly filled.
+    const kept = state.meta ? state.meta.retention_days * 24 : Infinity;
+    b.disabled = hours > kept + 24;
+    b.title = b.disabled ? `History is kept for ${state.meta.retention_days} days (settings.retention_days)` : '';
+  });
   markRange();
   rangeBtns.forEach((b) => b.addEventListener('click', () => {
     state.range = Number(b.dataset.hours);
     savePref('range', state.range);
     markRange();
-    loadHistory();
+    loadHistory(true);
   }));
 
   // process table controls
@@ -322,21 +376,31 @@ function renderDetail(name) {
     state.skew = host.server_time - before;
     if (!proc.paused) procData = host.processes || [];
     drawHost();
+    drawDocker();
     drawProcs();
   }
 
-  async function loadHistory() {
+  let historySeq = 0;
+  let historyAt = 0;
+  async function loadHistory(force) {
+    // Long ranges are hourly averages; refetching them every 30s buys nothing.
+    if (!force && state.range > 24 && Date.now() - historyAt < 300000) return;
+    const seq = ++historySeq;
     const charts = document.querySelectorAll('.chart');
     charts.forEach((c) => c.classList.add('loading'));
     try {
-      history = await api(`/api/hosts/${enc}/history?hours=${state.range}`);
+      const data = await api(`/api/hosts/${enc}/history?hours=${state.range}`);
+      if (seq !== historySeq) return; // a newer range was picked meanwhile
+      history = data;
+      historyAt = Date.now();
       drawCharts();
     } finally {
-      charts.forEach((c) => c.classList.remove('loading'));
+      if (seq === historySeq) charts.forEach((c) => c.classList.remove('loading'));
     }
   }
 
   function drawHost() {
+    markRange();
     setStatus($('#d-status'), host.status);
     const sub = [
       host.description,
@@ -401,6 +465,104 @@ function renderDetail(name) {
     )) : [h('tr', null, h('td', { colspan: 4, class: 'muted', text: 'No disk activity reported' }))]));
   }
 
+  // Stacks the user has expanded to show their containers.
+  const expanded = new Set();
+
+  function drawDocker() {
+    const dk = host.docker;
+    $('#docker-card').hidden = !dk;
+    if (!dk) return;
+    const err = $('#docker-error');
+    err.hidden = !dk.error;
+    err.textContent = dk.error || '';
+    const containers = dk.containers || [];
+    const ncpu = (host.cpu && host.cpu.count) || 1;
+
+    // Group containers by compose project; standalone containers stand alone.
+    const groups = new Map();
+    const group = (key, name, kind) => {
+      if (!groups.has(key)) groups.set(key, { key, name, kind, containers: [], volumeBytes: 0, volumes: 0 });
+      return groups.get(key);
+    };
+    for (const c of containers) {
+      if (c.project) group('p:' + c.project, c.project, 'stack').containers.push(c);
+      else group('c:' + c.name, c.name, 'container').containers.push(c);
+    }
+    const diskKnown = Array.isArray(dk.volumes);
+    for (const v of dk.volumes || []) {
+      const g = v.project ? group('p:' + v.project, v.project, 'stack')
+        : v.container ? group('c:' + v.container, v.container, 'container')
+          : group('unused', 'Unused volumes', 'volumes');
+      g.volumeBytes += v.size || 0;
+      g.volumes += 1;
+    }
+
+    const total = (list, key) => {
+      const vals = list.map((c) => c[key]).filter((v) => v != null);
+      return vals.length ? vals.reduce((a, b) => a + b, 0) : null;
+    };
+    const pair = (a, b, fmt) => (a == null && b == null ? '—' : `${fmt(a)} / ${fmt(b)}`);
+    const cells = (list, extraDisk) => {
+      const cpu = total(list, 'cpu'), mem = total(list, 'mem'), memPct = total(list, 'mem_percent');
+      const rw = total(list, 'disk');
+      const disk = diskKnown ? (rw || 0) + extraDisk : null;
+      return [
+        h('td', null, meter(null, cpu == null ? null : cpu / ncpu,
+          cpu == null ? 'Not measured' : `${fmtPct(cpu)} of one core (${ncpu} cores)`)),
+        h('td', { class: 'mem-cell' }, meter(null, memPct, mem == null ? 'Not measured' : `${fmtBytes(mem)} of ${fmtBytes(host.memory.total)}`,
+          null, mem == null ? '—' : `${fmtBytes(mem)} · ${fmtPct(memPct)}`)),
+        h('td', { class: 'num', text: pair(total(list, 'read_rate'), total(list, 'write_rate'), fmtRate) }),
+        h('td', { class: 'num', text: pair(total(list, 'rx_rate'), total(list, 'tx_rate'), fmtRate) }),
+        h('td', { class: 'num', text: disk == null ? '—' : fmtBytes(disk) }),
+      ];
+    };
+
+    const order = { stack: 0, container: 1, volumes: 2 };
+    const rows = [];
+    for (const g of [...groups.values()].sort((a, b) => order[a.kind] - order[b.kind] || a.name.localeCompare(b.name))) {
+      const open = expanded.has(g.key);
+      const canExpand = g.kind === 'stack' && g.containers.length > 0;
+      const nameCell = h('td', { class: 'stack-name' },
+        canExpand ? h('button', {
+          class: 'expander', type: 'button', 'aria-expanded': String(open),
+          'aria-label': `${open ? 'Hide' : 'Show'} containers in ${g.name}`,
+          onclick: () => { if (open) expanded.delete(g.key); else expanded.add(g.key); drawDocker(); },
+        }, open ? '▾' : '▸') : h('span', { class: 'expander-spacer' }),
+        h('b', { text: g.name }),
+        g.kind === 'container' && h('span', { class: 'muted', text: ' standalone' }),
+        g.volumes ? h('span', { class: 'muted', text: ` · ${g.volumes} volume${g.volumes > 1 ? 's' : ''}` }) : null);
+      if (g.kind === 'volumes') {
+        rows.push(h('tr', { class: 'stack-row' }, nameCell, h('td', { class: 'num', text: '—' }),
+          h('td'), h('td'), h('td'), h('td'), h('td', { class: 'num', text: fmtBytes(g.volumeBytes) })));
+        continue;
+      }
+      rows.push(h('tr', { class: 'stack-row' }, nameCell,
+        h('td', { class: 'num', text: g.containers.length }), ...cells(g.containers, g.volumeBytes)));
+      if (open) {
+        for (const c of g.containers) {
+          rows.push(h('tr', { class: 'container-row' },
+            h('td', { class: 'stack-name', title: `${c.image} · ${c.status}` },
+              h('span', { class: 'expander-spacer' }), c.service || c.name,
+              h('span', { class: 'muted', text: ` ${c.image}` })),
+            h('td', { class: 'num muted', text: c.status.split(' ')[0] }),
+            ...cells([c], 0)));
+        }
+      }
+    }
+    $('#docker-table tbody').replaceChildren(...(rows.length ? rows
+      : [h('tr', null, h('td', { colspan: 7, class: 'muted', text: 'No running containers' }))]));
+
+    const stacks = [...groups.values()].filter((g) => g.kind === 'stack').length;
+    $('#docker-count').textContent = containers.length
+      ? `${containers.length} running container${containers.length > 1 ? 's' : ''} · ${stacks} stack${stacks === 1 ? '' : 's'}` : '';
+    const cpu = total(containers, 'cpu'), memPct = total(containers, 'mem_percent');
+    $('#docker-summary').textContent = containers.length && cpu != null
+      ? `Containers are using ${fmtPct(cpu / ncpu)} of this host's CPU and ${fmtPct(memPct)} of its memory.` : '';
+    $('#docker-note').textContent = dk.error ? '' : diskKnown
+      ? `Disk space is container writable layers plus their volumes (bind mounts not included), measured ${fmtAgo(serverNow() - dk.disk_at)}. CPU share is of all ${ncpu} cores.`
+      : 'Disk space per stack is measured by the push agent every 15 minutes; it isn\'t available over SSH.';
+  }
+
   function drawProcs() {
     const q = proc.filter.trim().toLowerCase();
     let rows = procData;
@@ -457,16 +619,27 @@ function renderDetail(name) {
     // Never break lines for gaps shorter than a host needs to be marked offline.
     const minGap = Math.max(history.bucket * 3, (state.meta ? state.meta.stale_after : 60) * 1.5);
     const pick = (key) => m.filter((r) => r[key] != null).map((r) => ({ t: r.t, v: r[key] }));
-    const common = { x0, x1, minGap, days: state.range > 24 };
+    // Tooltip time: long ranges are averaged per hour or more, so a date
+    // (plus the year for 6 months and up) is what the reader needs.
+    const tipTime = (t) => {
+      const d = new Date(t * 1000);
+      if (history.bucket >= 86400) {
+        return d.toLocaleDateString([], { month: 'short', day: 'numeric', year: state.range >= 4380 ? 'numeric' : undefined });
+      }
+      return fmtClock(t, state.range > 24);
+    };
+    const common = { x0, x1, minGap, tipTime };
+    const fmtCount = (v) => (v == null ? '—' : (+v.toFixed(v < 10 ? 2 : 0)).toLocaleString());
 
-    lineChart($('#chart-usage'), {
-      ...common, title: 'Utilization', yMax: 100, fmt: fmtPct,
-      series: [
-        { label: 'CPU', slot: 1, points: pick('cpu') },
-        { label: 'Memory', slot: 2, points: pick('mem') },
-        { label: 'Disk busy', slot: 3, points: pick('disk_util') },
-      ],
-    });
+    const usage = [
+      { label: 'CPU', slot: 1, points: pick('cpu') },
+      { label: 'Memory', slot: 2, points: pick('mem') },
+      { label: 'Disk busy', slot: 3, points: pick('disk_util') },
+    ];
+    // Hosts without swap get no swap line rather than a flat 0%.
+    const swap = pick('swap');
+    if (swap.length) usage.push({ label: 'Swap', slot: 4, points: swap });
+    lineChart($('#chart-usage'), { ...common, title: 'Utilization', yMax: 100, fmt: fmtPct, series: usage });
 
     const storage = history.storage || {};
     const mounts = Object.keys(storage).sort().slice(0, 8);
@@ -495,6 +668,23 @@ function renderDetail(name) {
         { label: 'Sent', slot: 2, points: pick('tx') },
       ],
     });
+
+    lineChart($('#chart-load'), {
+      ...common, title: 'Load average', count: true, fmt: fmtCount,
+      series: [
+        { label: '1 min', slot: 1, points: pick('load1') },
+        { label: '5 min', slot: 2, points: pick('load5') },
+        { label: '15 min', slot: 3, points: pick('load15') },
+      ],
+    });
+
+    lineChart($('#chart-tasks'), {
+      ...common, title: 'Tasks', count: true, fmt: fmtCount,
+      series: [
+        { label: 'Processes', slot: 1, points: pick('procs') },
+        { label: 'Threads', slot: 2, points: pick('threads') },
+      ],
+    });
   }
 
   state.redraw = drawCharts;
@@ -515,6 +705,14 @@ function yScale(max, opts) {
     const step = opts.yMax / 4;
     return { top: opts.yMax, ticks: [0, 1, 2, 3, 4].map((i) => i * step), label: (v) => `${+v.toFixed(1)}%` };
   }
+  if (opts.count) {
+    max = Math.max(max, 1);
+    const step = niceStep(max / 4);
+    const top = Math.ceil(max / step) * step;
+    const ticks = [];
+    for (let v = 0; v <= top + 1e-9; v += step) ticks.push(v);
+    return { top, ticks, label: (v) => (+v.toFixed(2)).toLocaleString() };
+  }
   // Byte rates: pick a binary unit first so ticks land on round numbers of it.
   max = Math.max(max, 1024);
   const k = Math.min(Math.floor(Math.log(max) / Math.log(1024)), UNITS.length - 1);
@@ -534,10 +732,10 @@ function cadence(times) {
   for (let i = 1; i < times.length; i++) steps.push(times[i] - times[i - 1]);
   if (!steps.length) return 0;
   steps.sort((a, b) => a - b);
-  return steps[steps.length >> 1];
+  return steps[(steps.length - 1) >> 1]; // lower median: few samples shouldn't bridge a real gap
 }
 
-const TIME_STEPS = [300, 600, 900, 1800, 3600, 7200, 10800, 14400, 21600, 43200, 86400, 172800];
+const TIME_STEPS = [300, 600, 900, 1800, 3600, 7200, 10800, 14400, 21600, 43200, 86400, 172800, 604800, 1209600];
 const MIN_TICK_GAP = 76; // px between x-axis labels
 
 function lineChart(container, opts) {
@@ -585,15 +783,35 @@ function lineChart(container, opts) {
   // x axis: steps aligned to local time
   const span = x1 - x0;
   const maxTicks = Math.max(2, Math.floor(iw / MIN_TICK_GAP));
-  const step = TIME_STEPS.find((s) => span / s <= maxTicks) || 172800;
-  const off = -new Date().getTimezoneOffset() * 60;
-  for (let t = Math.ceil((x0 + off) / step) * step - off; t <= x1; t += step) {
+  const xTicks = [];
+  if (span > 90 * 86400) {
+    // Months, starting at the first 1st-of-the-month in range.
+    const d = new Date(x0 * 1000);
+    d.setDate(1);
+    d.setHours(0, 0, 0, 0);
+    d.setMonth(d.getMonth() + 1);
+    const months = [];
+    while (d.getTime() / 1000 <= x1) {
+      months.push(d.getTime() / 1000);
+      d.setMonth(d.getMonth() + 1);
+    }
+    const every = Math.ceil(months.length / maxTicks);
+    months.filter((_, i) => i % every === 0).forEach((t) => xTicks.push([t,
+      new Date(t * 1000).toLocaleDateString([], { month: 'short', year: '2-digit' })]));
+  } else {
+    const step = TIME_STEPS.find((s) => span / s <= maxTicks) || TIME_STEPS[TIME_STEPS.length - 1];
+    const off = -new Date().getTimezoneOffset() * 60;
+    for (let t = Math.ceil((x0 + off) / step) * step - off; t <= x1; t += step) {
+      xTicks.push([t, step >= 86400
+        ? new Date(t * 1000).toLocaleDateString([], { month: 'short', day: 'numeric' })
+        : fmtClock(t, false)]);
+    }
+  }
+  for (const [t, text] of xTicks) {
     const x = X(t);
     if (x < M.l + 16 || x > W - M.r - 16) continue;
     const label = svg('text', { class: 'tick', x, y: H - 6, 'text-anchor': 'middle' });
-    label.textContent = step >= 86400
-      ? new Date(t * 1000).toLocaleDateString([], { month: 'short', day: 'numeric' })
-      : fmtClock(t, false);
+    label.textContent = text;
     root.append(label);
   }
 
@@ -663,7 +881,7 @@ function lineChart(container, opts) {
         h('b', { text: p ? fmt(p.v) : '—' }),
         h('span', { text: p && p.extra ? `${s.label} · ${p.extra}` : s.label })));
     });
-    tip.replaceChildren(h('div', { class: 'tt-time', text: fmtClock(t, opts.days) }), ...rows);
+    tip.replaceChildren(h('div', { class: 'tt-time', text: opts.tipTime ? opts.tipTime(t) : fmtClock(t, false) }), ...rows);
     tip.hidden = false;
     const rect = root.getBoundingClientRect();
     if (clientX == null) {
@@ -723,19 +941,16 @@ function setupDialog() {
     const aName = $('#agent-name').value.trim() || 'my-server';
     $('#agent-config').textContent =
       `hosts:\n  - name: ${yamlName(aName)}\n    mode: agent\n    token: ${token}`;
+    const docker = $('#add-docker').checked ? ' --docker' : '';
+    $('#docker-warning').hidden = !docker;
     $('#agent-install').textContent =
-      `curl -fsSL ${origin}/api/agent/install.sh | sudo sh -s -- --url ${quote(origin)} --token ${token}`;
+      `curl -fsSL ${origin}/api/agent/install.sh | sudo sh -s -- --url ${quote(origin)} --token ${token}${docker}`;
 
     const sName = $('#ssh-name').value.trim() || 'my-server';
     const addr = $('#ssh-address').value.trim() || '192.168.1.10';
     const key = state.meta ? state.meta.ssh_public_key : '<loading…>';
-    $('#ssh-setup').textContent = [
-      'sudo useradd --system --create-home --shell /bin/sh serverstats',
-      'sudo install -d -m 700 -o serverstats -g serverstats ~serverstats/.ssh',
-      `echo ${quote('restrict ' + key)} | sudo tee -a ~serverstats/.ssh/authorized_keys`,
-      'sudo chown serverstats: ~serverstats/.ssh/authorized_keys',
-      'sudo chmod 600 ~serverstats/.ssh/authorized_keys',
-    ].join('\n');
+    $('#ssh-setup').textContent =
+      `curl -fsSL ${origin}/api/agent/install.sh | sudo sh -s -- --url ${quote(origin)} --ssh-key ${quote(key)}${docker}`;
     $('#ssh-config').textContent =
       `hosts:\n  - name: ${yamlName(sName)}\n    mode: ssh\n    address: ${yamlName(addr)}\n    user: serverstats`;
   }
@@ -755,7 +970,7 @@ function setupDialog() {
   });
   dialog.querySelector('[data-action="close"]').addEventListener('click', () => dialog.close());
   dialog.addEventListener('click', (e) => { if (e.target === dialog) dialog.close(); });
-  ['#agent-name', '#ssh-name', '#ssh-address'].forEach((id) => $(id).addEventListener('input', update));
+  ['#agent-name', '#ssh-name', '#ssh-address', '#add-docker'].forEach((id) => $(id).addEventListener('input', update));
 
   dialog.querySelectorAll('[role="tab"]').forEach((tab) => tab.addEventListener('click', () => {
     dialog.querySelectorAll('[role="tab"]').forEach((t) => t.setAttribute('aria-selected', String(t === tab)));

@@ -6,9 +6,10 @@ A small, self-hosted dashboard for the Linux machines you run. It tracks:
 - **RAM**: used/available memory and swap
 - **Disk utilization**: per-device busy %, read/write throughput
 - **Storage space**: used/free per filesystem, tracked over time so you can see disks filling up
-- **Network** throughput and **processes** (sortable/filterable, like `top` for your whole fleet)
+- **Network** throughput, **load average**, **task counts** and **processes** (sortable/filterable, like `top` for your whole fleet)
+- **Docker** (optional): CPU, memory, disk I/O, network and disk space per compose stack and container
 
-It keeps up to 7 days of history by default. It runs in one Docker container with SQLite, has no build step, and is designed to sit behind **Authentik**.
+History is kept for 400 days by default, so the charts go from the last hour out to a full year. Full-detail samples are kept for 3 days, 5-minute averages for 90 days, and hourly averages after that, so a year of history is only a few MB per host. It runs in one Docker container with SQLite, has no build step, and is designed to sit behind **Authentik**.
 
 ## How hosts are monitored: agent or SSH
 
@@ -16,13 +17,13 @@ Both modes run the same collector (`agent/serverstats_agent.py`). It uses only t
 
 | | **Push agent** (recommended) | **SSH pull** |
 |---|---|---|
-| Install on host | One Python file plus a systemd unit (a one-line installer) | Nothing, just `python3` and an `authorized_keys` entry |
+| Install on host | One Python file plus a systemd unit (a one-line installer) | One Python file plus a locked-down `authorized_keys` entry (a one-line installer) |
 | Network | Host makes outbound HTTPS to ServerStats. Works behind NAT, and the host needs no open ports | ServerStats must reach the host's SSH port |
-| If the ServerStats server is compromised | The attacker gets **no access to your hosts**. The server only receives data | The attacker gets SSH access (as an unprivileged user) to every host. See the hardening options below |
+| If the ServerStats server is compromised | The attacker gets **no access to your hosts**. The server only receives data | The attacker can make hosts run the collector, and nothing else: the key is locked to it by a forced command |
 | Runs as | Throwaway unprivileged user (`DynamicUser`) in a locked-down systemd sandbox | Unprivileged `serverstats` user |
 | Accuracy | CPU and disk rates are averaged over the whole report interval | 1-second sample at each poll |
 
-**Why agents are the default:** a monitoring server that holds SSH keys to every machine is a juicy target, and this one is internet-facing. With the push model, the server never has credentials for your hosts. Each host only has a token that lets it submit its own stats. SSH mode is still handy for boxes where you'd rather not install anything.
+**Why agents are the default:** a monitoring server that holds SSH keys to every machine is a juicy target, and this one is internet-facing. With the push model, the server never has credentials for your hosts. Each host only has a token that lets it submit its own stats. SSH mode is handy when a host can't reach the server, or you'd rather not run a service on it.
 
 ## Quick start
 
@@ -60,7 +61,7 @@ The easiest way is the **Add host** button in the UI. It generates a token and g
    ```
    This installs `/usr/local/bin/serverstats-agent`, writes the token to `/etc/serverstats-agent.env` (mode 600), and starts a hardened `serverstats-agent.service`. Check it with `journalctl -u serverstats-agent -f`. To remove it, run the same script with `--uninstall`.
 
-   Other installer options: `--interval 15` sets seconds between reports, and `--ca-file /path/ca.pem` is for a private CA. Longer intervals are fine: the agent tells the server its interval, so a host is only marked offline after it misses about three reports.
+   Add `--docker` for the Docker section (see below). Other installer options: `--interval 15` sets seconds between reports, and `--ca-file /path/ca.pem` is for a private CA. Longer intervals are fine: the agent tells the server its interval, so a host is only marked offline after it misses about three reports.
 
    You can also run the installer from a checkout of this repo (`sudo ./agent/install.sh --url … --token …`). Without systemd (Alpine/OpenRC, containers, …), run the script under your init system of choice:
    `SERVERSTATS_URL=… SERVERSTATS_TOKEN=… /usr/local/bin/serverstats-agent`
@@ -69,17 +70,17 @@ The agent identifies itself only by its token. A host can't report as another ho
 
 ### SSH
 
-1. Get ServerStats' public key from **Add host → SSH** in the UI, or with
-   `docker compose exec serverstats cat /data/ssh/id_ed25519.pub`. The key pair is generated on first start and stored in the data volume.
-2. On the host, create an unprivileged user and authorize the key:
+1. On the host, run the installer in SSH mode. **Add host → SSH** in the UI fills in the server's public key for you:
    ```sh
-   sudo useradd --system --create-home --shell /bin/sh serverstats
-   sudo install -d -m 700 -o serverstats -g serverstats ~serverstats/.ssh
-   echo 'restrict ssh-ed25519 AAAA… serverstats' | sudo tee -a ~serverstats/.ssh/authorized_keys
-   sudo chown serverstats: ~serverstats/.ssh/authorized_keys
-   sudo chmod 600 ~serverstats/.ssh/authorized_keys
+   curl -fsSL https://stats.example.com/api/agent/install.sh \
+     | sudo sh -s -- --url https://stats.example.com --ssh-key 'ssh-ed25519 AAAA… serverstats'
    ```
-3. Add the host to `config/config.yaml` and restart ServerStats:
+   This installs the collector as `/usr/local/bin/serverstats-agent`, creates a `serverstats` user, and authorizes the key with:
+   ```
+   restrict,command="/usr/local/bin/serverstats-agent --once" ssh-ed25519 AAAA… serverstats
+   ```
+   Add `--ssh-from 10.0.0.5` to accept the key only from ServerStats' address. To set a host up by hand, write that same line yourself. The server's key is also in `/data/ssh/id_ed25519.pub` inside the container.
+2. Add the host to `config/config.yaml` and restart ServerStats:
    ```yaml
      - name: pi
        mode: ssh
@@ -89,19 +90,18 @@ The agent identifies itself only by its token. A host can't report as another ho
        # interval: 15
    ```
 
+**The key can only ever run the collector.** With `command=` in `authorized_keys`, sshd ignores whatever command the client asks for and runs the collector instead. `restrict` blocks port forwarding, SFTP, PTYs and `~/.ssh/rc`. ServerStats never sends code or asks for a shell: the only command it requests is a harmless `echo` marker. A correctly set-up host runs the collector instead and returns stats. A host whose key isn't locked down would run the `echo`, and ServerStats refuses to use it and shows how to fix it. So even someone who steals the server's key can't do anything on your hosts except read stats.
+
 The host key is **trusted on first use** and pinned in `/data/known_hosts.json`. If it later changes, ServerStats refuses to connect and shows an error on the dashboard. You can pin a key up front with `host_key: "SHA256:…"` (get it with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`).
 
-**Hardening SSH mode (recommended):** by default the server pipes the collector to `python3 -`, which means the key can run arbitrary code as `serverstats` on that host. To lock the key down to *only* collecting stats, install the collector on the host and force it:
+### Docker and compose stacks (optional)
 
-```sh
-curl -fsSL https://stats.example.com/api/agent/serverstats_agent.py -o serverstats_agent.py
-sudo install -m 755 serverstats_agent.py /usr/local/bin/serverstats-agent
-```
-```
-restrict,from="10.0.0.5",command="/usr/local/bin/serverstats-agent --once" ssh-ed25519 AAAA… serverstats
-```
+Add `--docker` to either installer command to get a **Docker** section on the host's page. It shows how much of the host's CPU, memory, disk I/O, network and disk space each compose stack uses, and you can expand each stack into its containers.
 
-`from=` should be the IP ServerStats connects from. With a forced command, the host ignores whatever ServerStats sends and just prints one sample, so a stolen key is worth very little.
+- **Usage comes from the kernel.** CPU, memory and I/O are read from each container's cgroup, the same numbers `docker stats` uses, without its per-container delay.
+- **Disk space** is each container's writable layer plus its volumes (bind mounts aren't counted). The push agent measures it every 15 minutes; it isn't available in SSH mode.
+- **Grouping into stacks needs the Docker API.** Stacks are identified by the `com.docker.compose.project` label, which only the Docker API has. So `--docker` adds the collector to the `docker` group, and **access to the Docker socket is root-equivalent on that host**. The collector only ever sends three fixed, read-only requests (`GET /containers/json`, `GET /containers/<id>/json`, `GET /system/df`). It never acts on anything the server sends, but it's still your call whether that access is acceptable. Without `--docker`, nothing changes.
+- Per-container disk I/O needs cgroup v2 (the default on current distros). On cgroup v1 hosts it shows 0, as it does in `docker stats`.
 
 ## Putting it behind Authentik
 
@@ -221,6 +221,14 @@ For Caddy, Nginx Proxy Manager, and others, follow [Authentik's proxy provider d
 
 ## Security notes
 
+**No remote code execution by design:**
+- The **agent** only sends data. It never runs or interprets anything the server returns, and it refuses HTTP redirects, so the token can't be bounced elsewhere. A compromised ServerStats server can't run code on agent hosts.
+- In **SSH mode** the key is locked to the collector (see above), and ServerStats refuses hosts where it isn't.
+- The **server** never executes, evaluates or unpickles anything. The config is read with `yaml.safe_load`, SQL is parameterized, and host data is validated against a strict schema. A test checks the server code for exec paths.
+- **Install time is the exception.** `curl … | sudo sh` trusts whoever serves the installer at that moment. The files come from the read-only container image, but for the strongest guarantee, install from a git checkout you've reviewed (`sudo ./agent/install.sh …`).
+
+Also:
+
 - **Don't expose port 8080 directly.** The SSO check trusts the `X-authentik-username` header, which is only meaningful when every request comes through your proxy. The compose file binds to `127.0.0.1`; with Traefik, use a Docker network and no published port.
 - Agent tokens are compared in constant time. Ingest payloads are capped at 4 MiB and normalized to a strict schema. Everything from hosts (process names, command lines) is rendered as text, never HTML. The UI sends a strict Content-Security-Policy.
 - The UI is read-only: nothing in it can change or run anything on your hosts.
@@ -228,7 +236,7 @@ For Caddy, Nginx Proxy Manager, and others, follow [Authentik's proxy provider d
 
 ## Configuration
 
-See [`config.example.yaml`](config.example.yaml) for all options: offline threshold, history retention, SSH poll interval, process cap, and auth header.
+See [`config.example.yaml`](config.example.yaml) for all options: offline threshold, history retention (`retention_days`, default 400), SSH poll interval, process cap, and auth header.
 
 | Env var | Default | |
 |---|---|---|
@@ -259,8 +267,8 @@ Layout:
 agent/serverstats_agent.py   collector + push agent (stdlib only)
 agent/install.sh             systemd installer for the agent
 server/app/main.py           FastAPI app: UI API, agent ingest, auth gate
-server/app/ssh_poller.py     SSH pull mode (asyncssh), host key pinning
-server/app/store.py          latest samples + SQLite history
+server/app/ssh_poller.py     SSH pull mode (asyncssh): forced-command check, host key pinning
+server/app/store.py          latest samples + tiered SQLite history (raw / 5 min / 1 h)
 server/app/schema.py         payload normalization
 server/app/static/           the UI (plain HTML/CSS/JS, no build step)
 ```

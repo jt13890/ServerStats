@@ -69,10 +69,13 @@
 
       <div class="toolbar">
         <div class="seg" role="radiogroup" aria-label="History range" id="range">
-          <button type="button" role="radio" data-hours="1">1 hour</button>
-          <button type="button" role="radio" data-hours="6">6 hours</button>
-          <button type="button" role="radio" data-hours="24">24 hours</button>
-          <button type="button" role="radio" data-hours="168">7 days</button>
+          <button type="button" role="radio" data-hours="1" aria-label="1 hour">1h</button>
+          <button type="button" role="radio" data-hours="6" aria-label="6 hours">6h</button>
+          <button type="button" role="radio" data-hours="24" aria-label="24 hours">24h</button>
+          <button type="button" role="radio" data-hours="168" aria-label="7 days">7d</button>
+          <button type="button" role="radio" data-hours="720" aria-label="30 days">30d</button>
+          <button type="button" role="radio" data-hours="4380" aria-label="6 months">6mo</button>
+          <button type="button" role="radio" data-hours="8760" aria-label="1 year">1y</button>
         </div>
       </div>
       <div class="charts">
@@ -91,6 +94,14 @@
         <figure class="card chart-card">
           <figcaption>Network</figcaption>
           <div class="chart" id="chart-net"></div>
+        </figure>
+        <figure class="card chart-card">
+          <figcaption>Load average</figcaption>
+          <div class="chart" id="chart-load"></div>
+        </figure>
+        <figure class="card chart-card">
+          <figcaption>Tasks</figcaption>
+          <div class="chart" id="chart-tasks"></div>
         </figure>
       </div>
 
@@ -112,6 +123,31 @@
             <tbody></tbody>
           </table>
         </div>
+      </div>
+
+      <div class="card" id="docker-card" hidden>
+        <div class="proc-head">
+          <h2>Docker <span id="docker-count" class="muted"></span></h2>
+        </div>
+        <p id="docker-summary" class="docker-summary"></p>
+        <div id="docker-error" class="banner" hidden></div>
+        <div class="table-wrap">
+          <table class="table docker-table" id="docker-table">
+            <thead>
+              <tr>
+                <th>Stack</th>
+                <th class="num">Containers</th>
+                <th class="meter-col">CPU <span class="muted">of host</span></th>
+                <th class="meter-col">Memory <span class="muted">of RAM</span></th>
+                <th class="num">Disk read / write</th>
+                <th class="num">Network in / out</th>
+                <th class="num">Disk space</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p id="docker-note" class="muted docker-note"></p>
       </div>
 
       <div class="card">
@@ -166,15 +202,18 @@
     </div>
 
     <div data-panel="ssh" hidden>
-      <p>ServerStats connects over SSH and runs the collector with <code>python3</code>. Nothing is installed on the host.</p>
+      <p>ServerStats connects over SSH. The host's key entry is locked to the collector with a forced command, so the key can't run anything else, even if someone stole it from this server.</p>
       <label class="field">Host name <input id="ssh-name" class="input" value="my-server" spellcheck="false"></label>
       <label class="field">Address <input id="ssh-address" class="input" value="192.168.1.10" spellcheck="false"></label>
-      <p><strong>1.</strong> On the host, create an unprivileged user and authorize the ServerStats key:</p>
+      <p><strong>1.</strong> Run this on the host. It installs the collector and a <code>serverstats</code> user whose key can only run it:</p>
       <pre id="ssh-setup" class="code"></pre>
       <p><strong>2.</strong> Add this to <code>config.yaml</code> and restart ServerStats:</p>
       <pre id="ssh-config" class="code"></pre>
-      <p class="muted">The host key is trusted on first connect and pinned afterwards.</p>
+      <p class="muted">The host key is trusted on first connect and pinned afterwards. Hosts whose key isn't locked to the collector are refused.</p>
     </div>
+
+    <label class="check dialog-docker"><input id="add-docker" type="checkbox"> Also show Docker containers and compose stacks</label>
+    <p id="docker-warning" class="muted" hidden>This lets the collector read the Docker socket (docker group), which is root-equivalent on that host. It only makes fixed, read-only requests.</p>
   </dialog>
 
   <div id="tooltip" class="tooltip" role="status" hidden></div>

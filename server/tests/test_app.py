@@ -154,3 +154,205 @@ def test_slow_agent_is_not_flagged_offline(client, monkeypatch):
 def test_interval_is_clamped(client):
     ingest(client, TOKEN_A, sample(interval=10**9))
     assert client.get("/api/hosts/alpha", headers=USER).json()["interval"] == 3600.0
+
+
+# -- long-term history ----------------------------------------------------------
+
+def test_year_of_history_is_rolled_up_and_pruned(tmp_path):
+    import time as _time
+
+    from app.store import Store
+
+    store = Store(tmp_path / "db.sqlite", retention_days=400)
+    now = _time.time()
+    # One sample every 2h for 420 days; CPU ramps smoothly with age so values can be checked.
+    for k in range(420 * 12, -1, -1):
+        t = now - k * 7200
+        store.record("h", {"cpu": {"percent": (now - t) / 86400 / 4.2}, "disks": []}, now=t)
+    store.rollup(now)
+    store.prune({"h"}, now)
+
+    def count(table):
+        return store._db.execute(f"SELECT COUNT(*), MIN(ts) FROM {table}").fetchone()
+
+    raw, m5, h1 = count("history"), count("history_5m"), count("history_1h")
+    assert raw[1] >= now - 3 * 86400 - 3600        # raw kept ~3 days
+    assert m5[1] >= now - 90 * 86400 - 3600        # 5-minute tier kept 90 days
+    assert h1[1] >= now - 400 * 86400 - 7200       # hourly tier kept retention_days
+    assert h1[0] > 400 * 11                        # ...and it has most of a year+
+
+    year = store.history("h", 24 * 365)
+    pts = year["metrics"]
+    assert year["bucket"] >= 3600 and 200 <= len(pts) <= 245
+    assert pts[0]["t"] <= now - 360 * 86400        # reaches back a full year
+    assert pts[-1]["t"] >= now - 2 * year["bucket"]  # and up to now, not just the last rollup
+    # Values survive the averaging: ~200 days ago CPU was ~200/4.2.
+    mid = min(pts, key=lambda p: abs(p["t"] - (now - 200 * 86400)))
+    assert abs(mid["cpu"] - 200 / 4.2) < 1
+
+    hour = store.history("h", 1)
+    assert hour["bucket"] < 300  # short ranges still come from raw samples
+
+
+def test_rollup_is_idempotent(tmp_path):
+    import time as _time
+
+    from app.store import Store
+
+    store = Store(tmp_path / "db.sqlite", retention_days=400)
+    now = _time.time()
+    for k in range(100):
+        store.record("h", {"cpu": {"percent": 50.0}, "disks": []}, now=now - 10000 + k * 60)
+    store.rollup(now)
+    first = store._db.execute("SELECT COUNT(*), SUM(cpu) FROM history_5m").fetchone()
+    store.rollup(now)
+    store.rollup(now + 1)
+    assert store._db.execute("SELECT COUNT(*), SUM(cpu) FROM history_5m").fetchone() == first
+
+
+def test_trends_endpoint(client):
+    ingest(client, TOKEN_A, sample())
+    tr = client.get("/api/trends", headers=USER).json()
+    assert set(tr["hosts"]) == {"alpha"}
+    assert {"t", "cpu", "mem", "disk_util", "storage"} <= tr["hosts"]["alpha"].keys()
+
+
+def test_retention_setting(tmp_path):
+    from app.config import ConfigError, load
+
+    p = tmp_path / "c.yaml"
+    p.write_text("settings: {history_hours: 24}\nhosts: []\n")
+    assert load(p).settings.retention_days == 400  # old setting ignored (logged)
+    p.write_text("settings: {retention_days: 30}\nhosts: []\n")
+    assert load(p).settings.retention_days == 30
+    p.write_text("settings: {retention_days: 0}\nhosts: []\n")
+    with pytest.raises(ConfigError):
+        load(p)
+
+
+# -- SSH: no code is ever sent --------------------------------------------------
+
+class _FakeStream:
+    def __init__(self, data):
+        self._data = data
+
+    async def read(self, n):
+        chunk, self._data = self._data[:n], self._data[n:]
+        return chunk
+
+
+class _FakeConn:
+    """Stands in for an SSH connection; `forced` = host has the forced command."""
+
+    def __init__(self, forced, output=b""):
+        self.forced, self.output, self.commands = forced, output, []
+
+    def create_process(self, command, **kw):
+        self.commands.append(command)
+        conn = self
+
+        class Proc:
+            exit_status = 0
+
+            async def __aenter__(self):
+                out = conn.output if conn.forced else b"serverstats-key-not-restricted\n"
+                self.stdout, self.stderr = _FakeStream(out), _FakeStream(b"")
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def wait(self):
+                return None
+
+        return Proc()
+
+
+def _poller():
+    from app.ssh_poller import SSHPoller
+
+    return SSHPoller([], None, None, 500)
+
+
+def test_ssh_only_ever_requests_the_harmless_probe():
+    import asyncio
+
+    from app.config import Host
+    from app.ssh_poller import PROBE_COMMAND
+
+    host = Host(name="h", mode="ssh", address="x")
+    conn = _FakeConn(forced=True, output=json.dumps(sample()).encode())
+    data = asyncio.run(_poller()._collect(conn, host))
+    assert data["cpu"]["count"] >= 1
+    assert conn.commands == [PROBE_COMMAND] and PROBE_COMMAND.startswith("echo ")
+
+
+def test_ssh_refuses_unrestricted_keys():
+    import asyncio
+
+    from app.config import Host
+    from app.ssh_poller import UnrestrictedKeyError
+
+    with pytest.raises(UnrestrictedKeyError):
+        asyncio.run(_poller()._collect(_FakeConn(forced=False), Host(name="h", mode="ssh", address="x")))
+
+
+def test_ssh_output_is_size_limited():
+    import asyncio
+
+    from app.config import Host
+
+    conn = _FakeConn(forced=True, output=b"{" + b" " * (9 * 1024 * 1024))
+    with pytest.raises(RuntimeError, match="too large"):
+        asyncio.run(_poller()._collect(conn, Host(name="h", mode="ssh", address="x")))
+
+
+def test_server_code_has_no_exec_paths():
+    """Nothing on the server may execute or deserialize code."""
+    import pathlib
+    import re
+
+    src = "\n".join(p.read_text() for p in pathlib.Path("app").glob("*.py"))
+    for pattern in (r"\beval\(", r"\bexec\(", r"\bpickle\b", r"\bsubprocess\b", r"os\.system", r"yaml\.load\(",
+                    r"yaml\.unsafe", r"shell=True", r"create_subprocess"):
+        assert not re.search(pattern, src), pattern
+
+
+# -- Docker ---------------------------------------------------------------------
+
+def test_cgroup_v2_counters(tmp_path, monkeypatch):
+    import agent_collector as a
+
+    cg = tmp_path / "system.slice" / "docker-abc.scope"
+    cg.mkdir(parents=True)
+    (cg / "cpu.stat").write_text("usage_usec 2500000\nuser_usec 2000000\n")
+    (cg / "memory.current").write_text("104857600\n")
+    (cg / "memory.stat").write_text("anon 50\ninactive_file 4857600\n")
+    (cg / "io.stat").write_text("8:0 rbytes=1000 wbytes=2000 rios=1\n8:16 rbytes=24 wbytes=48\n")
+    real_read = a._read
+    monkeypatch.setattr(a, "CGROUP_ROOT", str(tmp_path))
+    monkeypatch.setattr(a, "_read", lambda p: "0::/system.slice/docker-abc.scope\n" if p == "/proc/42/cgroup" else real_read(p))
+    assert a._cgroup_counters(42) == (2_500_000_000, 100_000_000, 1024, 2048)
+
+
+def test_docker_payload_is_normalized(client):
+    docker = {
+        "containers": [
+            {"id": "a" * 64, "name": "media-app-1", "project": "media", "service": "app", "image": "x",
+             "status": "Up 2 hours", "cpu": 50.0, "mem": 1e8, "mem_percent": 1.5, "rx_rate": "lots", "disk": 4096},
+            "junk",
+        ],
+        "volumes": [{"name": "media_data", "project": "media", "size": 1e9}, {"name": {"x": 1}}],
+        "disk_at": 1.0,
+    }
+    ingest(client, TOKEN_A, sample(docker=docker))
+    d = client.get("/api/hosts/alpha", headers=USER).json()["docker"]
+    assert len(d["containers"]) == 1
+    c = d["containers"][0]
+    assert c["id"] == "a" * 12 and c["project"] == "media" and c["cpu"] == 50.0 and c["rx_rate"] is None
+    assert d["volumes"][0]["size"] == 1e9 and d["volumes"][1]["name"] == "{'x': 1}"
+    # The fleet overview doesn't carry per-container data.
+    assert "docker" not in client.get("/api/hosts", headers=USER).json()[0]
+
+    ingest(client, TOKEN_A, sample(docker={"error": "no permission"}))
+    assert client.get("/api/hosts/alpha", headers=USER).json()["docker"] == {"error": "no permission"}
