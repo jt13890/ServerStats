@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import re
+import secrets
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -33,6 +34,36 @@ AGENT_VERSION = re.search(rb'^VERSION = "([0-9.]+)"', _agent_code, re.M).group(1
 # another site can't trigger updates through a signed-in user's browser.
 ACTION_HEADER = "X-ServerStats-Action"
 MAX_UPDATE_OFFERS = 3
+MAX_ENROLLED = 1000
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _load_join_key(rotate: bool = False) -> str:
+    """The shared key agents use to join; generated once, kept in /data."""
+    path = cfg.DATA_DIR / "join_key"
+    if not rotate and path.exists():
+        key = path.read_text().strip()
+        if len(key) >= 32:
+            return key
+    key = secrets.token_urlsafe(32)
+    path.write_text(key + "\n")
+    path.chmod(0o600)
+    return key
+
+
+def all_hosts(app) -> list[cfg.Host]:
+    """Hosts from config.yaml, then hosts that joined with the join key."""
+    conf = app.state.conf
+    names = {h.name for h in conf.hosts}
+    enrolled = [
+        cfg.Host(name=name, mode="agent", enrolled=True, token_hash=token_hash)
+        for name, token_hash in app.state.store.enrolled_hosts()
+        if name not in names  # config.yaml wins on a clash
+    ]
+    return conf.hosts + enrolled
 
 
 def _version_tuple(v: str | None) -> tuple:
@@ -47,6 +78,7 @@ def _version_tuple(v: str | None) -> tuple:
 # /api/agent/../hosts can't widen the exemption.
 PUBLIC_PATHS = frozenset({
     "/api/ingest",
+    "/api/enroll",
     "/api/agent/serverstats_agent.py",
     "/api/agent/install.sh",
     "/healthz",
@@ -70,6 +102,7 @@ async def lifespan(app: FastAPI):
     # the agent runs the new version, at most MAX_UPDATE_OFFERS times.
     app.state.update_pending = {}
     app.state.public_key = key.export_public_key("openssh").decode().strip()
+    app.state.join_key = _load_join_key() if conf.settings.enrollment else None
     poller.start()
 
     async def maintenance():
@@ -77,14 +110,15 @@ async def lifespan(app: FastAPI):
         while True:
             try:
                 store.rollup()
-                store.prune({h.name for h in conf.hosts})
+                store.prune({h.name for h in all_hosts(app)})
             except Exception:
                 log.exception("history maintenance failed")
             await asyncio.sleep(300)
 
     pruner = asyncio.create_task(maintenance())
-    log.info("loaded %d host(s): %d agent, %d ssh", len(conf.hosts),
-             sum(h.mode == "agent" for h in conf.hosts), sum(h.mode == "ssh" for h in conf.hosts))
+    log.info("loaded %d host(s) from config (%d agent, %d ssh), %d joined with the join key",
+             len(conf.hosts), sum(h.mode == "agent" for h in conf.hosts),
+             sum(h.mode == "ssh" for h in conf.hosts), len(store.enrolled_hosts()))
     yield
     pruner.cancel()
     await poller.stop()
@@ -153,6 +187,7 @@ def _summary(request: Request, host: cfg.Host, with_processes: bool = False) -> 
         # Only surface errors that are newer than the last good sample.
         error=st.error if st.error and (st.received_at is None or st.error_at > st.received_at) else None,
         host_key=st.host_key,
+        enrolled=host.enrolled,
         server_time=now,
         update_pending=host.name in request.app.state.update_pending,
         update_available=host.mode == "agent" and bool(data)
@@ -165,7 +200,7 @@ def _summary(request: Request, host: cfg.Host, with_processes: bool = False) -> 
 
 
 def _host_or_404(request: Request, name: str) -> cfg.Host:
-    host = request.app.state.conf.host(name)
+    host = next((h for h in all_hosts(request.app) if h.name == name), None)
     if host is None:
         raise HTTPException(404, "unknown host")
     return host
@@ -183,12 +218,13 @@ async def meta(request: Request):
         "stale_after": settings.stale_after,
         "retention_days": settings.retention_days,
         "agent_version": AGENT_VERSION,
+        "join_key": request.app.state.join_key,
     }
 
 
 @app.get("/api/hosts")
 async def list_hosts(request: Request):
-    return [_summary(request, h) for h in request.app.state.conf.hosts]
+    return [_summary(request, h) for h in all_hosts(request.app)]
 
 
 @app.get("/api/hosts/{name}")
@@ -205,7 +241,7 @@ async def get_history(request: Request, name: str, hours: float = 1.0):
 @app.get("/api/trends")
 async def get_trends(request: Request):
     """Last hour of CPU/memory/disk/storage for every host, for the overview."""
-    known = {h.name for h in request.app.state.conf.hosts}
+    known = {h.name for h in all_hosts(request.app)}
     trends = request.app.state.store.trends()
     trends["hosts"] = {k: v for k, v in trends["hosts"].items() if k in known}
     return trends
@@ -247,7 +283,7 @@ async def update_all(request: Request):
     """Queue updates for every outdated agent that accepts them."""
     _require_action_header(request)
     queued, skipped = [], {}
-    for host in request.app.state.conf.hosts:
+    for host in all_hosts(request.app):
         if host.mode != "agent":
             continue
         reason = _request_update(request, host)
@@ -262,11 +298,63 @@ async def update_all(request: Request):
 
 def _host_for_token(request: Request, token: str) -> cfg.Host | None:
     match = None
-    for h in request.app.state.conf.hosts:
+    hashed = _token_hash(token)
+    for h in all_hosts(request.app):
         # Compare against every token so timing doesn't reveal which exist.
         if h.token and hmac.compare_digest(h.token.encode(), token.encode()):
             match = h
+        if h.token_hash and hmac.compare_digest(h.token_hash, hashed):
+            match = h
     return match
+
+
+@app.post("/api/enroll")
+async def enroll(request: Request):
+    """An agent joins: join key in, its own name and token out."""
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except ValueError:
+        raise HTTPException(400, "invalid JSON")
+    join_key = request.app.state.join_key
+    key = str(body.get("key") or "")
+    if not join_key or not key or not hmac.compare_digest(key.encode(), join_key.encode()):
+        await asyncio.sleep(0.5)  # slow down guessing
+        raise HTTPException(401, "invalid join key (or enrollment is turned off)")
+    name = str(body.get("name") or "").strip()
+    if not cfg.NAME_RE.match(name):
+        raise HTTPException(400, "name must be 1-64 letters, digits, '.', '_' or '-'")
+    if any(h.name == name for h in all_hosts(request.app)):
+        raise HTTPException(409, f"a host named {name!r} already exists; pick another name with --name, "
+                                 "or remove the old one in the dashboard")
+    if len(request.app.state.store.enrolled_hosts()) >= MAX_ENROLLED:
+        raise HTTPException(429, "too many enrolled hosts")
+    token = secrets.token_hex(32)
+    if not request.app.state.store.enroll(name, _token_hash(token), str(body.get("hostname") or "")[:253]):
+        raise HTTPException(409, f"a host named {name!r} already exists")
+    log.info("host %s joined", name)
+    return {"name": name, "token": token}
+
+
+@app.post("/api/join-key/rotate")
+async def rotate_join_key(request: Request):
+    """New join key; hosts that already joined keep working."""
+    _require_action_header(request)
+    if not request.app.state.conf.settings.enrollment:
+        raise HTTPException(409, "enrollment is turned off in config.yaml")
+    request.app.state.join_key = _load_join_key(rotate=True)
+    return {"join_key": request.app.state.join_key}
+
+
+@app.post("/api/hosts/{name}/remove")
+async def remove_host(request: Request, name: str):
+    """Remove a host that joined with the join key, with all its data."""
+    _require_action_header(request)
+    host = _host_or_404(request, name)
+    if not host.enrolled:
+        raise HTTPException(409, "this host is defined in config.yaml; remove it there")
+    request.app.state.store.remove_host(host.name)
+    request.app.state.update_pending.pop(host.name, None)
+    return {"ok": True}
 
 
 @app.post("/api/ingest")

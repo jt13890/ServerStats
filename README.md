@@ -30,13 +30,13 @@ Both modes run the same collector (`agent/serverstats_agent.py`). It uses only t
 ```sh
 git clone <this repo> serverstats && cd serverstats
 mkdir -p config
-cp config.example.yaml config/config.yaml   # then edit it (see "Adding hosts")
+cp config.example.yaml config/config.yaml   # optional: settings, SSH hosts, hosts with fixed tokens
 docker compose up -d --build
 ```
 
 The app listens on `127.0.0.1:8080`, so it's not reachable from other machines until you put a reverse proxy in front (see [Putting it behind Authentik](#putting-it-behind-authentik)). By default it **rejects UI and API requests that don't carry Authentik's `X-authentik-username` header** (`require_auth_header: true`). For a quick local test without a proxy, set that to `false` temporarily.
 
-Edit `config/config.yaml` and restart the container (`docker compose restart`) to add or remove hosts.
+Agents join by themselves (see [Adding hosts](#adding-hosts)), so you only need to touch `config/config.yaml` for settings and SSH hosts. Restart the container (`docker compose restart`) after editing it. Without a config file, ServerStats starts with the defaults.
 
 **Trying it on your LAN before Authentik is set up:** create a `.env` file next to `docker-compose.yml` containing `SERVERSTATS_BIND=0.0.0.0` (and `SERVERSTATS_PORT=…` if 8080 is taken), and set `require_auth_header: false` in the config. Anyone on your network can then view the dashboard, so undo both once Authentik is in front.
 
@@ -46,19 +46,21 @@ The easiest way is the **Add host** button in the UI. It generates a token and g
 
 ### Agent
 
-1. Generate a token: `openssl rand -hex 32`
-2. Add the host to `config/config.yaml` and restart ServerStats:
-   ```yaml
-   hosts:
-     - name: nas
-       mode: agent
-       token: <the token>
-   ```
-3. On the host (needs systemd or OpenRC, `python3`, and `curl` or `wget`):
-   ```sh
-   curl -fsSL https://stats.example.com/api/agent/install.sh \
-     | sudo sh -s -- --url https://stats.example.com --token <the token>
-   ```
+On the host (needs systemd or OpenRC, `python3`, and `curl` or `wget`), run the command from **Add host** in the UI. It looks like this:
+```sh
+curl -fsSL https://stats.example.com/api/agent/install.sh \
+  | sudo sh -s -- --url https://stats.example.com --join <join key> [--name nas]
+```
+The host joins with the server's **join key** and appears on the dashboard within seconds. No config edit or restart is needed.
+- **Tokens:** the server gives the host its own token, and stores only a hash of it.
+- **Naming:** the host uses its hostname unless you pass `--name`. Names must be unique, so a host can't take over another's name.
+- **Reinstalling** keeps the token the host already has.
+- **The join key** is only good for adding hosts, but anyone with it can add one, so treat it like a password. **Add host → Make a new join key** replaces it; hosts that already joined keep working.
+- **Removing:** enrolled hosts have a **Remove host** button, which deletes them and their history.
+- **Turning joining off:** set `enrollment: false` in the config.
+
+Alternatively, list the host in `config/config.yaml` yourself (`name`, `mode: agent`, and a token from `openssl rand -hex 32`), restart ServerStats, and install with `--token <the token>` instead of `--join`.
+
    This installs `/usr/local/bin/serverstats-agent`, writes the token to `/etc/serverstats-agent.env`, and starts the service:
    - **systemd:** a hardened `serverstats-agent.service` running as a throwaway user. Logs: `journalctl -u serverstats-agent -f`.
    - **OpenRC** (Alpine, postmarketOS, Gentoo): an `/etc/init.d/serverstats-agent` service supervised by `supervise-daemon`, running as a dedicated unprivileged `serverstats-agent` user. The agent reads the token from the env file (readable only by root and that user), so it never appears in `ps`. Logs: `/var/log/serverstats-agent.log`.
@@ -117,11 +119,12 @@ Add `--docker` to either installer command to get a **Docker** section on the ho
 
 ## Putting it behind Authentik
 
-The UI and its API sit behind Authentik. These four exact paths **must bypass** Authentik, because agents authenticate with their own per-host bearer tokens:
+The UI and its API sit behind Authentik. These five exact paths **must bypass** Authentik, because agents authenticate with their own per-host tokens or the join key:
 
 | Path | Purpose |
 |---|---|
 | `/api/ingest` | agents POST their stats here (bearer token required) |
+| `/api/enroll` | new agents join here (join key required) |
 | `/api/agent/serverstats_agent.py` | agent download, used by the installer |
 | `/api/agent/install.sh` | installer download |
 | `/healthz` | health check |
@@ -136,6 +139,7 @@ If your agents can reach ServerStats on your LAN, you can also point them at an 
    - Under *Advanced protocol settings → Unauthenticated Paths*, add:
      ```
      ^/api/ingest$
+     ^/api/enroll$
      ^/api/agent/serverstats_agent\.py$
      ^/api/agent/install\.sh$
      ^/healthz$

@@ -99,6 +99,10 @@ class Store:
                 host TEXT PRIMARY KEY, received_at REAL NOT NULL, data TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS enrolled (
+                name TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE,
+                hostname TEXT, created REAL NOT NULL
+            );
             """
         )
         # Databases from earlier versions lack some metric columns.
@@ -146,6 +150,31 @@ class Store:
     def record_error(self, host: str, error: str) -> None:
         st = self.state(host)
         st.error, st.error_at = error, time.time()
+
+    # -- hosts that joined with the join key ---------------------------------
+
+    def enrolled_hosts(self) -> list[tuple[str, str]]:
+        with self._lock:
+            return self._db.execute("SELECT name, token_hash FROM enrolled ORDER BY created").fetchall()
+
+    def enroll(self, name: str, token_hash: str, hostname: str) -> bool:
+        """Register a host; False if the name is already taken."""
+        with self._lock, self._db:
+            try:
+                self._db.execute(
+                    "INSERT INTO enrolled (name, token_hash, hostname, created) VALUES (?,?,?,?)",
+                    (name, token_hash, hostname, time.time()),
+                )
+            except sqlite3.IntegrityError:
+                return False
+        return True
+
+    def remove_host(self, name: str) -> None:
+        """Forget an enrolled host and all of its data."""
+        with self._lock, self._db:
+            for table in ("enrolled", "latest", "history", "history_5m", "history_1h", "storage_history", "storage_1h"):
+                self._db.execute(f"DELETE FROM {table} WHERE {'name' if table == 'enrolled' else 'host'} = ?", (name,))
+        self.states.pop(name, None)
 
     # -- rollups and retention ----------------------------------------------
 

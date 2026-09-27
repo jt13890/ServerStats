@@ -470,9 +470,22 @@ function renderDetail(name) {
     updateBtn.textContent = button;
   }
 
+  const removeBtn = $('#d-remove');
+  removeBtn.addEventListener('click', async () => {
+    if (!confirm(`Remove ${name} and all of its history? If its agent is still running it can't report any more; `
+      + 'uninstall it on the host (install.sh --uninstall) or join again.')) return;
+    try {
+      await apiPost(`/api/hosts/${enc}/remove`);
+      location.hash = '#/';
+    } catch (e) {
+      alert(`Couldn't remove ${name}: ${e.message}`);
+    }
+  });
+
   function drawHost() {
     markRange();
     drawUpdate();
+    removeBtn.hidden = !host.enrolled;
     setStatus($('#d-status'), host.status);
     const sub = [
       host.description,
@@ -1010,13 +1023,21 @@ function setupDialog() {
   const yamlName = (s) => (/^[A-Za-z0-9._-]+$/.test(s) ? s : JSON.stringify(s));
 
   function update() {
-    const aName = $('#agent-name').value.trim() || 'my-server';
-    $('#agent-config').textContent =
-      `hosts:\n  - name: ${yamlName(aName)}\n    mode: agent\n    token: ${token}`;
     const docker = $('#add-docker').checked ? ' --docker' : '';
     $('#docker-warning').hidden = !docker;
-    $('#agent-install').textContent =
-      `curl -fsSL ${origin}/api/agent/install.sh | sudo sh -s -- --url ${quote(origin)} --token ${token}${docker}`;
+    const joinKey = state.meta && state.meta.join_key;
+    $('#join-flow').hidden = !joinKey;
+    $('#token-flow').hidden = !!joinKey;
+    const installer = `curl -fsSL ${origin}/api/agent/install.sh | sudo sh -s -- --url ${quote(origin)}`;
+    if (joinKey) {
+      const name = $('#agent-name').value.trim();
+      $('#agent-install').textContent =
+        `${installer} --join ${quote(joinKey)}${name ? ' --name ' + quote(name) : ''}${docker}`;
+    }
+    const aName = $('#agent-name-cfg').value.trim() || 'my-server';
+    $('#agent-config').textContent =
+      `hosts:\n  - name: ${yamlName(aName)}\n    mode: agent\n    token: ${token}`;
+    $('#agent-install-token').textContent = `${installer} --token ${token}${docker}`;
 
     const sName = $('#ssh-name').value.trim() || 'my-server';
     const addr = $('#ssh-address').value.trim() || '192.168.1.10';
@@ -1042,7 +1063,17 @@ function setupDialog() {
   });
   dialog.querySelector('[data-action="close"]').addEventListener('click', () => dialog.close());
   dialog.addEventListener('click', (e) => { if (e.target === dialog) dialog.close(); });
-  ['#agent-name', '#ssh-name', '#ssh-address', '#add-docker'].forEach((id) => $(id).addEventListener('input', update));
+  ['#agent-name', '#agent-name-cfg', '#ssh-name', '#ssh-address', '#add-docker'].forEach((id) => $(id).addEventListener('input', update));
+  $('#rotate-join').addEventListener('click', async () => {
+    if (!confirm('Make a new join key? The current one stops working for new hosts; hosts that already joined are unaffected.')) return;
+    try {
+      const r = await apiPost('/api/join-key/rotate');
+      state.meta.join_key = r.join_key;
+      update();
+    } catch (e) {
+      alert(`Couldn't make a new join key: ${e.message}`);
+    }
+  });
 
   dialog.querySelectorAll('[role="tab"]').forEach((tab) => tab.addEventListener('click', () => {
     dialog.querySelectorAll('[role="tab"]').forEach((t) => t.setAttribute('aria-selected', String(t === tab)));

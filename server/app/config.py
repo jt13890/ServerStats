@@ -32,6 +32,8 @@ class Host:
     interval: float = 15.0
     host_key: str | None = None  # optional pinned SHA256 fingerprint
     description: str = ""
+    enrolled: bool = False  # joined with the join key rather than listed in config.yaml
+    token_hash: str | None = None  # enrolled hosts: sha256 of their token
 
 
 @dataclass
@@ -43,6 +45,7 @@ class Settings:
     max_procs: int = 500
     auth_header: str = "X-authentik-username"
     require_auth_header: bool = True
+    enrollment: bool = True  # let agents join with the join key
 
 
 @dataclass
@@ -55,9 +58,12 @@ class Config:
 
 
 def load(path: Path = CONFIG_PATH) -> Config:
-    if not path.exists():
-        raise ConfigError(f"config file not found: {path} (copy config.example.yaml there)")
-    raw = yaml.safe_load(path.read_text()) or {}
+    if path.exists():
+        raw = yaml.safe_load(path.read_text()) or {}
+    else:
+        # Fine now that agents can join with the join key; settings default.
+        log.warning("no config file at %s; using defaults (see config.example.yaml)", path)
+        raw = {}
 
     s = raw.get("settings") or {}
     settings = Settings(
@@ -68,6 +74,7 @@ def load(path: Path = CONFIG_PATH) -> Config:
         max_procs=int(s.get("max_procs", 500)),
         auth_header=str(s.get("auth_header", "X-authentik-username")),
         require_auth_header=bool(s.get("require_auth_header", True)),
+        enrollment=bool(s.get("enrollment", True)),
     )
 
     if "history_hours" in s:

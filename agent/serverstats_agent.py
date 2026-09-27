@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -793,6 +793,34 @@ def run_agent(args, argv):
         time.sleep(max(wait - (time.monotonic() - started), 0.5))
 
 
+def enroll(url, name, ca_file=None):
+    """Join the server with the join key (SERVERSTATS_JOIN_KEY); print "name token"."""
+    key = os.environ.get("SERVERSTATS_JOIN_KEY", "")
+    if not url or not key:
+        sys.exit("enrolling needs --url and SERVERSTATS_JOIN_KEY")
+    ctx = ssl.create_default_context(cafile=ca_file or None)
+    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx), _NoRedirects())
+    body = json.dumps({"key": key, "name": name, "hostname": socket.gethostname()}).encode()
+    req = urllib.request.Request(
+        url.rstrip("/") + "/api/enroll", data=body, method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": "serverstats-agent/" + VERSION},
+    )
+    try:
+        with opener.open(req, timeout=30) as resp:
+            reply = json.loads(resp.read(65536).decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read(65536).decode("utf-8", "replace")).get("detail")
+        except Exception:
+            detail = e.reason
+        sys.exit("joining failed: HTTP %d %s" % (e.code, detail))
+    except Exception as e:
+        sys.exit("joining failed: %s" % e)
+    if not isinstance(reply, dict) or not re.match(r"^[0-9a-f]{64}$", str(reply.get("token", ""))):
+        sys.exit("joining failed: unexpected reply from server")
+    print("%s %s" % (reply["name"], reply["token"]))
+
+
 def _load_env_file(argv):
     """Apply KEY=VALUE lines from --env-file PATH before reading settings.
 
@@ -829,6 +857,7 @@ def main():
     ap = argparse.ArgumentParser(description="ServerStats agent / collector")
     ap.add_argument("--env-file", help="read SERVERSTATS_* settings from this KEY=VALUE file")
     ap.add_argument("--once", action="store_true", help="print one JSON sample to stdout and exit")
+    ap.add_argument("--enroll", metavar="NAME", help="join the server as NAME using SERVERSTATS_JOIN_KEY, print 'name token'")
     ap.add_argument("--url", default=env("SERVERSTATS_URL"), help="server base URL, e.g. https://stats.example.com")
     ap.add_argument("--token", default=env("SERVERSTATS_TOKEN"), help="per-host token from the server config")
     ap.add_argument("--interval", type=float, default=float(env("SERVERSTATS_INTERVAL", "15")), help="seconds between reports")
@@ -838,6 +867,9 @@ def main():
     ap.add_argument("--version", action="version", version=VERSION)
     args = ap.parse_args()
 
+    if args.enroll:
+        enroll(args.url, args.enroll, args.ca_file)
+        return
     if args.once:
         json.dump(collect(args.sample, args.max_procs)[0], sys.stdout, separators=(",", ":"))
         sys.stdout.write("\n")

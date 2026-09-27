@@ -442,3 +442,71 @@ def test_failed_update_is_not_offered_again(client):
     assert "update" not in reply
     r = _post_update(client, "alpha")
     assert r.status_code == 409 and "failed to start" in r.json()["detail"]
+
+
+# -- joining with the join key --------------------------------------------------
+
+ACTION = dict(USER, **{"X-ServerStats-Action": "1"})
+
+
+def _join(client, key, name):
+    return client.post("/api/enroll", json={"key": key, "name": name, "hostname": name})
+
+
+def test_enrollment(client):
+    key = client.get("/api/meta", headers=USER).json()["join_key"]
+    assert key and len(key) >= 32
+    assert _join(client, "wrong", "newbox").status_code == 401
+
+    r = _join(client, key, "newbox")  # no SSO header needed: agents call this
+    assert r.status_code == 200
+    token = r.json()["token"]
+    assert ingest(client, token, sample()).json()["host"] == "newbox"
+    host = client.get("/api/hosts/newbox", headers=USER).json()
+    assert host["enrolled"] and host["status"] == "online"
+
+    # Names are unique, including against config.yaml hosts.
+    assert _join(client, key, "newbox").status_code == 409
+    assert _join(client, key, "alpha").status_code == 409
+    assert _join(client, key, "bad name!").status_code == 400
+
+    # Only a hash of the token is stored.
+    from app.main import app as _app
+    stored = _app.state.store._db.execute("SELECT token_hash FROM enrolled").fetchall()
+    assert token not in str(stored)
+
+    # A new join key stops new joins but not existing hosts.
+    assert client.post("/api/join-key/rotate", headers=USER).status_code == 403  # action header
+    new_key = client.post("/api/join-key/rotate", headers=ACTION).json()["join_key"]
+    assert new_key != key
+    assert _join(client, key, "other").status_code == 401
+    assert ingest(client, token, sample()).status_code == 200
+
+    # Enrolled hosts can be removed; config.yaml hosts can't be removed from the UI.
+    assert client.post("/api/hosts/alpha/remove", headers=ACTION).status_code == 409
+    assert client.post("/api/hosts/newbox/remove", headers=USER).status_code == 403
+    assert client.post("/api/hosts/newbox/remove", headers=ACTION).status_code == 200
+    assert client.get("/api/hosts/newbox", headers=USER).status_code == 404
+    assert ingest(client, token, sample()).status_code == 401
+
+
+def test_enrollment_can_be_turned_off(tmp_path, monkeypatch):
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("settings:\n  require_auth_header: false\n  enrollment: false\nhosts: []\n")
+    from app import config
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config.load, "__defaults__", (cfg_file,))
+    from app.main import app
+
+    with TestClient(app) as c:
+        assert c.get("/api/meta").json()["join_key"] is None
+        assert _join(c, "anything", "x").status_code == 401
+        assert not (tmp_path / "join_key").exists()
+
+
+def test_starts_without_config_file(tmp_path):
+    from app.config import load
+
+    conf = load(tmp_path / "missing.yaml")
+    assert conf.hosts == [] and conf.settings.require_auth_header and conf.settings.enrollment
