@@ -26,7 +26,6 @@ def client(tmp_path, monkeypatch):
     cfg_file.write_text(CONFIG)
     from app import config
 
-    monkeypatch.setattr(config, "CONFIG_PATH", cfg_file)
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     monkeypatch.setattr(config.load, "__defaults__", (cfg_file,))
     from app.main import app
@@ -505,8 +504,42 @@ def test_enrollment_can_be_turned_off(tmp_path, monkeypatch):
         assert not (tmp_path / "join_key").exists()
 
 
-def test_starts_without_config_file(tmp_path):
+def test_generates_config_when_missing(tmp_path, monkeypatch):
+    from app import config
+
+    monkeypatch.delenv("SERVERSTATS_CONFIG", raising=False)
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    mounted = tmp_path / "mounted" / "config.yaml"
+    monkeypatch.setattr(config, "MOUNTED_CONFIG", mounted)
+    # No ./config folder (not mounted): fall back to the data volume.
+    assert config.config_path() == tmp_path / "config.yaml"
+
+    # With the bind mount, the config is generated there.
+    mounted.parent.mkdir()
+    assert config.config_path() == mounted
+    conf = config.load()
+    assert mounted.exists()
+    assert conf.hosts == [] and conf.settings.require_auth_header and conf.settings.enrollment
+    assert config.load().settings.retention_days == 400  # the generated file parses as the defaults
+    mounted.write_text("settings: {retention_days: 30}\n")
+    assert config.load().settings.retention_days == 30
+
+
+def test_env_overrides_require_auth_header(tmp_path, monkeypatch):
+    from app import config
+
+    monkeypatch.setenv("SERVERSTATS_REQUIRE_AUTH_HEADER", "false")
+    conf = config.load(tmp_path / "new.yaml")
+    assert conf.settings.require_auth_header is False
+    assert "require_auth_header: false" in (tmp_path / "new.yaml").read_text()
+    (tmp_path / "set.yaml").write_text("settings: {require_auth_header: true}\n")
+    assert config.load(tmp_path / "set.yaml").settings.require_auth_header is False
+
+
+def test_unwritable_config_location_falls_back_to_defaults(tmp_path):
     from app.config import load
 
-    conf = load(tmp_path / "missing.yaml")
-    assert conf.hosts == [] and conf.settings.require_auth_header and conf.settings.enrollment
+    blocker = tmp_path / "file"
+    blocker.write_text("")
+    conf = load(blocker / "config.yaml")  # parent is a file: can't create
+    assert conf.hosts == [] and conf.settings.enrollment

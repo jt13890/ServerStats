@@ -92,6 +92,7 @@ logging.getLogger("asyncssh").setLevel(logging.WARNING)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     conf = cfg.load()
+    log.info("config: %s", cfg.config_path())
     store = Store(cfg.DATA_DIR / "serverstats.db", conf.settings.retention_days)
     key = load_or_create_key(conf.settings.ssh_key)
     poller = SSHPoller(conf.hosts, store, key, conf.settings.max_procs)

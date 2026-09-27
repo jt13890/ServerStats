@@ -29,16 +29,20 @@ Both modes run the same collector (`agent/serverstats_agent.py`). It uses only t
 
 ```sh
 git clone <this repo> serverstats && cd serverstats
-mkdir -p config
-cp config.example.yaml config/config.yaml   # optional: settings, SSH hosts, hosts with fixed tokens
 docker compose up -d --build
 ```
 
-The app listens on `127.0.0.1:8080`, so it's not reachable from other machines until you put a reverse proxy in front (see [Putting it behind Authentik](#putting-it-behind-authentik)). By default it **rejects UI and API requests that don't carry Authentik's `X-authentik-username` header** (`require_auth_header: true`). For a quick local test without a proxy, set that to `false` temporarily.
+That's all. On first start, ServerStats writes a complete, commented `config/config.yaml` (it's bind-mounted into the container) and generates the join key that hosts use to add themselves. Edit the config when you want to change settings or add SSH hosts, then run `docker compose restart`. History, the join key and the SSH key live in the `serverstats-data` Docker volume.
 
-Agents join by themselves (see [Adding hosts](#adding-hosts)), so you only need to touch `config/config.yaml` for settings and SSH hosts. Restart the container (`docker compose restart`) after editing it. Without a config file, ServerStats starts with the defaults.
+The app listens on `127.0.0.1:8080`, so it's not reachable from other machines until you put a reverse proxy in front (see [Putting it behind Authentik](#putting-it-behind-authentik)). By default it **rejects UI and API requests that don't carry Authentik's `X-authentik-username` header** (`require_auth_header: true`).
 
-**Trying it on your LAN before Authentik is set up:** create a `.env` file next to `docker-compose.yml` containing `SERVERSTATS_BIND=0.0.0.0` (and `SERVERSTATS_PORT=…` if 8080 is taken), and set `require_auth_header: false` in the config. Anyone on your network can then view the dashboard, so undo both once Authentik is in front.
+**Trying it on your LAN before Authentik is set up:** create a `.env` file next to `docker-compose.yml` with:
+```sh
+SERVERSTATS_BIND=0.0.0.0
+SERVERSTATS_REQUIRE_AUTH_HEADER=false
+# SERVERSTATS_PORT=8081   # if 8080 is taken
+```
+Then run `docker compose up -d`. Anyone on your network can view the dashboard, so remove these two lines once Authentik is in front.
 
 ## Adding hosts
 
@@ -249,7 +253,7 @@ Also:
 - **Don't expose port 8080 directly.** The SSO check trusts the `X-authentik-username` header, which is only meaningful when every request comes through your proxy. The compose file binds to `127.0.0.1`; with Traefik, use a Docker network and no published port.
 - Agent tokens are compared in constant time. Ingest payloads are capped at 4 MiB and normalized to a strict schema. Everything from hosts (process names, command lines) is rendered as text, never HTML. The UI sends a strict Content-Security-Policy.
 - Apart from the update buttons, the UI is read-only.
-- The container runs as a non-root user with a read-only root filesystem and all capabilities dropped. Persistent state lives in the `/data` volume: the SQLite DB, the SSH key, and pinned host keys.
+- The app runs as a non-root user (uid 10001) with no capabilities, `no-new-privileges`, and a read-only root filesystem. A startup script runs as root only long enough to make the bind-mounted `config` folder writable for that user (the only capabilities it's given are `CHOWN`, `SETUID` and `SETGID`), then drops to it for good. Persistent state lives in the `/data` volume: the SQLite DB, the join key, the SSH key, and pinned host keys.
 
 ## Configuration
 
@@ -257,10 +261,11 @@ See [`config.example.yaml`](config.example.yaml) for all options: offline thresh
 
 | Env var | Default | |
 |---|---|---|
-| `SERVERSTATS_CONFIG` | `/config/config.yaml` | config file path |
+| `SERVERSTATS_CONFIG` | `/config/config.yaml` | config file path (generated if missing) |
+| `SERVERSTATS_REQUIRE_AUTH_HEADER` | unset | `false` turns the SSO header check off (LAN tests), overriding the config |
 | `SERVERSTATS_DATA` | `/data` | SQLite DB, SSH key, `known_hosts.json` |
 
-If you bind-mount a host directory as `/data` instead of using the named volume, make it writable by UID `10001`.
+To keep `/data` in a host folder too, swap the volume for a bind mount such as `./data:/data`. The startup script makes it writable as well.
 
 ## Development
 

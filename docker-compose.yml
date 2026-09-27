@@ -5,8 +5,11 @@ services:
     container_name: serverstats
     restart: unless-stopped
     volumes:
-      - ./config:/config:ro      # config.yaml lives here
-      - serverstats-data:/data   # SQLite history, SSH key, pinned host keys
+      - ./config:/config         # config.yaml: generated here on first start; edit it, then restart
+      - serverstats-data:/data   # history, join key, SSH key
+    environment:
+      # Set SERVERSTATS_REQUIRE_AUTH_HEADER=false in .env for a LAN test without Authentik.
+      SERVERSTATS_REQUIRE_AUTH_HEADER: ${SERVERSTATS_REQUIRE_AUTH_HEADER:-}
     # Don't publish the port to the internet: everything except the agent
     # endpoints should only be reachable through Authentik. Binds to localhost
     # by default (or drop "ports" and attach the container to your proxy's
@@ -21,6 +24,12 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # Only used by the entrypoint to make ./config writable before it drops to
+    # an unprivileged user; the app itself runs with no capabilities.
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
 
 volumes:
   serverstats-data:

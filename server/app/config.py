@@ -8,8 +8,78 @@ from pathlib import Path
 
 import yaml
 
-CONFIG_PATH = Path(os.environ.get("SERVERSTATS_CONFIG", "/config/config.yaml"))
 DATA_DIR = Path(os.environ.get("SERVERSTATS_DATA", "/data"))
+MOUNTED_CONFIG = Path("/config/config.yaml")  # ./config/config.yaml in docker-compose.yml
+
+
+def config_path() -> Path:
+    """SERVERSTATS_CONFIG if set, else ./config/config.yaml (the bind mount; it's
+    generated there on first start). Only if that folder isn't writable does the
+    config live in the data volume instead."""
+    if os.environ.get("SERVERSTATS_CONFIG"):
+        return Path(os.environ["SERVERSTATS_CONFIG"])
+    fallback = DATA_DIR / "config.yaml"
+    if MOUNTED_CONFIG.exists():
+        return MOUNTED_CONFIG
+    if fallback.exists() or not os.access(MOUNTED_CONFIG.parent, os.W_OK):
+        return fallback
+    return MOUNTED_CONFIG
+
+
+def _env_bool(name: str) -> bool | None:
+    v = os.environ.get(name, "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+DEFAULT_CONFIG = """\
+# ServerStats configuration, generated on first start. Edit it and restart
+# ServerStats (docker compose restart) to apply. All settings are optional.
+
+settings:
+  # Reject UI/API requests without the header Authentik sets (agent endpoints
+  # excepted). Keep this on once Authentik is in front; for a LAN test without
+  # it, set SERVERSTATS_REQUIRE_AUTH_HEADER=false in .env (overrides this).
+  require_auth_header: {require_auth_header}
+  # Header your reverse proxy sets with the signed-in user.
+  auth_header: X-authentik-username
+  # Let agents join with the join key shown under "Add host" in the UI, so
+  # they don't need to be listed below.
+  enrollment: true
+  # Mark a host offline after this many seconds without a report (or 3x its
+  # reporting interval, if longer).
+  stale_after: 60
+  # Days of history to keep. Older data is stored as hourly averages.
+  retention_days: 400
+  # Default poll interval for SSH hosts, in seconds.
+  ssh_interval: 15
+  # Report at most this many processes per host (busiest first).
+  max_procs: 500
+
+# Hosts that join with the join key don't need to be listed here. List SSH
+# hosts (the server connects to them), or agents with a fixed token:
+hosts: []
+#  - name: pi
+#    mode: ssh
+#    address: 192.168.1.20
+#    user: serverstats
+#  - name: nas
+#    mode: agent
+#    token: <openssl rand -hex 32>
+"""
+
+
+def _write_default(path: Path) -> None:
+    require = _env_bool("SERVERSTATS_REQUIRE_AUTH_HEADER")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(DEFAULT_CONFIG.format(require_auth_header=str(require is not False).lower()))
+        log.info("wrote a default config to %s", path)
+    except OSError as e:
+        log.warning("no config at %s and couldn't write one (%s); using defaults", path, e)
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -57,13 +127,11 @@ class Config:
         return next((h for h in self.hosts if h.name == name), None)
 
 
-def load(path: Path = CONFIG_PATH) -> Config:
-    if path.exists():
-        raw = yaml.safe_load(path.read_text()) or {}
-    else:
-        # Fine now that agents can join with the join key; settings default.
-        log.warning("no config file at %s; using defaults (see config.example.yaml)", path)
-        raw = {}
+def load(path: Path | None = None) -> Config:
+    path = path or config_path()
+    if not path.exists():
+        _write_default(path)
+    raw = (yaml.safe_load(path.read_text()) if path.exists() else None) or {}
 
     s = raw.get("settings") or {}
     settings = Settings(
@@ -76,6 +144,10 @@ def load(path: Path = CONFIG_PATH) -> Config:
         require_auth_header=bool(s.get("require_auth_header", True)),
         enrollment=bool(s.get("enrollment", True)),
     )
+    # .env can switch the SSO check off for a LAN test without editing this file.
+    env_require = _env_bool("SERVERSTATS_REQUIRE_AUTH_HEADER")
+    if env_require is not None:
+        settings.require_auth_header = env_require
 
     if "history_hours" in s:
         log.warning("settings.history_hours is no longer used; history is kept for retention_days (default 400)")
