@@ -64,6 +64,8 @@
       <div class="detail-head">
         <h1 id="d-name"></h1>
         <span id="d-status" class="status"><span class="status-dot"></span><span class="status-label"></span></span>
+        <span class="spacer"></span>
+        <button id="d-remove" class="btn btn-quiet" type="button" hidden>Remove host</button>
       </div>
       <div id="d-sub" class="host-sub"></div>
       <div id="d-update" class="update-row" hidden>
@@ -199,13 +201,24 @@
     </div>
 
     <div data-panel="agent">
-      <p>The agent is a single Python file with no dependencies. It pushes stats to this server over HTTPS, so hosts need no inbound ports and the server holds no credentials to them.</p>
-      <label class="field">Host name <input id="agent-name" class="input" value="my-server" spellcheck="false"></label>
-      <p><strong>1.</strong> Add this to <code>config.yaml</code> and restart ServerStats:</p>
-      <pre id="agent-config" class="code"></pre>
-      <p><strong>2.</strong> Run this on the host:</p>
-      <pre id="agent-install" class="code"></pre>
-      <p class="muted">A fresh random token is generated each time this dialog opens. <code>/api/ingest</code> and <code>/api/agent/</code> must be excluded from SSO (see README).</p>
+      <p>The agent is a single Python file with no dependencies. It pushes stats to this server over HTTPS, so hosts need no inbound ports. Works with systemd and OpenRC.</p>
+      <div id="join-flow">
+        <label class="field">Name on the dashboard <span class="muted">(optional, defaults to the host's hostname)</span>
+          <input id="agent-name" class="input" placeholder="hostname" spellcheck="false"></label>
+        <p>Run this on the host. It joins with this server's join key and shows up here within seconds, with no config changes or restarts:</p>
+        <pre id="agent-install" class="code"></pre>
+        <p class="muted">Anyone with the join key can add a host, so treat it like a password.
+          <button id="rotate-join" class="link" type="button">Make a new join key</button>
+          (hosts that already joined keep working).</p>
+      </div>
+      <div id="token-flow" hidden>
+        <p>Joining is turned off (<code>enrollment: false</code>), so add hosts to <code>config.yaml</code>:</p>
+        <label class="field">Host name <input id="agent-name-cfg" class="input" value="my-server" spellcheck="false"></label>
+        <p><strong>1.</strong> Add this to <code>config.yaml</code> and restart ServerStats:</p>
+        <pre id="agent-config" class="code"></pre>
+        <p><strong>2.</strong> Run this on the host:</p>
+        <pre id="agent-install-token" class="code"></pre>
+      </div>
     </div>
 
     <div data-panel="ssh" hidden>

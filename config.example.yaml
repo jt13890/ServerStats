@@ -18,9 +18,13 @@ settings:
   # Defense in depth against the UI being reached without going through
   # Authentik. Set to false only for local testing without a proxy.
   require_auth_header: true
+  # Let agents join with the join key shown under "Add host" (no need to list
+  # them below). Set to false to only allow the hosts listed here.
+  enrollment: true
 
+# Hosts that join with the join key don't need to be listed here.
 hosts:
-  # Push agent (recommended). Generate a token per host with:
+  # Push agent with a fixed token (optional; joining is easier). Generate a token per host with:
   #   openssl rand -hex 32
   # then run the installer on the host (the "Add host" button in the UI
   # generates both for you).

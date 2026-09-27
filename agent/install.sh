@@ -1,15 +1,18 @@
 #!/bin/sh
 # Installs the ServerStats collector on this host, in one of two modes.
 #
-# Push agent (a service that reports to the server; systemd or OpenRC):
+# Push agent (a service that reports to the server; systemd or OpenRC). Join
+# with the server's join key (shown under "Add host"), no config edit needed:
 #   curl -fsSL https://stats.example.com/api/agent/install.sh \
-#     | sudo sh -s -- --url https://stats.example.com --token <TOKEN>
+#     | sudo sh -s -- --url https://stats.example.com --join <JOIN KEY> [--name NAME]
+# ...or with a token you put in config.yaml yourself: --token <TOKEN>
 #
 # SSH pull (the server connects in; its key may only run the collector):
 #   curl -fsSL https://stats.example.com/api/agent/install.sh \
 #     | sudo sh -s -- --url https://stats.example.com --ssh-key 'ssh-ed25519 AAAA... serverstats'
 #
 # Options:
+#   --name NAME       with --join: the name to show (default: this hostname)
 #   --docker          also report Docker containers/compose stacks. This gives
 #                     the collector read access to the Docker socket (docker
 #                     group), which is root-equivalent: only enable it if you
@@ -29,6 +32,8 @@ set -eu
 
 URL=""
 TOKEN=""
+JOIN=""
+NAME=""
 SSH_KEY=""
 SSH_FROM=""
 DOCKER=0
@@ -50,12 +55,14 @@ SSH_USER=serverstats
 FORCED='command="/usr/local/bin/serverstats-agent --once"'
 
 die() { echo "error: $*" >&2; exit 1; }
-usage() { die "usage: install.sh --url <server url> (--token <token> | --ssh-key '<public key>') [--docker] [--no-updates] [--ssh-from addr] [--interval 15] [--ca-file path] | --uninstall"; }
+usage() { die "usage: install.sh --url <server url> (--join <join key> [--name name] | --token <token> | --ssh-key '<public key>') [--docker] [--no-updates] [--ssh-from addr] [--interval 15] [--ca-file path] | --uninstall"; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --url) URL="${2:-}"; shift 2 ;;
         --token) TOKEN="${2:-}"; shift 2 ;;
+        --join) JOIN="${2:-}"; shift 2 ;;
+        --name) NAME="${2:-}"; shift 2 ;;
         --ssh-key) SSH_KEY="${2:-}"; shift 2 ;;
         --ssh-from) SSH_FROM="${2:-}"; shift 2 ;;
         --docker) DOCKER=1; shift ;;
@@ -106,8 +113,9 @@ if [ "$UNINSTALL" -eq 1 ]; then
     exit 0
 fi
 
-if [ -n "$TOKEN" ] && [ -n "$SSH_KEY" ]; then die "use either --token (agent) or --ssh-key (SSH), not both"; fi
-[ -n "$TOKEN" ] || [ -n "$SSH_KEY" ] || usage
+MODES=0
+for v in "$TOKEN" "$JOIN" "$SSH_KEY"; do [ -n "$v" ] && MODES=$((MODES + 1)); done
+[ "$MODES" -eq 1 ] || { [ "$MODES" -eq 0 ] && usage; die "use one of --join, --token or --ssh-key"; }
 URL="${URL%/}"
 command -v python3 >/dev/null 2>&1 || die "python3 is required (e.g. apt install python3 / apk add python3)"
 if [ "$DOCKER" -eq 1 ]; then group_exists docker || die "--docker: no docker group on this host"; fi
@@ -188,6 +196,21 @@ fi
 # A fresh install replaces any remotely-updated copy.
 for d in $STATE_DIRS; do rm -f "$d/serverstats_agent.py" "$d/serverstats_agent.py.failed" "$d/update-attempts"; done
 [ "$INIT" != none ] || die "no systemd or OpenRC found; run '$BIN --env-file $ENV_FILE' under your init system (see README)"
+
+if [ -n "$JOIN" ]; then
+    # Reinstalling? Keep the token this host already has for this server.
+    if [ -f "$ENV_FILE" ] && [ "$(sed -n 's/^SERVERSTATS_URL=//p' "$ENV_FILE")" = "$URL" ]; then
+        TOKEN=$(sed -n 's/^SERVERSTATS_TOKEN=//p' "$ENV_FILE")
+    fi
+    if [ -z "$TOKEN" ]; then
+        [ -n "$NAME" ] || NAME=$(hostname -s 2>/dev/null || hostname)
+        NAME=$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-64)
+        # The key goes in via the environment, not argv, so `ps` can't show it.
+        OUT=$(SERVERSTATS_JOIN_KEY="$JOIN" python3 "$BIN" --enroll "$NAME" --url "$URL" ${CA_FILE:+--ca-file "$CA_FILE"}) || exit 1
+        TOKEN=${OUT#* }
+        echo "Joined ServerStats as ${OUT%% *}."
+    fi
+fi
 
 write_env() {
     cat > "$ENV_FILE" <<EOF
