@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ServerStats</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13h4l3-8 4 14 3-6h4"/></svg>
+      ServerStats
+    </a>
+    <span id="fleet-summary" class="fleet-summary"></span>
+    <span class="spacer"></span>
+    <button id="add-host-btn" class="btn" type="button">Add host</button>
+    <span id="user" class="user" hidden></span>
+  </header>
+
+  <div id="conn-banner" class="conn-banner" role="alert" hidden>
+    Lost connection to ServerStats. Your sign-in may have expired.
+    <button class="link" type="button" data-action="reload">Reload</button>
+  </div>
+
+  <main id="app"></main>
+
+  <!-- Overview -->
+  <template id="tpl-overview">
+    <section class="overview">
+      <div class="toolbar">
+        <input id="host-filter" class="input" type="search" placeholder="Filter hosts" aria-label="Filter hosts">
+      </div>
+      <div id="host-grid" class="host-grid"></div>
+      <div id="empty" class="empty" hidden>
+        <h2>No hosts configured yet</h2>
+        <p>Add hosts to <code>config.yaml</code> and restart the container. <button class="link" type="button" data-action="add-host">Show me how</button></p>
+      </div>
+    </section>
+  </template>
+
+  <template id="tpl-card">
+    <a class="card host-card">
+      <div class="card-head">
+        <span class="host-name"></span>
+        <span class="status"><span class="status-dot"></span><span class="status-label"></span></span>
+      </div>
+      <div class="host-sub"></div>
+      <div class="meters"></div>
+      <div class="card-foot"></div>
+      <div class="card-error" hidden></div>
+    </a>
+  </template>
+
+  <!-- Host detail -->
+  <template id="tpl-detail">
+    <section class="detail">
+      <a class="back" href="#/">&larr; All hosts</a>
+      <div class="detail-head">
+        <h1 id="d-name"></h1>
+        <span id="d-status" class="status"><span class="status-dot"></span><span class="status-label"></span></span>
+      </div>
+      <div id="d-sub" class="host-sub"></div>
+      <div id="d-error" class="banner" hidden></div>
+
+      <div id="d-tiles" class="tiles"></div>
+
+      <div class="toolbar">
+        <div class="seg" role="radiogroup" aria-label="History range" id="range">
+          <button type="button" role="radio" data-hours="1">1 hour</button>
+          <button type="button" role="radio" data-hours="6">6 hours</button>
+          <button type="button" role="radio" data-hours="24">24 hours</button>
+          <button type="button" role="radio" data-hours="168">7 days</button>
+        </div>
+      </div>
+      <div class="charts">
+        <figure class="card chart-card">
+          <figcaption>Utilization</figcaption>
+          <div class="chart" id="chart-usage"></div>
+        </figure>
+        <figure class="card chart-card">
+          <figcaption>Storage used</figcaption>
+          <div class="chart" id="chart-storage"></div>
+        </figure>
+        <figure class="card chart-card">
+          <figcaption>Disk I/O</figcaption>
+          <div class="chart" id="chart-diskio"></div>
+        </figure>
+        <figure class="card chart-card">
+          <figcaption>Network</figcaption>
+          <div class="chart" id="chart-net"></div>
+        </figure>
+      </div>
+
+      <div class="card">
+        <h2>Storage</h2>
+        <div class="table-wrap">
+          <table class="table" id="storage-table">
+            <thead><tr><th>Mount</th><th>Device</th><th>Type</th><th class="num">Used</th><th class="num">Free</th><th class="num">Size</th><th class="meter-col">Usage</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Disk activity</h2>
+        <div class="table-wrap">
+          <table class="table" id="diskio-table">
+            <thead><tr><th>Device</th><th class="num">Read</th><th class="num">Write</th><th class="meter-col">Busy</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="proc-head">
+          <h2>Processes <span id="proc-count" class="muted"></span></h2>
+          <span class="spacer"></span>
+          <input id="proc-filter" class="input" type="search" placeholder="Filter by name, command, user or PID" aria-label="Filter processes">
+          <label class="check"><input id="proc-pause" type="checkbox"> Pause updates</label>
+        </div>
+        <div class="table-wrap">
+          <table class="table proc-table" id="proc-table">
+            <thead>
+              <tr>
+                <th data-sort="pid" class="num">PID</th>
+                <th data-sort="user">User</th>
+                <th data-sort="cpu" class="num">CPU %</th>
+                <th data-sort="mem" class="num">Mem %</th>
+                <th data-sort="rss" class="num">RSS</th>
+                <th data-sort="threads" class="num">Thr</th>
+                <th data-sort="state">S</th>
+                <th data-sort="started" class="num">Started</th>
+                <th data-sort="name">Command</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <button id="proc-more" class="btn btn-quiet" type="button" hidden></button>
+      </div>
+    </section>
+  </template>
+
+  <!-- Add host dialog -->
+  <dialog id="add-dialog" class="dialog">
+    <div class="dialog-head">
+      <h2>Add a host</h2>
+      <button class="btn btn-quiet" type="button" data-action="close" aria-label="Close">&times;</button>
+    </div>
+    <div class="seg" role="tablist">
+      <button type="button" role="tab" data-tab="agent" aria-selected="true">Agent (recommended)</button>
+      <button type="button" role="tab" data-tab="ssh" aria-selected="false">SSH</button>
+    </div>
+
+    <div data-panel="agent">
+      <p>The agent is a single Python file with no dependencies. It pushes stats to this server over HTTPS, so hosts need no inbound ports and the server holds no credentials to them.</p>
+      <label class="field">Host name <input id="agent-name" class="input" value="my-server" spellcheck="false"></label>
+      <p><strong>1.</strong> Add this to <code>config.yaml</code> and restart ServerStats:</p>
+      <pre id="agent-config" class="code"></pre>
+      <p><strong>2.</strong> Run this on the host:</p>
+      <pre id="agent-install" class="code"></pre>
+      <p class="muted">A fresh random token is generated each time this dialog opens. <code>/api/ingest</code> and <code>/api/agent/</code> must be excluded from SSO (see README).</p>
+    </div>
+
+    <div data-panel="ssh" hidden>
+      <p>ServerStats connects over SSH and runs the collector with <code>python3</code>. Nothing is installed on the host.</p>
+      <label class="field">Host name <input id="ssh-name" class="input" value="my-server" spellcheck="false"></label>
+      <label class="field">Address <input id="ssh-address" class="input" value="192.168.1.10" spellcheck="false"></label>
+      <p><strong>1.</strong> On the host, create an unprivileged user and authorize the ServerStats key:</p>
+      <pre id="ssh-setup" class="code"></pre>
+      <p><strong>2.</strong> Add this to <code>config.yaml</code> and restart ServerStats:</p>
+      <pre id="ssh-config" class="code"></pre>
+      <p class="muted">The host key is trusted on first connect and pinned afterwards.</p>
+    </div>
+  </dialog>
+
+  <div id="tooltip" class="tooltip" role="status" hidden></div>
+</body>
+</html>

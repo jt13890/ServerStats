@@ -1,0 +1,39 @@
+# ServerStats configuration. Copy to ./config/config.yaml and restart the
+# container after editing.
+
+settings:
+  # Mark a host offline when it hasn't reported for this many seconds.
+  stale_after: 60
+  # How long to keep history for the charts (hours). 168 = 7 days.
+  history_hours: 168
+  # Default poll interval for SSH hosts (seconds).
+  ssh_interval: 15
+  # Report at most this many processes per host (busiest first).
+  max_procs: 500
+  # Header your reverse proxy sets with the signed-in user (shown in the UI).
+  auth_header: X-authentik-username
+  # Reject UI/API requests that lack auth_header (agent endpoints excepted).
+  # Defense in depth against the UI being reached without going through
+  # Authentik. Set to false only for local testing without a proxy.
+  require_auth_header: true
+
+hosts:
+  # Push agent (recommended). Generate a token per host with:
+  #   openssl rand -hex 32
+  # then run the installer on the host (the "Add host" button in the UI
+  # generates both for you).
+  - name: nas
+    description: Storage box
+    mode: agent
+    token: CHANGE-ME-0123456789abcdef0123456789abcdef
+
+  # SSH pull: no install needed, just python3 on the host and the server's
+  # public key (shown under "Add host" in the UI) in authorized_keys.
+  - name: pi
+    mode: ssh
+    address: 192.168.1.20
+    port: 22
+    user: serverstats
+    # interval: 30            # override ssh_interval for this host
+    # python: /usr/bin/python3
+    # host_key: "SHA256:..."  # pin the host key instead of trust-on-first-use

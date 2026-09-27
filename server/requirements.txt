@@ -1,0 +1,4 @@
+fastapi==0.141.1
+uvicorn[standard]==0.54.0
+asyncssh==2.24.0
+PyYAML==6.0.3
