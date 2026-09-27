@@ -134,3 +134,23 @@ def test_public_paths_are_exact(client):
     assert client.get("/api/agent/../hosts").status_code in (401, 404)
     assert client.get("/api/agent/other").status_code == 401
     assert client.get("/healthzz").status_code == 401
+
+
+def test_slow_agent_is_not_flagged_offline(client, monkeypatch):
+    import time as _time
+
+    # An agent reporting every 120s must stay "online" between reports even
+    # though the default stale_after is 60s.
+    assert ingest(client, TOKEN_A, sample(interval=120)).status_code == 200
+    real = _time.time
+    monkeypatch.setattr("app.main.time.time", lambda: real() + 150)
+    hosts = {h["name"]: h for h in client.get("/api/hosts", headers=USER).json()}
+    assert hosts["alpha"]["status"] == "online"
+    monkeypatch.setattr("app.main.time.time", lambda: real() + 400)
+    hosts = {h["name"]: h for h in client.get("/api/hosts", headers=USER).json()}
+    assert hosts["alpha"]["status"] == "offline"
+
+
+def test_interval_is_clamped(client):
+    ingest(client, TOKEN_A, sample(interval=10**9))
+    assert client.get("/api/hosts/alpha", headers=USER).json()["interval"] == 3600.0

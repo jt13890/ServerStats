@@ -2,7 +2,8 @@
 # container after editing.
 
 settings:
-  # Mark a host offline when it hasn't reported for this many seconds.
+  # Mark a host offline when it hasn't reported for this many seconds, or for
+  # 3x its reporting/poll interval if that's longer.
   stale_after: 60
   # How long to keep history for the charts (hours). 168 = 7 days.
   history_hours: 168

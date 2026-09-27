@@ -454,9 +454,10 @@ function renderDetail(name) {
     const x1 = serverNow();
     const x0 = x1 - state.range * 3600;
     const m = history.metrics || [];
-    const gap = Math.max(history.bucket * 3, (state.meta ? state.meta.stale_after : 60) * 1.5);
+    // Never break lines for gaps shorter than a host needs to be marked offline.
+    const minGap = Math.max(history.bucket * 3, (state.meta ? state.meta.stale_after : 60) * 1.5);
     const pick = (key) => m.filter((r) => r[key] != null).map((r) => ({ t: r.t, v: r[key] }));
-    const common = { x0, x1, gap, days: state.range > 24 };
+    const common = { x0, x1, minGap, days: state.range > 24 };
 
     lineChart($('#chart-usage'), {
       ...common, title: 'Utilization', yMax: 100, fmt: fmtPct,
@@ -471,7 +472,7 @@ function renderDetail(name) {
     const mounts = Object.keys(storage).sort().slice(0, 8);
     lineChart($('#chart-storage'), {
       ...common, title: 'Storage used', yMax: 100, fmt: fmtPct,
-      gap: Math.max(history.bucket, 300) * 3,
+      minGap: Math.max(history.bucket, 300) * 3,
       series: mounts.map((mount, i) => ({
         label: mount, slot: i + 1,
         points: storage[mount].map((r) => ({ t: r.t, v: r.total ? (100 * r.used) / r.total : 0, extra: `${fmtBytes(r.used)} of ${fmtBytes(r.total)}` })),
@@ -525,6 +526,17 @@ function yScale(max, opts) {
   return { top: top * unit, ticks, label: (v) => `${+(v / unit).toFixed(2)} ${UNITS[k]}/s` };
 }
 
+// Typical spacing between samples. Lines only break for gaps well beyond it,
+// so a host polled every few minutes still draws as a line while a real
+// outage shows up as a gap.
+function cadence(times) {
+  const steps = [];
+  for (let i = 1; i < times.length; i++) steps.push(times[i] - times[i - 1]);
+  if (!steps.length) return 0;
+  steps.sort((a, b) => a - b);
+  return steps[steps.length >> 1];
+}
+
 const TIME_STEPS = [300, 600, 900, 1800, 3600, 7200, 10800, 14400, 21600, 43200, 86400, 172800];
 const MIN_TICK_GAP = 76; // px between x-axis labels
 
@@ -540,6 +552,8 @@ function lineChart(container, opts) {
   const X = (t) => M.l + ((t - x0) / (x1 - x0)) * iw;
 
   const visible = series.map((s) => ({ ...s, points: s.points.filter((p) => p.t >= x0 - 3600) }));
+  const allTimes = [...new Set(visible.flatMap((s) => s.points.map((p) => p.t)))].sort((a, b) => a - b);
+  const gap = Math.max(opts.minGap || 0, 3 * cadence(allTimes));
   const hasData = visible.some((s) => s.points.some((p) => p.t >= x0));
   const maxV = Math.max(0, ...visible.flatMap((s) => s.points.map((p) => p.v)));
   const ys = yScale(maxV, opts);
@@ -598,18 +612,26 @@ function lineChart(container, opts) {
 
   for (const s of visible) {
     let d = '';
-    let prev = null;
-    for (const p of s.points) {
-      d += (prev && p.t - prev.t <= opts.gap ? 'L' : 'M') + X(p.t).toFixed(1) + ',' + Y(p.v).toFixed(1);
-      prev = p;
-    }
+    const lone = [];
+    s.points.forEach((p, i) => {
+      const pt = X(p.t).toFixed(1) + ',' + Y(p.v).toFixed(1);
+      const prev = s.points[i - 1], next = s.points[i + 1];
+      if (prev && p.t - prev.t <= gap) d += 'L' + pt;
+      else {
+        d += 'M' + pt;
+        // A sample with no neighbours has no line to sit on; mark it instead.
+        // (The newest sample already gets the end dot.)
+        if (next && next.t - p.t > gap && p.t >= x0) lone.push(p);
+      }
+    });
     root.append(svg('path', { class: `line c${s.slot}`, d, 'clip-path': `url(#${clipId})` }));
+    for (const p of lone) root.append(svg('circle', { class: `dot c${s.slot}`, cx: X(p.t), cy: Y(p.v), r: 3 }));
     const last = s.points[s.points.length - 1];
     if (last && last.t >= x0) root.append(svg('circle', { class: `dot c${s.slot}`, cx: X(last.t), cy: Y(last.v), r: 4 }));
   }
 
   // hover layer: crosshair snaps to the nearest sample time
-  const times = [...new Set(visible.flatMap((s) => s.points.map((p) => p.t)))].filter((t) => t >= x0).sort((a, b) => a - b);
+  const times = allTimes.filter((t) => t >= x0);
   const lookup = visible.map((s) => new Map(s.points.map((p) => [p.t, p])));
   const cross = svg('line', { class: 'crosshair', y1: M.t, y2: M.t + ih, visibility: 'hidden' });
   const dots = visible.map((s) => svg('circle', { class: `dot c${s.slot}`, r: 4, visibility: 'hidden' }));

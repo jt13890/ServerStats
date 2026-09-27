@@ -87,8 +87,12 @@ def normalize(d: dict, max_procs: int) -> dict:
             "cmd": _str(p.get("cmd"), 512),
         })
 
+    interval = _num(d.get("interval"), None)
     return {
         "agent_version": _str(d.get("agent_version"), 32),
+        # Reporting interval (agents only), clamped so a host can't claim to
+        # stay "online" for days after it stops reporting.
+        "interval": min(max(interval, 1.0), 3600.0) if interval is not None else None,
         "collected_at": _num(d.get("collected_at"), None),
         "hostname": _str(d.get("hostname"), 253),
         "os": _str(d.get("os")),

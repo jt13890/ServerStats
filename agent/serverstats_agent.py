@@ -385,6 +385,7 @@ def run_agent(args):
         started = time.monotonic()
         try:
             sample_data, snapshot = collect(sample, args.max_procs, snapshot)
+            sample_data["interval"] = interval  # lets the server judge staleness
             _post(args.url, args.token, sample_data, ctx)
             if failures:
                 print("reporting recovered after %d failure(s)" % failures, flush=True)

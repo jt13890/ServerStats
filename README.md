@@ -58,7 +58,7 @@ The easiest way is the **Add host** button in the UI. It generates a token and g
    ```
    This installs `/usr/local/bin/serverstats-agent`, writes the token to `/etc/serverstats-agent.env` (mode 600), and starts a hardened `serverstats-agent.service`. Check it with `journalctl -u serverstats-agent -f`. To remove it, run the same script with `--uninstall`.
 
-   Other installer options: `--interval 15` sets seconds between reports, and `--ca-file /path/ca.pem` is for a private CA.
+   Other installer options: `--interval 15` sets seconds between reports, and `--ca-file /path/ca.pem` is for a private CA. Longer intervals are fine: the agent tells the server its interval, so a host is only marked offline after it misses about three reports.
 
    You can also run the installer from a checkout of this repo (`sudo ./agent/install.sh --url … --token …`). Without systemd (Alpine/OpenRC, containers, …), run the script under your init system of choice:
    `SERVERSTATS_URL=… SERVERSTATS_TOKEN=… /usr/local/bin/serverstats-agent`

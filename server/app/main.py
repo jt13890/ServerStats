@@ -100,6 +100,8 @@ def _status(host: cfg.Host, st, settings: cfg.Settings, now: float) -> str:
     limit = settings.stale_after
     if host.mode == "ssh":
         limit = max(limit, host.interval * 3)
+    elif st.data and st.data.get("interval"):
+        limit = max(limit, st.data["interval"] * 3)
     if st.received_at is None:
         return "error" if st.error else "pending"
     if now - st.received_at > limit:
