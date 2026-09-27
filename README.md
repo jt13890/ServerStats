@@ -1,2 +1,264 @@
 # ServerStats
-A tool to view server load stats
+
+A small, self-hosted dashboard for the Linux machines you run. It tracks:
+
+- **CPU**: total utilization, per-core count, load average
+- **RAM**: used/available memory and swap
+- **Disk utilization**: per-device busy %, read/write throughput
+- **Storage space**: used/free per filesystem, tracked over time so you can see disks filling up
+- **Network** throughput and **processes** (sortable/filterable, like `top` for your whole fleet)
+
+It keeps up to 7 days of history by default. It runs in one Docker container with SQLite, has no build step, and is designed to sit behind **Authentik**.
+
+## How hosts are monitored: agent or SSH
+
+Both modes run the same collector (`agent/serverstats_agent.py`). It uses only the Python standard library, needs Python 3.6+, and reads everything from `/proc`. You can mix both modes in one fleet.
+
+| | **Push agent** (recommended) | **SSH pull** |
+|---|---|---|
+| Install on host | One Python file plus a systemd unit (a one-line installer) | Nothing, just `python3` and an `authorized_keys` entry |
+| Network | Host makes outbound HTTPS to ServerStats. Works behind NAT, and the host needs no open ports | ServerStats must reach the host's SSH port |
+| If the ServerStats server is compromised | The attacker gets **no access to your hosts**. The server only receives data | The attacker gets SSH access (as an unprivileged user) to every host. See the hardening options below |
+| Runs as | Throwaway unprivileged user (`DynamicUser`) in a locked-down systemd sandbox | Unprivileged `serverstats` user |
+| Accuracy | CPU and disk rates are averaged over the whole report interval | 1-second sample at each poll |
+
+**Why agents are the default:** a monitoring server that holds SSH keys to every machine is a juicy target, and this one is internet-facing. With the push model, the server never has credentials for your hosts. Each host only has a token that lets it submit its own stats. SSH mode is still handy for boxes where you'd rather not install anything.
+
+## Quick start
+
+```sh
+git clone <this repo> serverstats && cd serverstats
+mkdir -p config
+cp config.example.yaml config/config.yaml   # then edit it (see "Adding hosts")
+docker compose up -d --build
+```
+
+The app listens on `127.0.0.1:8080`, so it's not reachable from other machines until you put a reverse proxy in front (see [Putting it behind Authentik](#putting-it-behind-authentik)). By default it **rejects UI and API requests that don't carry Authentik's `X-authentik-username` header** (`require_auth_header: true`). For a quick local test without a proxy, set that to `false` temporarily.
+
+Edit `config/config.yaml` and restart the container (`docker compose restart`) to add or remove hosts.
+
+## Adding hosts
+
+The easiest way is the **Add host** button in the UI. It generates a token and gives you ready-to-paste config and commands. Here is what it does, for reference:
+
+### Agent
+
+1. Generate a token: `openssl rand -hex 32`
+2. Add the host to `config/config.yaml` and restart ServerStats:
+   ```yaml
+   hosts:
+     - name: nas
+       mode: agent
+       token: <the token>
+   ```
+3. On the host (needs systemd, `python3`, and `curl` or `wget`):
+   ```sh
+   curl -fsSL https://stats.example.com/api/agent/install.sh \
+     | sudo sh -s -- --url https://stats.example.com --token <the token>
+   ```
+   This installs `/usr/local/bin/serverstats-agent`, writes the token to `/etc/serverstats-agent.env` (mode 600), and starts a hardened `serverstats-agent.service`. Check it with `journalctl -u serverstats-agent -f`. To remove it, run the same script with `--uninstall`.
+
+   Other installer options: `--interval 15` sets seconds between reports, and `--ca-file /path/ca.pem` is for a private CA. Longer intervals are fine: the agent tells the server its interval, so a host is only marked offline after it misses about three reports.
+
+   You can also run the installer from a checkout of this repo (`sudo ./agent/install.sh --url … --token …`). Without systemd (Alpine/OpenRC, containers, …), run the script under your init system of choice:
+   `SERVERSTATS_URL=… SERVERSTATS_TOKEN=… /usr/local/bin/serverstats-agent`
+
+The agent identifies itself only by its token. A host can't report as another host.
+
+### SSH
+
+1. Get ServerStats' public key from **Add host → SSH** in the UI, or with
+   `docker compose exec serverstats cat /data/ssh/id_ed25519.pub`. The key pair is generated on first start and stored in the data volume.
+2. On the host, create an unprivileged user and authorize the key:
+   ```sh
+   sudo useradd --system --create-home --shell /bin/sh serverstats
+   sudo install -d -m 700 -o serverstats -g serverstats ~serverstats/.ssh
+   echo 'restrict ssh-ed25519 AAAA… serverstats' | sudo tee -a ~serverstats/.ssh/authorized_keys
+   sudo chown serverstats: ~serverstats/.ssh/authorized_keys
+   sudo chmod 600 ~serverstats/.ssh/authorized_keys
+   ```
+3. Add the host to `config/config.yaml` and restart ServerStats:
+   ```yaml
+     - name: pi
+       mode: ssh
+       address: 192.168.1.20
+       user: serverstats
+       # port: 22
+       # interval: 15
+   ```
+
+The host key is **trusted on first use** and pinned in `/data/known_hosts.json`. If it later changes, ServerStats refuses to connect and shows an error on the dashboard. You can pin a key up front with `host_key: "SHA256:…"` (get it with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`).
+
+**Hardening SSH mode (recommended):** by default the server pipes the collector to `python3 -`, which means the key can run arbitrary code as `serverstats` on that host. To lock the key down to *only* collecting stats, install the collector on the host and force it:
+
+```sh
+curl -fsSL https://stats.example.com/api/agent/serverstats_agent.py -o serverstats_agent.py
+sudo install -m 755 serverstats_agent.py /usr/local/bin/serverstats-agent
+```
+```
+restrict,from="10.0.0.5",command="/usr/local/bin/serverstats-agent --once" ssh-ed25519 AAAA… serverstats
+```
+
+`from=` should be the IP ServerStats connects from. With a forced command, the host ignores whatever ServerStats sends and just prints one sample, so a stolen key is worth very little.
+
+## Putting it behind Authentik
+
+The UI and its API sit behind Authentik. These four exact paths **must bypass** Authentik, because agents authenticate with their own per-host bearer tokens:
+
+| Path | Purpose |
+|---|---|
+| `/api/ingest` | agents POST their stats here (bearer token required) |
+| `/api/agent/serverstats_agent.py` | agent download, used by the installer |
+| `/api/agent/install.sh` | installer download |
+| `/healthz` | health check |
+
+If your agents can reach ServerStats on your LAN, you can also point them at an internal address instead. Nothing else changes.
+
+### 1. Authentik
+
+1. **Applications → Providers → Create → Proxy Provider**
+   - Mode: **Forward auth (single application)**. **Proxy** mode also works if you want Authentik's outpost to be the reverse proxy.
+   - External host: `https://stats.example.com`
+   - Under *Advanced protocol settings → Unauthenticated Paths*, add:
+     ```
+     ^/api/ingest$
+     ^/api/agent/serverstats_agent\.py$
+     ^/api/agent/install\.sh$
+     ^/healthz$
+     ```
+2. **Applications → Create**: name it ServerStats, select the provider, and optionally restrict it to a group via *Policy / Group bindings*.
+3. **Outposts**: add the application to your outpost (e.g. the embedded outpost).
+
+Authentik passes the signed-in user in the `X-authentik-username` header. ServerStats shows it in the top bar and rejects UI/API requests without it (`require_auth_header`).
+
+### 2. Reverse proxy
+
+<details>
+<summary><b>Traefik</b> (Docker labels)</summary>
+
+Attach ServerStats to Traefik's network instead of publishing a port:
+
+```yaml
+services:
+  serverstats:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - ./config:/config:ro
+      - serverstats-data:/data
+    networks: [proxy]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.serverstats.rule=Host(`stats.example.com`)
+      - traefik.http.routers.serverstats.entrypoints=websecure
+      - traefik.http.routers.serverstats.tls.certresolver=letsencrypt
+      - traefik.http.routers.serverstats.middlewares=authentik@docker
+      - traefik.http.services.serverstats.loadbalancer.server.port=8080
+networks:
+  proxy:
+    external: true
+volumes:
+  serverstats-data:
+```
+
+If you don't already have an `authentik` forward-auth middleware, define one (e.g. on the Authentik server container):
+
+```yaml
+      - traefik.http.middlewares.authentik.forwardauth.address=http://authentik-server:9000/outpost.goauthentik.io/auth/traefik
+      - traefik.http.middlewares.authentik.forwardauth.trustForwardHeader=true
+      - traefik.http.middlewares.authentik.forwardauth.authResponseHeaders=X-authentik-username,X-authentik-groups,X-authentik-email,X-authentik-name,X-authentik-uid
+```
+
+You also need a router for `/outpost.goauthentik.io/` on the same host pointing to Authentik, as described in [Authentik's Traefik docs](https://docs.goauthentik.io/docs/add-secure-apps/providers/proxy/server_traefik).
+</details>
+
+<details>
+<summary><b>nginx</b></summary>
+
+```nginx
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name stats.example.com;
+    # ssl_certificate / ssl_certificate_key ...
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+        auth_request /outpost.goauthentik.io/auth/nginx;
+        error_page 401 = @goauthentik_proxy_signin;
+        auth_request_set $auth_cookie $upstream_http_set_cookie;
+        add_header Set-Cookie $auth_cookie;
+        auth_request_set $authentik_username $upstream_http_x_authentik_username;
+        proxy_set_header X-authentik-username $authentik_username;
+    }
+
+    location /outpost.goauthentik.io {
+        proxy_pass http://authentik-server:9000/outpost.goauthentik.io;
+        proxy_set_header Host $host;
+        proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+        add_header Set-Cookie $auth_cookie;
+        auth_request_set $auth_cookie $upstream_http_set_cookie;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+    }
+
+    location @goauthentik_proxy_signin {
+        internal;
+        add_header Set-Cookie $auth_cookie;
+        return 302 /outpost.goauthentik.io/start?rd=$scheme://$http_host$request_uri;
+    }
+}
+```
+</details>
+
+For Caddy, Nginx Proxy Manager, and others, follow [Authentik's proxy provider docs](https://docs.goauthentik.io/docs/add-secure-apps/providers/proxy/). ServerStats needs nothing special beyond the unauthenticated paths above.
+
+## Security notes
+
+- **Don't expose port 8080 directly.** The SSO check trusts the `X-authentik-username` header, which is only meaningful when every request comes through your proxy. The compose file binds to `127.0.0.1`; with Traefik, use a Docker network and no published port.
+- Agent tokens are compared in constant time. Ingest payloads are capped at 4 MiB and normalized to a strict schema. Everything from hosts (process names, command lines) is rendered as text, never HTML. The UI sends a strict Content-Security-Policy.
+- The UI is read-only: nothing in it can change or run anything on your hosts.
+- The container runs as a non-root user with a read-only root filesystem and all capabilities dropped. Persistent state lives in the `/data` volume: the SQLite DB, the SSH key, and pinned host keys.
+
+## Configuration
+
+See [`config.example.yaml`](config.example.yaml) for all options: offline threshold, history retention, SSH poll interval, process cap, and auth header.
+
+| Env var | Default | |
+|---|---|---|
+| `SERVERSTATS_CONFIG` | `/config/config.yaml` | config file path |
+| `SERVERSTATS_DATA` | `/data` | SQLite DB, SSH key, `known_hosts.json` |
+
+If you bind-mount a host directory as `/data` instead of using the named volume, make it writable by UID `10001`.
+
+## Development
+
+```sh
+cd server
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest
+
+# run locally without a proxy
+mkdir -p ../data
+printf 'settings:\n  require_auth_header: false\nhosts: []\n' > ../data/config.yaml
+SERVERSTATS_CONFIG=../data/config.yaml SERVERSTATS_DATA=../data uvicorn app.main:app --reload --port 8080
+```
+
+`python3 agent/serverstats_agent.py --once` prints a single sample, which is handy for checking what a host reports.
+
+Layout:
+
+```
+agent/serverstats_agent.py   collector + push agent (stdlib only)
+agent/install.sh             systemd installer for the agent
+server/app/main.py           FastAPI app: UI API, agent ingest, auth gate
+server/app/ssh_poller.py     SSH pull mode (asyncssh), host key pinning
+server/app/store.py          latest samples + SQLite history
+server/app/schema.py         payload normalization
+server/app/static/           the UI (plain HTML/CSS/JS, no build step)
+```
