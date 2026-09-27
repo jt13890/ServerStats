@@ -8,11 +8,12 @@ services:
       - ./config:/config:ro      # config.yaml lives here
       - serverstats-data:/data   # SQLite history, SSH key, pinned host keys
     # Don't publish the port to the internet: everything except the agent
-    # endpoints should only be reachable through Authentik. Bind to localhost
-    # (or drop "ports" entirely and attach the container to your proxy's
-    # Docker network - see README).
+    # endpoints should only be reachable through Authentik. Binds to localhost
+    # by default (or drop "ports" and attach the container to your proxy's
+    # Docker network - see README). For a LAN-only test without a proxy, put
+    # SERVERSTATS_BIND=0.0.0.0 in a .env file next to this one.
     ports:
-      - "127.0.0.1:8080:8080"
+      - "${SERVERSTATS_BIND:-127.0.0.1}:${SERVERSTATS_PORT:-8080}:8080"
     read_only: true
     tmpfs:
       - /tmp

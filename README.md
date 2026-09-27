@@ -37,6 +37,8 @@ The app listens on `127.0.0.1:8080`, so it's not reachable from other machines u
 
 Edit `config/config.yaml` and restart the container (`docker compose restart`) to add or remove hosts.
 
+**Trying it on your LAN before Authentik is set up:** create a `.env` file next to `docker-compose.yml` containing `SERVERSTATS_BIND=0.0.0.0` (and `SERVERSTATS_PORT=…` if 8080 is taken), and set `require_auth_header: false` in the config. Anyone on your network can then view the dashboard, so undo both once Authentik is in front.
+
 ## Adding hosts
 
 The easiest way is the **Add host** button in the UI. It generates a token and gives you ready-to-paste config and commands. Here is what it does, for reference:
