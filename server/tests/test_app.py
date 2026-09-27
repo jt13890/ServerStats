@@ -362,3 +362,24 @@ def test_ui_is_revalidated(client):
     assert client.get("/", headers=USER).headers["cache-control"] == "no-cache"
     assert client.get("/static/app.js", headers=USER).headers["cache-control"] == "no-cache"
     assert "cache-control" not in client.get("/api/hosts", headers=USER).headers
+
+
+def test_cgroup_v2_without_memory_controller(tmp_path, monkeypatch):
+    """Raspberry Pi OS disables the memory cgroup by default: still report CPU."""
+    import agent_collector as a
+
+    cg = tmp_path / "system.slice" / "docker-abc.scope"
+    cg.mkdir(parents=True)
+    (cg / "cpu.stat").write_text("usage_usec 1000\n")
+    real_read = a._read
+    monkeypatch.setattr(a, "CGROUP_ROOT", str(tmp_path))
+    monkeypatch.setattr(a, "_read", lambda p: "0::/system.slice/docker-abc.scope\n" if p == "/proc/42/cgroup" else real_read(p))
+    assert a._cgroup_counters(42) == (1_000_000, None, 0, 0)
+    delta = a._docker_delta(
+        {"containers": {"c": {"counters": (0, None, 0, 0), "net": None}}},
+        {"containers": {"c": {"name": "x", "project": "p", "service": "s", "image": "i", "status": "Up",
+                              "counters": (1_000_000_000, None, 0, 0), "net": None, "volumes": []}}},
+        1.0, 1000,
+    )
+    c = delta["containers"][0]
+    assert c["cpu"] == 100.0 and c["mem"] is None and c["mem_percent"] is None
