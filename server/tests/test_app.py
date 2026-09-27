@@ -356,3 +356,9 @@ def test_docker_payload_is_normalized(client):
 
     ingest(client, TOKEN_A, sample(docker={"error": "no permission"}))
     assert client.get("/api/hosts/alpha", headers=USER).json()["docker"] == {"error": "no permission"}
+
+
+def test_ui_is_revalidated(client):
+    assert client.get("/", headers=USER).headers["cache-control"] == "no-cache"
+    assert client.get("/static/app.js", headers=USER).headers["cache-control"] == "no-cache"
+    assert "cache-control" not in client.get("/api/hosts", headers=USER).headers
