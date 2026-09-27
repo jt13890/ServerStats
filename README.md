@@ -17,13 +17,13 @@ Both modes run the same collector (`agent/serverstats_agent.py`). It uses only t
 
 | | **Push agent** (recommended) | **SSH pull** |
 |---|---|---|
-| Install on host | One Python file plus a systemd unit (a one-line installer) | One Python file plus a locked-down `authorized_keys` entry (a one-line installer) |
+| Install on host | One Python file plus a systemd or OpenRC service (a one-line installer) | One Python file plus a locked-down `authorized_keys` entry (a one-line installer) |
 | Network | Host makes outbound HTTPS to ServerStats. Works behind NAT, and the host needs no open ports | ServerStats must reach the host's SSH port |
-| If the ServerStats server is compromised | The attacker gets **no access to your hosts**. The server only receives data | The attacker can make hosts run the collector, and nothing else: the key is locked to it by a forced command |
-| Runs as | Throwaway unprivileged user (`DynamicUser`) in a locked-down systemd sandbox | Unprivileged `serverstats` user |
+| If the ServerStats server is compromised | The attacker can push agent code to hosts that accept [remote updates](#updating-agents) (the default), running as the agent's user. Install with `--no-updates` and the server only receives data | The attacker can make hosts run the collector, and nothing else: the key is locked to it by a forced command |
+| Runs as | Unprivileged user: a throwaway `DynamicUser` in a locked-down systemd sandbox, or `serverstats-agent` under OpenRC | Unprivileged `serverstats` user |
 | Accuracy | CPU and disk rates are averaged over the whole report interval | 1-second sample at each poll |
 
-**Why agents are the default:** a monitoring server that holds SSH keys to every machine is a juicy target, and this one is internet-facing. With the push model, the server never has credentials for your hosts. Each host only has a token that lets it submit its own stats. SSH mode is handy when a host can't reach the server, or you'd rather not run a service on it.
+**Why agents are the default:** a monitoring server that holds SSH keys to every machine is a juicy target, and this one is internet-facing. With the push model, the server never has credentials for your hosts. Each host only has a token that lets it submit its own stats. The one thing a host trusts the server with is remote updates, and you can turn those off per host. SSH mode is handy when a host can't reach the server, or you'd rather not run a service on it.
 
 ## Quick start
 
@@ -54,19 +54,31 @@ The easiest way is the **Add host** button in the UI. It generates a token and g
        mode: agent
        token: <the token>
    ```
-3. On the host (needs systemd, `python3`, and `curl` or `wget`):
+3. On the host (needs systemd or OpenRC, `python3`, and `curl` or `wget`):
    ```sh
    curl -fsSL https://stats.example.com/api/agent/install.sh \
      | sudo sh -s -- --url https://stats.example.com --token <the token>
    ```
-   This installs `/usr/local/bin/serverstats-agent`, writes the token to `/etc/serverstats-agent.env` (mode 600), and starts a hardened `serverstats-agent.service`. Check it with `journalctl -u serverstats-agent -f`. To remove it, run the same script with `--uninstall`.
+   This installs `/usr/local/bin/serverstats-agent`, writes the token to `/etc/serverstats-agent.env`, and starts the service:
+   - **systemd:** a hardened `serverstats-agent.service` running as a throwaway user. Logs: `journalctl -u serverstats-agent -f`.
+   - **OpenRC** (Alpine, postmarketOS, Gentoo): an `/etc/init.d/serverstats-agent` service supervised by `supervise-daemon`, running as a dedicated unprivileged `serverstats-agent` user. The agent reads the token from the env file (readable only by root and that user), so it never appears in `ps`. Logs: `/var/log/serverstats-agent.log`.
 
-   Add `--docker` for the Docker section (see below). Other installer options: `--interval 15` sets seconds between reports, and `--ca-file /path/ca.pem` is for a private CA. Longer intervals are fine: the agent tells the server its interval, so a host is only marked offline after it misses about three reports.
+   To remove it, run the same script with `--uninstall`.
 
-   You can also run the installer from a checkout of this repo (`sudo ./agent/install.sh --url … --token …`). Without systemd (Alpine/OpenRC, containers, …), run the script under your init system of choice:
-   `SERVERSTATS_URL=… SERVERSTATS_TOKEN=… /usr/local/bin/serverstats-agent`
+   Add `--docker` for the Docker section (see below), and `--no-updates` to refuse [remote updates](#updating-agents). Other installer options: `--interval 15` sets seconds between reports, and `--ca-file /path/ca.pem` is for a private CA. Longer intervals are fine: the agent tells the server its interval, so a host is only marked offline after it misses about three reports.
+
+   You can also run the installer from a checkout of this repo (`sudo ./agent/install.sh --url … --token …`). With neither systemd nor OpenRC (e.g. inside a container), run the agent under your init system of choice: `/usr/local/bin/serverstats-agent --env-file /etc/serverstats-agent.env`.
 
 The agent identifies itself only by its token. A host can't report as another host.
+
+### Updating agents
+
+When the server has a newer agent than a host is running, the host's page shows **Update agent**, and the overview shows **Update agents (N)** for all of them. Updating the server (`git pull` plus `docker compose up -d --build`) is what makes a new agent version available.
+
+- **How it works:** after you click, the server answers the host's next report with the new version and its SHA-256 hash. The agent downloads the code from the server, checks the hash, saves it in its own state directory (`/var/lib/serverstats-agent`) and restarts into it. It keeps running as the same unprivileged user.
+- **Safety net:** the installed copy stays untouched. If an update fails to start three times in a row, the agent goes back to the installed version, won't retry that version, and the host page tells you it failed. Rerun the installer to retry.
+- **Only agents from 1.2.0 on can be updated this way.** Older agents, and SSH hosts, need the installer rerun once.
+- **What you're trusting:** an agent that accepts updates runs whatever code the server gives it, so anyone who takes over the ServerStats server can run code on those hosts. On hosts installed with `--docker` that includes the Docker socket, which is root-equivalent. Install with `--no-updates` on hosts where that's not acceptable; the dashboard then says the host doesn't accept remote updates.
 
 ### SSH
 
@@ -221,8 +233,9 @@ For Caddy, Nginx Proxy Manager, and others, follow [Authentik's proxy provider d
 
 ## Security notes
 
-**No remote code execution by design:**
-- The **agent** only sends data. It never runs or interprets anything the server returns, and it refuses HTTP redirects, so the token can't be bounced elsewhere. A compromised ServerStats server can't run code on agent hosts.
+**Where code can come from:**
+- **Remote updates are the one deliberate exception.** An agent that accepts them (the default) runs agent code the server provides when you click Update, so the server is trusted with code on those hosts. Install with `--no-updates` to opt a host out; see [Updating agents](#updating-agents). Update requests need the SSO header and a custom request header, so another site can't trigger one through your browser.
+- Apart from updates, the **agent** only sends data. It doesn't interpret anything else the server returns, and it refuses HTTP redirects, so the token can't be bounced elsewhere.
 - In **SSH mode** the key is locked to the collector (see above), and ServerStats refuses hosts where it isn't.
 - The **server** never executes, evaluates or unpickles anything. The config is read with `yaml.safe_load`, SQL is parameterized, and host data is validated against a strict schema. A test checks the server code for exec paths.
 - **Install time is the exception.** `curl … | sudo sh` trusts whoever serves the installer at that moment. The files come from the read-only container image, but for the strongest guarantee, install from a git checkout you've reviewed (`sudo ./agent/install.sh …`).
@@ -231,7 +244,7 @@ Also:
 
 - **Don't expose port 8080 directly.** The SSO check trusts the `X-authentik-username` header, which is only meaningful when every request comes through your proxy. The compose file binds to `127.0.0.1`; with Traefik, use a Docker network and no published port.
 - Agent tokens are compared in constant time. Ingest payloads are capped at 4 MiB and normalized to a strict schema. Everything from hosts (process names, command lines) is rendered as text, never HTML. The UI sends a strict Content-Security-Policy.
-- The UI is read-only: nothing in it can change or run anything on your hosts.
+- Apart from the update buttons, the UI is read-only.
 - The container runs as a non-root user with a read-only root filesystem and all capabilities dropped. Persistent state lives in the `/data` volume: the SQLite DB, the SSH key, and pinned host keys.
 
 ## Configuration
@@ -265,7 +278,7 @@ Layout:
 
 ```
 agent/serverstats_agent.py   collector + push agent (stdlib only)
-agent/install.sh             systemd installer for the agent
+agent/install.sh             installer: systemd or OpenRC agent service, or locked SSH access
 server/app/main.py           FastAPI app: UI API, agent ingest, auth gate
 server/app/ssh_poller.py     SSH pull mode (asyncssh): forced-command check, host key pinning
 server/app/store.py          latest samples + tiered SQLite history (raw / 5 min / 1 h)

@@ -32,6 +32,9 @@
     <section class="overview">
       <div class="toolbar">
         <input id="host-filter" class="input" type="search" placeholder="Filter hosts" aria-label="Filter hosts">
+        <span class="spacer"></span>
+        <span id="update-all-note" class="muted update-note"></span>
+        <button id="update-all" class="btn" type="button" hidden></button>
       </div>
       <div id="host-grid" class="host-grid"></div>
       <div id="empty" class="empty" hidden>
@@ -63,6 +66,10 @@
         <span id="d-status" class="status"><span class="status-dot"></span><span class="status-label"></span></span>
       </div>
       <div id="d-sub" class="host-sub"></div>
+      <div id="d-update" class="update-row" hidden>
+        <span id="d-update-text"></span>
+        <button id="d-update-btn" class="btn" type="button" hidden></button>
+      </div>
       <div id="d-error" class="banner" hidden></div>
 
       <div id="d-tiles" class="tiles"></div>

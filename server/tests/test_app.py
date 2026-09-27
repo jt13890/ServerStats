@@ -383,3 +383,62 @@ def test_cgroup_v2_without_memory_controller(tmp_path, monkeypatch):
     )
     c = delta["containers"][0]
     assert c["cpu"] == 100.0 and c["mem"] is None and c["mem_percent"] is None
+
+
+# -- remote agent updates -------------------------------------------------------
+
+def _post_update(client, name, header=True):
+    headers = dict(USER, **({"X-ServerStats-Action": "1"} if header else {}))
+    return client.post(f"/api/hosts/{name}/update", headers=headers)
+
+
+def test_update_flow(client):
+    from app.main import AGENT_SHA256, AGENT_VERSION
+
+    ingest(client, TOKEN_A, sample(agent_version="1.0.0", updates=True))
+    assert client.get("/api/hosts", headers=USER).json()[0]["update_available"] is True
+
+    assert _post_update(client, "alpha", header=False).status_code == 403  # CSRF guard
+    assert client.post("/api/hosts/alpha/update", headers={"X-ServerStats-Action": "1"}).status_code == 401  # SSO
+    assert _post_update(client, "alpha").status_code == 200
+
+    # Offered on the next reports, at most 3 times, then given up on.
+    for _ in range(3):
+        reply = ingest(client, TOKEN_A, sample(agent_version="1.0.0", updates=True)).json()
+        assert reply["update"] == {"version": AGENT_VERSION, "sha256": AGENT_SHA256}
+    assert "update" not in ingest(client, TOKEN_A, sample(agent_version="1.0.0", updates=True)).json()
+
+    # Once the agent runs the new version the request is done.
+    assert _post_update(client, "alpha").status_code == 200
+    assert "update" not in ingest(client, TOKEN_A, sample(agent_version=AGENT_VERSION, updates=True)).json()
+    assert client.get("/api/hosts/alpha", headers=USER).json()["update_pending"] is False
+    assert _post_update(client, "alpha").status_code == 409  # already up to date
+
+
+def test_update_refused_when_agent_opted_out(client):
+    ingest(client, TOKEN_A, sample(agent_version="1.0.0", updates=False))
+    r = _post_update(client, "alpha")
+    assert r.status_code == 409 and "doesn't accept remote updates" in r.json()["detail"]
+    ingest(client, TOKEN_B, sample(agent_version="1.0.0", updates=True))
+    r = client.post("/api/update-agents", headers=dict(USER, **{"X-ServerStats-Action": "1"})).json()
+    assert r["queued"] == ["beta"] and "alpha" in r["skipped"]
+
+
+def test_served_agent_matches_announced_hash(client):
+    import hashlib
+
+    from app.main import AGENT_SHA256
+
+    body = client.get("/api/agent/serverstats_agent.py").content
+    assert hashlib.sha256(body).hexdigest() == AGENT_SHA256
+
+
+def test_failed_update_is_not_offered_again(client):
+    from app.main import AGENT_VERSION
+
+    ingest(client, TOKEN_A, sample(agent_version="1.0.0", updates=True))
+    assert _post_update(client, "alpha").status_code == 200
+    reply = ingest(client, TOKEN_A, sample(agent_version="1.0.0", updates=True, update_failed=AGENT_VERSION)).json()
+    assert "update" not in reply
+    r = _post_update(client, "alpha")
+    assert r.status_code == 409 and "failed to start" in r.json()["detail"]

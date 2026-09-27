@@ -130,6 +130,8 @@ def normalize(d: dict, max_procs: int) -> dict:
     interval = _num(d.get("interval"), None)
     return {
         "agent_version": _str(d.get("agent_version"), 32),
+        "updates": d.get("updates") is True,  # agent accepts remote updates
+        "update_failed": _str(d.get("update_failed"), 32) or None,  # version that failed to start
         # Reporting interval (agents only), clamped so a host can't claim to
         # stay "online" for days after it stops reporting.
         "interval": min(max(interval, 1.0), 3600.0) if interval is not None else None,
