@@ -33,7 +33,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -322,11 +322,14 @@ def _cgroup_counters(pid):
             if c:
                 v1[c] = path.lstrip("/")
 
-    if v2 and os.path.exists(os.path.join(v2, "memory.current")):  # cgroup v2
+    if v2 and os.path.exists(os.path.join(v2, "cpu.stat")):  # cgroup v2
         cpu = _kv_file(os.path.join(v2, "cpu.stat")).get("usage_usec", 0) * 1000
-        mem = int(_read(os.path.join(v2, "memory.current")))
-        # Like `docker stats`: don't count reclaimable page cache.
-        mem -= _kv_file(os.path.join(v2, "memory.stat")).get("inactive_file", 0)
+        try:
+            mem = int(_read(os.path.join(v2, "memory.current")))
+            # Like `docker stats`: don't count reclaimable page cache.
+            mem = max(mem - _kv_file(os.path.join(v2, "memory.stat")).get("inactive_file", 0), 0)
+        except OSError:
+            mem = None  # memory controller disabled (e.g. Raspberry Pi OS default)
         rd = wr = 0
         try:
             for line in _read(os.path.join(v2, "io.stat")).splitlines():
@@ -338,7 +341,7 @@ def _cgroup_counters(pid):
                         wr += int(v)
         except OSError:
             pass
-        return cpu, max(mem, 0), rd, wr
+        return cpu, mem, rd, wr
 
     def v1_dir(controller, *mounts):  # cgroup v1: each controller has its own tree
         for m in mounts:
@@ -348,9 +351,12 @@ def _cgroup_counters(pid):
         raise OSError("no %s cgroup for pid %d" % (controller, pid))
 
     cpu = int(_read(os.path.join(v1_dir("cpuacct", "cpuacct", "cpu,cpuacct", "cpuacct,cpu"), "cpuacct.usage")))
-    mdir = v1_dir("memory", "memory")
-    mem = int(_read(os.path.join(mdir, "memory.usage_in_bytes")))
-    mem -= _kv_file(os.path.join(mdir, "memory.stat")).get("total_inactive_file", 0)
+    try:
+        mdir = v1_dir("memory", "memory")
+        mem = int(_read(os.path.join(mdir, "memory.usage_in_bytes")))
+        mem = max(mem - _kv_file(os.path.join(mdir, "memory.stat")).get("total_inactive_file", 0), 0)
+    except OSError:
+        mem = None  # memory controller disabled
     rd = wr = 0
     try:
         for line in _read(os.path.join(v1_dir("blkio", "blkio"), "blkio.throttle.io_service_bytes")).splitlines():
@@ -361,7 +367,7 @@ def _cgroup_counters(pid):
                 wr += int(parts[2])
     except OSError:
         pass
-    return cpu, max(mem, 0), rd, wr
+    return cpu, mem, rd, wr
 
 
 class _Docker(object):
@@ -461,7 +467,7 @@ def _docker_delta(before, after, elapsed, mem_total):
             "read_rate": None, "write_rate": None, "rx_rate": None, "tx_rate": None,
             "disk": (disk.get("containers") or {}).get(cid),
         }
-        if cur:
+        if cur and cur[1] is not None:
             entry["mem"] = cur[1]
             entry["mem_percent"] = round(100.0 * cur[1] / mem_total, 2) if mem_total else None
         if cur and old:

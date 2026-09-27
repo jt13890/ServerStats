@@ -17,7 +17,7 @@ from .schema import normalize
 from .ssh_poller import AGENT_SCRIPT, SSHPoller, load_or_create_key
 from .store import Store
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 STATIC = Path(__file__).parent / "static"
 INSTALL_SH = AGENT_SCRIPT.parent / "install.sh"
 MAX_INGEST_BYTES = 4 * 1024 * 1024
@@ -86,6 +86,9 @@ async def auth_and_headers(request: Request, call_next):
             status_code=401,
         )
     response = await call_next(request)
+    if path == "/" or path.startswith("/static/"):
+        # Revalidate on every load so an update never leaves a stale UI.
+        response.headers["Cache-Control"] = "no-cache"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "same-origin"
