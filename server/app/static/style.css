@@ -284,7 +284,7 @@ td .meter { grid-template-columns: 1fr 52px; }
   .topbar { padding: 10px 16px; gap: 10px; }
   .fleet-summary { display: none; }
   main { padding: 16px 16px 40px; }
-  .host-grid { grid-template-columns: 1fr; }
+  .host-grid { grid-template-columns: minmax(0, 1fr); }
   .table th, .table td { padding: 6px; }
 }
 

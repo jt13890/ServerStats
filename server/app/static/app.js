@@ -160,6 +160,73 @@ async function refreshHosts() {
   if (state.hosts.length) state.skew = state.hosts[0].server_time - before;
   const online = state.hosts.filter((x) => x.status === 'online').length;
   $('#fleet-summary').textContent = state.hosts.length ? `${online} of ${state.hosts.length} hosts online` : '';
+  drawUpdateAll();
+}
+
+// -- update all agents (top bar) -----------------------------------------------
+
+// Agents the server can update right now.
+function updatableAgents() {
+  return state.hosts.filter((x) => x.mode === 'agent' && x.update_available && x.updates && !x.update_pending
+    && !(state.meta && x.update_failed === state.meta.agent_version));
+}
+
+function drawUpdateAll() {
+  const btn = $('#update-all');
+  const agents = state.hosts.filter((x) => x.mode === 'agent');
+  const latest = state.meta ? state.meta.agent_version : 'the latest version';
+  const ready = updatableAgents();
+  const updating = agents.filter((x) => x.update_pending);
+  // Outdated, but not updatable from here (remote updates off, or the update failed there).
+  const manual = agents.filter((x) => x.update_available && !x.update_pending && !ready.includes(x));
+  const names = (list) => list.map((x) => x.name).join(', ');
+  btn.hidden = agents.length === 0;
+  btn.disabled = ready.length === 0 || btn.dataset.busy === '1';
+  if (ready.length) {
+    btn.textContent = `Update agents (${ready.length})`;
+    btn.title = `Update ${names(ready)} to agent ${latest}`;
+  } else if (updating.length) {
+    btn.textContent = `Updating ${updating.length} agent${updating.length > 1 ? 's' : ''}…`;
+    btn.title = names(updating);
+  } else if (manual.length) {
+    btn.textContent = `${manual.length} agent${manual.length > 1 ? 's' : ''} need a manual update`;
+    btn.title = `Rerun the installer on ${names(manual)} to update ${manual.length > 1 ? 'them' : 'it'}; `
+      + 'the host page says why.';
+  } else {
+    btn.textContent = 'All agents up to date';
+    btn.title = `Every agent runs ${latest}`;
+  }
+}
+
+function setupUpdateAll() {
+  const btn = $('#update-all');
+  const note = $('#update-all-note');
+  let hideNote;
+  const say = (text) => {
+    note.textContent = text;
+    note.hidden = false;
+    clearTimeout(hideNote);
+    hideNote = setTimeout(() => { note.hidden = true; }, 15000);
+  };
+  btn.addEventListener('click', async () => {
+    const list = updatableAgents();
+    const version = state.meta ? state.meta.agent_version : 'the latest version';
+    if (!list.length || !confirm(`Update ${list.length} agent${list.length > 1 ? 's' : ''} to ${version}?\n\n`
+      + `${list.map((x) => x.name).join(', ')}\n\nThey will download and run the agent code this server provides.`)) return;
+    btn.dataset.busy = '1';
+    btn.disabled = true;
+    try {
+      const r = await apiPost('/api/update-agents');
+      const skipped = Object.keys(r.skipped || {});
+      say(`Update requested for ${r.queued.length}` + (skipped.length ? `; skipped ${skipped.join(', ')}` : ''));
+      await refreshHosts();
+    } catch (e) {
+      say(`Update failed: ${e.message}`);
+    } finally {
+      delete btn.dataset.busy;
+      drawUpdateAll();
+    }
+  });
 }
 
 // -- shared widgets ----------------------------------------------------------
@@ -226,11 +293,15 @@ function tile(label, value, sub) {
     sub && h('div', { class: 'tile-sub', text: sub }));
 }
 
+function cores(n) {
+  return `${n} core${n === 1 ? '' : 's'}`;
+}
+
 function subline(host) {
   const parts = [
     host.description,
     host.os,
-    host.cpu && `${host.cpu.count} cores`,
+    host.cpu && cores(host.cpu.count),
     host.memory && `${fmtBytes(host.memory.total)} RAM`,
   ].filter(Boolean);
   if (parts.length) return parts.join(' · ');
@@ -250,35 +321,9 @@ function renderOverview() {
   filter.value = state.hostFilter;
   filter.addEventListener('input', () => { state.hostFilter = filter.value; draw(); });
 
-  const updateBtn = $('#update-all');
-  const updateNote = $('#update-all-note');
-  const updatable = () => state.hosts.filter((x) => x.mode === 'agent' && x.update_available && x.updates && !x.update_pending
-    && !(state.meta && x.update_failed === state.meta.agent_version));
-  updateBtn.addEventListener('click', async () => {
-    const list = updatable();
-    const version = state.meta ? state.meta.agent_version : 'the latest version';
-    if (!list.length || !confirm(`Update ${list.length} agent${list.length > 1 ? 's' : ''} to ${version}?\n\n`
-      + `${list.map((x) => x.name).join(', ')}\n\nThey will download and run the agent code this server provides.`)) return;
-    updateBtn.disabled = true;
-    try {
-      const r = await apiPost('/api/update-agents');
-      const skipped = Object.keys(r.skipped || {});
-      updateNote.textContent = `Update requested for ${r.queued.length}` + (skipped.length ? `; skipped ${skipped.join(', ')}` : '');
-      await refreshHosts();
-      draw();
-    } catch (e) {
-      updateNote.textContent = `Update failed: ${e.message}`;
-    } finally {
-      updateBtn.disabled = false;
-    }
-  });
-
   function draw() {
     const q = state.hostFilter.trim().toLowerCase();
     $('#empty').hidden = state.hosts.length > 0;
-    const n = updatable().length;
-    updateBtn.hidden = n === 0;
-    updateBtn.textContent = `Update agents (${n})`;
     const seen = new Set();
     state.hosts.forEach((host, i) => {
       let card = cards.get(host.name);
@@ -302,7 +347,9 @@ function renderOverview() {
     const tr = trends && trends.hosts[name];
     if (!tr) return {};
     const series = (key) => tr.t.map((t, i) => ({ t, v: tr[key][i] })).filter((p) => p.v != null);
-    return { cpu: series('cpu'), mem: series('mem'), disk: series('disk_util'), storage: series('storage') };
+    return {
+      cpu: series('cpu'), mem: series('mem'), swap: series('swap'), disk: series('disk_util'), storage: series('storage'),
+    };
   }
 
   every(5000, async () => { await refreshHosts(); draw(); });
@@ -321,8 +368,12 @@ function updateCard(card, host, trend = {}) {
     const disk = fullestDisk(host);
     const mem = host.memory || {};
     meters.push(
-      meter('CPU', host.cpu.percent, `${host.cpu.count} cores`, trend.cpu || []),
+      meter('CPU', host.cpu.percent, cores(host.cpu.count), trend.cpu || []),
       meter('Memory', mem.percent, `${fmtBytes(mem.used)} of ${fmtBytes(mem.total)} used`, trend.mem || []),
+      mem.swap_total
+        ? meter('Swap', 100 * (mem.swap_used || 0) / mem.swap_total,
+          `${fmtBytes(mem.swap_used || 0)} of ${fmtBytes(mem.swap_total)} swap used`, trend.swap || [])
+        : meter('Swap', null, 'No swap configured on this host', [], 'None'),
       meter('Disk I/O', host.disk_io ? host.disk_io.util : null,
         host.disk_io ? `Busiest disk. Read ${fmtRate(host.disk_io.read_rate)}, write ${fmtRate(host.disk_io.write_rate)}` : 'Not reported',
         trend.disk || []),
@@ -516,7 +567,7 @@ function renderDetail(name) {
     const net = host.net || {};
     const tasks = host.tasks || {};
     tiles.replaceChildren(
-      tile('CPU', fmtPct(host.cpu.percent), `${host.cpu.count} cores · load ${(host.load || []).map((l) => l.toFixed(2)).join(' ')}`),
+      tile('CPU', fmtPct(host.cpu.percent), `${cores(host.cpu.count)} · load ${(host.load || []).map((l) => l.toFixed(2)).join(' ')}`),
       tile('Memory', fmtPct(mem.percent),
         `${fmtBytes(mem.used)} of ${fmtBytes(mem.total)}` + (mem.swap_total ? ` · swap ${fmtBytes(mem.swap_used)}` : '')),
       tile('Disk I/O busy', fmtPct(dio.util), `read ${fmtRate(dio.read_rate)} · write ${fmtRate(dio.write_rate)}`),
@@ -1105,6 +1156,7 @@ function route() {
 
 async function boot() {
   setupDialog();
+  setupUpdateAll();
   window.addEventListener('hashchange', route);
   let resizeTimer;
   window.addEventListener('resize', () => {
@@ -1116,6 +1168,7 @@ async function boot() {
   route();
   try {
     state.meta = await api('/api/meta');
+    drawUpdateAll(); // now with the latest agent version
     if (state.meta.user) {
       const user = $('#user');
       user.textContent = state.meta.user;

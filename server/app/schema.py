@@ -141,7 +141,7 @@ def normalize(d: dict, max_procs: int) -> dict:
         "kernel": _str(d.get("kernel")),
         "arch": _str(d.get("arch"), 32),
         "uptime": _num(d.get("uptime"), None),
-        "cpu": {"count": _int(cpu.get("count"), 1), "percent": _num(cpu.get("percent"))},
+        "cpu": {"count": _int(cpu.get("count"), 1), "percent": _opt(cpu.get("percent"))},
         "load": load + [0.0] * (3 - len(load)),
         "memory": {k: _num(mem.get(k)) for k in ("total", "available", "used", "percent", "swap_total", "swap_used")},
         "disks": disks,

@@ -79,7 +79,7 @@ The agent identifies itself only by its token. A host can't report as another ho
 
 ### Updating agents
 
-When the server has a newer agent than a host is running, the host's page shows **Update agent**, and the overview shows **Update agents (N)** for all of them. Updating the server (`git pull` plus `docker compose up -d --build`) is what makes a new agent version available.
+When the server has a newer agent than a host is running, the host's page shows **Update agent**, and the top bar shows **Update agents (N)** to update all of them at once. When nothing can be updated from the dashboard, that button says why: all agents are up to date, updates are in progress, or some agents need the installer rerun on the host. Updating the server (`git pull` plus `docker compose up -d --build`) is what makes a new agent version available.
 
 - **How it works:** after you click, the server answers the host's next report with the new version and its SHA-256 hash. The agent downloads the code from the server, checks the hash, saves it in its own state directory (`/var/lib/serverstats-agent`) and restarts into it. It keeps running as the same unprivileged user.
 - **Safety net:** the installed copy stays untouched. If an update fails to start three times in a row, the agent goes back to the installed version, won't retry that version, and the host page tells you it failed. Rerun the installer to retry.
@@ -118,7 +118,7 @@ Add `--docker` to either installer command to get a **Docker** section on the ho
 
 - **Usage comes from the kernel.** CPU, memory and I/O are read from each container's cgroup, the same numbers `docker stats` uses, without its per-container delay.
 - **Disk space** is each container's writable layer plus its volumes (bind mounts aren't counted). The push agent measures it every 15 minutes; it isn't available in SSH mode.
-- **Grouping into stacks needs the Docker API.** Stacks are identified by the `com.docker.compose.project` label, which only the Docker API has. So `--docker` adds the collector to the `docker` group, and **access to the Docker socket is root-equivalent on that host**. The collector only ever sends three fixed, read-only requests (`GET /containers/json`, `GET /containers/<id>/json`, `GET /system/df`). It never acts on anything the server sends, but it's still your call whether that access is acceptable. Without `--docker`, nothing changes.
+- **Grouping into stacks needs the Docker API.** Stacks are identified by the `com.docker.compose.project` label, which only the Docker API has. So `--docker` adds the collector to the `docker` group, and **access to the Docker socket is root-equivalent on that host**. The collector only ever sends three fixed, read-only requests (`GET /containers/json`, `GET /containers/<id>/json`, `GET /system/df`). It never acts on anything the server sends, but it's still your call whether that access is acceptable. Without `--docker`, the agent doesn't read Docker; on a host that has Docker, the host's page says so and how to turn it on.
 - Per-container disk I/O needs cgroup v2 (the default on current distros). On cgroup v1 hosts it shows 0, as it does in `docker stats`.
 
 ## Putting it behind Authentik

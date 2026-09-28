@@ -16,6 +16,8 @@
     </a>
     <span id="fleet-summary" class="fleet-summary"></span>
     <span class="spacer"></span>
+    <span id="update-all-note" class="muted update-note" hidden></span>
+    <button id="update-all" class="btn" type="button" hidden></button>
     <button id="add-host-btn" class="btn" type="button">Add host</button>
     <span id="user" class="user" hidden></span>
   </header>
@@ -32,9 +34,6 @@
     <section class="overview">
       <div class="toolbar">
         <input id="host-filter" class="input" type="search" placeholder="Filter hosts" aria-label="Filter hosts">
-        <span class="spacer"></span>
-        <span id="update-all-note" class="muted update-note"></span>
-        <button id="update-all" class="btn" type="button" hidden></button>
       </div>
       <div id="host-grid" class="host-grid"></div>
       <div id="empty" class="empty" hidden>

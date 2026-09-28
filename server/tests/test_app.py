@@ -89,7 +89,7 @@ def test_malformed_payload_is_normalized(client):
     }
     assert ingest(client, TOKEN_A, evil).status_code == 200
     h = client.get("/api/hosts/alpha", headers=USER).json()
-    assert h["cpu"] == {"count": 1, "percent": 0.0}
+    assert h["cpu"] == {"count": 1, "percent": None}  # unknown, not 0%
     assert h["load"] == [0.0, 0.0, 0.0]
     assert h["memory"]["total"] == 0.0
     assert h["disks"] == [{"mount": "/", "device": "", "fs": "", "total": 0.0, "used": 0.0, "free": 0.0, "percent": 0.0}]
@@ -213,7 +213,7 @@ def test_trends_endpoint(client):
     ingest(client, TOKEN_A, sample())
     tr = client.get("/api/trends", headers=USER).json()
     assert set(tr["hosts"]) == {"alpha"}
-    assert {"t", "cpu", "mem", "disk_util", "storage"} <= tr["hosts"]["alpha"].keys()
+    assert {"t", "cpu", "mem", "swap", "disk_util", "storage"} <= tr["hosts"]["alpha"].keys()
 
 
 def test_retention_setting(tmp_path):
@@ -543,3 +543,70 @@ def test_unwritable_config_location_falls_back_to_defaults(tmp_path):
     blocker.write_text("")
     conf = load(blocker / "config.yaml")  # parent is a file: can't create
     assert conf.hosts == [] and conf.settings.enrollment
+
+
+# /proc/stat on kernel 3.10 while 3 of 4 cores go offline (CPU hotplug), 1 s apart.
+# The combined "cpu" line counts offline cores' idle time from a stale counter,
+# so it drops by a lot; only online cores get a per-core line.
+PROC_STAT_4_ONLINE = """cpu  4000 0 2000 400000 100 0 50 0 0 0
+cpu0 1000 0 500 100000 25 0 20 0 0 0
+cpu1 1000 0 500 100000 25 0 10 0 0 0
+cpu2 1000 0 500 100000 25 0 10 0 0 0
+cpu3 1000 0 500 100000 25 0 10 0 0 0
+btime 1700000000
+"""
+PROC_STAT_1_ONLINE = """cpu  4030 0 2010 100060 100 0 51 0 0 0
+cpu0 1030 0 510 100060 25 0 21 0 0 0
+btime 1700000000
+"""
+
+
+def _cpus(monkeypatch, text):
+    import agent_collector as a
+
+    monkeypatch.setattr(a, "_read", lambda path: text)
+    return a._cpu_times()[0]
+
+
+def test_cpu_percent_survives_cpu_hotplug(monkeypatch):
+    import agent_collector as a
+
+    monkeypatch.setattr(a, "CLK_TCK", 100)
+    four, one = _cpus(monkeypatch, PROC_STAT_4_ONLINE), _cpus(monkeypatch, PROC_STAT_1_ONLINE)
+    assert set(four) == {"cpu0", "cpu1", "cpu2", "cpu3"} and set(one) == {"cpu0"}
+    # Cores going offline: only cpu0 counts, busy 41 of its 101 ticks.
+    assert a._cpu_percent(four, one, 1.0) == 40.6
+    # Cores coming back online weren't there before, so they're left out too.
+    assert a._cpu_percent(one, four, 1.0) is None or 0 <= a._cpu_percent(one, four, 1.0) <= 100
+
+
+def test_cpu_percent_skips_cores_whose_counters_jump(monkeypatch):
+    import agent_collector as a
+
+    monkeypatch.setattr(a, "CLK_TCK", 100)
+    before = {"cpu0": (1000, 800), "cpu1": (1000, 800)}
+    # cpu0 is normal (half busy); cpu1's idle counter went backwards.
+    after = {"cpu0": (1100, 850), "cpu1": (1100, 100)}
+    assert a._cpu_percent(before, after, 1.0) == 50.0
+    # cpu1 gained far more time than one core can in a second (offline and back).
+    after = {"cpu0": (1100, 850), "cpu1": (901000, 900700)}
+    assert a._cpu_percent(before, after, 1.0) == 50.0
+    # Nothing usable at all: unknown rather than a made-up number.
+    assert a._cpu_percent(before, {"cpu0": (900, 700)}, 1.0) is None
+
+
+def test_impossible_cpu_values_are_kept_visible(client):
+    # Not clamped: a broken agent should look broken, not quietly show 100%.
+    assert ingest(client, TOKEN_A, sample(cpu={"count": 1, "percent": 82919282100.0})).status_code == 200
+    assert client.get("/api/hosts/alpha", headers=USER).json()["cpu"]["percent"] == 82919282100.0
+
+
+def test_docker_left_off_is_reported_when_docker_is_there(tmp_path, monkeypatch):
+    import agent_collector as a
+
+    sock = tmp_path / "docker.sock"
+    monkeypatch.setattr(a, "DOCKER_SOCK", str(sock))
+    monkeypatch.setenv("SERVERSTATS_DOCKER", "0")
+    assert a._DOCKER.snapshot() is None  # no Docker on this host: nothing to say
+    sock.write_text("")
+    assert "--docker" in a._DOCKER.snapshot()["error"]  # Docker here, but the agent wasn't allowed to read it

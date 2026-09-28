@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -54,18 +54,44 @@ def _read(path):
 
 
 def _cpu_times():
-    """Return (total, idle) jiffies summed across all CPUs, plus boot time."""
-    total = idle = 0
+    """Return {cpu: (total, idle)} jiffies for each online CPU, plus boot time.
+
+    Per CPU rather than the combined "cpu" line: with CPU hotplug (common on
+    phones and tablets) the combined line jumps when a core goes offline,
+    because older kernels (e.g. 3.10) count an offline core's idle time from a
+    different, stale counter. Only online cores get their own line.
+    """
+    cpus = {}
     btime = 0
     for line in _read("/proc/stat").splitlines():
-        if line.startswith("cpu "):
-            vals = [int(v) for v in line.split()[1:]]
+        if line.startswith("cpu") and line[3:4].isdigit():
+            parts = line.split()
             # user nice system idle iowait irq softirq steal (guest is already in user)
-            total = sum(vals[:8])
-            idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+            vals = [int(v) for v in parts[1:9]]
+            cpus[parts[0]] = (sum(vals), vals[3] + (vals[4] if len(vals) > 4 else 0))
         elif line.startswith("btime "):
             btime = int(line.split()[1])
-    return total, idle, btime
+    return cpus, btime
+
+
+def _cpu_percent(before, after, elapsed):
+    """Share of CPU time spent busy between two samples, 0-100 (None if unknown).
+
+    Only cores online in both samples count. A core whose counters went
+    backwards, or advanced faster than the clock (it went offline and came
+    back in between), is left out of this sample instead of skewing it.
+    """
+    most = elapsed * CLK_TCK * 1.1 + 2  # the most ticks one core can gain
+    busy = total = 0
+    for cpu, (total1, idle1) in after.items():
+        if cpu not in before:
+            continue
+        dtotal, didle = total1 - before[cpu][0], idle1 - before[cpu][1]
+        if dtotal <= 0 or dtotal > most or not 0 <= didle <= dtotal:
+            continue
+        total += dtotal
+        busy += dtotal - didle
+    return round(100.0 * busy / total, 1) if total else None
 
 
 def _net_bytes(path="/proc/net/dev"):
@@ -381,11 +407,17 @@ class _Docker(object):
     def snapshot(self):
         """Raw per-container counters, None if Docker isn't there, or an error."""
         if os.environ.get("SERVERSTATS_DOCKER", "1") == "0":
+            if os.path.exists(DOCKER_SOCK):
+                # Say so, rather than showing nothing on a host that does run Docker.
+                return {"error": "Docker is installed here, but this agent was installed without --docker. "
+                                 "Rerun the installer with --docker to see containers."}
             return None
         try:
             listed = _docker_get("/containers/json")
-        except (FileNotFoundError, ConnectionRefusedError):
-            return None  # Docker not installed / not running
+        except FileNotFoundError:
+            return None  # Docker not installed
+        except ConnectionRefusedError:
+            return {"error": "Docker is installed but not running (%s refused the connection)" % DOCKER_SOCK}
         except PermissionError:
             return {"error": "no permission to read the Docker socket; add this account to the docker group to see containers"}
         except (OSError, ValueError) as e:
@@ -497,10 +529,10 @@ def _docker_delta(before, after, elapsed, mem_total):
 
 
 def _snapshot():
-    total, idle, btime = _cpu_times()
+    cpus, btime = _cpu_times()
     return {
         "t": time.monotonic(),
-        "cpu": (total, idle),
+        "cpu": cpus,
         "btime": btime,
         "procs": _proc_snapshot(),
         "net": _net_bytes(),
@@ -522,8 +554,6 @@ def collect(sample_seconds=1.0, max_procs=500, prev=None):
     cur = _snapshot()
 
     t0, t1 = prev["t"], cur["t"]
-    total0, idle0 = prev["cpu"]
-    total1, idle1 = cur["cpu"]
     procs0, procs1 = prev["procs"], cur["procs"]
     (rx0, tx0), (rx1, tx1) = prev["net"], cur["net"]
     io0, io1 = prev["io"], cur["io"]
@@ -531,7 +561,7 @@ def collect(sample_seconds=1.0, max_procs=500, prev=None):
     btime = cur["btime"]
 
     elapsed = max(t1 - t0, 1e-6)
-    dtotal = max(total1 - total0, 1)
+    cpu_percent = _cpu_percent(prev["cpu"], cur["cpu"], elapsed)
     ncpu = os.cpu_count() or 1
     mem = _meminfo()
 
@@ -550,7 +580,7 @@ def collect(sample_seconds=1.0, max_procs=500, prev=None):
             "state": p["state"],
             "uid": p["uid"],
             # top-style: 100% == one full core
-            "cpu": round(100.0 * ncpu * max(dticks, 0) / dtotal, 1),
+            "cpu": round(100.0 * max(dticks, 0) / (elapsed * CLK_TCK), 1),
             "rss": p["rss"],
             "mem": round(100.0 * p["rss"] / mem["total"], 1) if mem["total"] else 0.0,
             "threads": p["threads"],
@@ -575,7 +605,7 @@ def collect(sample_seconds=1.0, max_procs=500, prev=None):
         "uptime": float(_read("/proc/uptime").split()[0]),
         "cpu": {
             "count": ncpu,
-            "percent": round(100.0 * (1 - (idle1 - idle0) / dtotal), 1),
+            "percent": cpu_percent,
         },
         "load": [round(x, 2) for x in load],
         "memory": mem,

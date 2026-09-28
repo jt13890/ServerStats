@@ -282,10 +282,10 @@ class Store:
         return {"bucket": bucket, "metrics": metrics, "storage": storage}
 
     def trends(self, hours: float = 1.0, points: int = 60) -> dict:
-        """Recent CPU/memory/disk/storage for every host (overview sparklines)."""
+        """Recent CPU/memory/swap/disk/storage for every host (overview sparklines)."""
         bucket = max(hours * 3600 / points, 1)
         since = time.time() - hours * 3600
-        keys = ("cpu", "mem", "disk_util", "storage")
+        keys = ("cpu", "mem", "swap", "disk_util", "storage")
         with self._lock:
             rows = self._db.execute(
                 f"""SELECT host, CAST(ts / ? AS INTEGER) * ? AS t, {', '.join(f'AVG({k})' for k in keys)}
