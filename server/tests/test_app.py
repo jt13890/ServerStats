@@ -543,3 +543,41 @@ def test_unwritable_config_location_falls_back_to_defaults(tmp_path):
     blocker.write_text("")
     conf = load(blocker / "config.yaml")  # parent is a file: can't create
     assert conf.hosts == [] and conf.settings.enrollment
+
+
+# -- CPU accounting on devices that take cores offline ---------------------------
+
+def test_cpu_percent_survives_cores_going_offline():
+    from agent_collector import _cpu_percent
+
+    before = {"cpu0": (500, 500, 0), "cpu1": (500, 500, 0), "cpu2": (900, 100, 0), "cpu3": (400, 600, 0)}
+    # cpu2 and cpu3 went offline: the old summary-line math saw totals go
+    # backwards and reported billions of percent.
+    after = {"cpu0": (550, 550, 0), "cpu1": (560, 540, 0)}
+    assert _cpu_percent(before, after) == 55.0
+    # A core that went offline and came back has restarted counters: skipped.
+    assert _cpu_percent(before, {"cpu0": (550, 550, 0), "cpu3": (5, 5, 0)}) == 50.0
+    # iowait running backwards doesn't count as busy time.
+    assert _cpu_percent({"cpu0": (100, 100, 50)}, {"cpu0": (110, 190, 40)}) == 10.0
+    assert _cpu_percent(before, {}) == 0.0
+
+
+def test_absurd_percentages_are_clamped(client):
+    ingest(client, TOKEN_A, sample(cpu={"count": 4, "percent": 84416868700.0},
+                                   memory={"percent": -5, "total": 1}))
+    h = client.get("/api/hosts/alpha", headers=USER).json()
+    assert h["cpu"]["percent"] == 100.0 and h["memory"]["percent"] == 0.0
+    hist = client.get("/api/hosts/alpha/history?hours=1", headers=USER).json()["metrics"]
+    assert all(0 <= p["cpu"] <= 100 for p in hist)
+
+
+def test_docker_not_enabled_is_explained(monkeypatch, tmp_path):
+    import agent_collector as a
+
+    sock = tmp_path / "docker.sock"
+    sock.write_text("")
+    monkeypatch.setattr(a, "DOCKER_SOCK", str(sock))
+    monkeypatch.setenv("SERVERSTATS_DOCKER", "0")
+    assert "--docker" in a._Docker().snapshot()["error"]
+    sock.unlink()  # no Docker on the host: no section at all
+    assert a._Docker().snapshot() is None
