@@ -426,12 +426,7 @@ function renderDetail(name) {
   // range selector
   const rangeBtns = [...document.querySelectorAll('#range button')];
   const markRange = () => rangeBtns.forEach((b) => {
-    const hours = Number(b.dataset.hours);
-    b.setAttribute('aria-checked', String(hours === state.range));
-    // Ranges longer than the configured retention would only ever be partly filled.
-    const kept = state.meta ? state.meta.retention_days * 24 : Infinity;
-    b.disabled = hours > kept + 24;
-    b.title = b.disabled ? `History is kept for ${state.meta.retention_days} days (settings.retention_days)` : '';
+    b.setAttribute('aria-checked', String(Number(b.dataset.hours) === state.range));
   });
   markRange();
   rangeBtns.forEach((b) => b.addEventListener('click', () => {
@@ -1416,6 +1411,84 @@ function lineChart(container, opts) {
   });
 }
 
+// -- prune dialog ------------------------------------------------------------
+
+function setupPrune() {
+  const dialog = $('#prune-dialog');
+  const ages = $('#prune-ages');
+  const hostSel = $('#prune-host');
+  const preview = $('#prune-preview');
+  const go = $('#prune-go');
+  let days = null;
+  let seq = 0;
+  let busy = false;
+  const label = () => (state.meta.prune_options.find((o) => o.days === days) || {}).label;
+  const fmtDate = (t) => new Date(t * 1000).toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' });
+
+  async function refresh() {
+    const n = ++seq;
+    const host = hostSel.value;
+    ages.querySelectorAll('button').forEach((b) => b.setAttribute('aria-checked', String(Number(b.dataset.days) === days)));
+    go.disabled = true;
+    go.textContent = `Delete history older than ${label()}`;
+    preview.textContent = 'Checking…';
+    try {
+      const p = await api(`/api/prune?days=${days}` + (host ? `&host=${encodeURIComponent(host)}` : ''));
+      if (n !== seq) return;
+      if (!p.rows) {
+        preview.textContent = `Nothing ${host ? `for ${host} ` : ''}is older than ${label()} (before ${fmtDate(p.cutoff)}).`;
+        return;
+      }
+      const who = host || (p.hosts.length === 1 ? p.hosts[0] : `${p.hosts.length} hosts`);
+      preview.replaceChildren('This permanently deletes ', h('strong', { text: `${fmtNum(p.rows)} data points` }),
+        ` for ${who}, from ${fmtDate(p.oldest)} up to ${fmtDate(p.cutoff)}. It can't be undone.`);
+      go.disabled = busy;
+    } catch (e) {
+      if (n === seq) preview.textContent = `Couldn't check: ${e.message}`;
+    }
+  }
+
+  async function open() {
+    if (!state.meta) state.meta = await api('/api/meta');
+    if (!ages.childElementCount) {
+      ages.replaceChildren(...state.meta.prune_options.map((o) => h('button', {
+        type: 'button', role: 'radio', 'data-days': o.days, text: o.label,
+        onclick: () => { days = o.days; refresh(); },
+      })));
+    }
+    const current = hostSel.value;
+    const names = (state.hosts || []).map((x) => x.name).sort((a, b) => a.localeCompare(b));
+    hostSel.replaceChildren(h('option', { value: '', text: 'All hosts' }), ...names.map((n) => h('option', { value: n, text: n })));
+    hostSel.value = names.includes(current) ? current : '';
+    if (days == null) days = 365;
+    dialog.showModal();
+    refresh();
+  }
+
+  hostSel.addEventListener('change', refresh);
+  go.addEventListener('click', async () => {
+    const host = hostSel.value;
+    if (!confirm(`Delete all history older than ${label()} for ${host || 'all hosts'}? This can't be undone.`)) return;
+    busy = true;
+    go.disabled = true;
+    preview.textContent = 'Deleting…';
+    try {
+      const r = await apiPost('/api/prune', { days, host: host || null });
+      preview.textContent = r.rows
+        ? `Deleted ${fmtNum(r.rows)} data points` + (r.freed ? ` and freed ${fmtBytes(r.freed)}.` : '.')
+        : 'Nothing to delete.';
+      route(); // re-fetch whatever page is open behind the dialog
+    } catch (e) {
+      preview.textContent = `Couldn't prune: ${e.message}`;
+    } finally {
+      busy = false;
+    }
+  });
+  $('#prune-btn').addEventListener('click', open);
+  dialog.querySelectorAll('[data-action="close"]').forEach((b) => b.addEventListener('click', () => dialog.close()));
+  dialog.addEventListener('click', (e) => { if (e.target === dialog) dialog.close(); });
+}
+
 // -- add host dialog ---------------------------------------------------------
 
 function setupDialog() {
@@ -1509,6 +1582,7 @@ function route() {
 
 async function boot() {
   setupDialog();
+  setupPrune();
   window.addEventListener('hashchange', route);
   let resizeTimer;
   window.addEventListener('resize', () => {

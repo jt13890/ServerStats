@@ -20,7 +20,7 @@ from .schema import normalize
 from .ssh_poller import AGENT_SCRIPT, SSHPoller, load_or_create_key
 from .store import Store
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 STATIC = Path(__file__).parent / "static"
 INSTALL_SH = AGENT_SCRIPT.parent / "install.sh"
 MAX_INGEST_BYTES = 4 * 1024 * 1024
@@ -36,6 +36,8 @@ ACTION_HEADER = "X-ServerStats-Action"
 MAX_UPDATE_OFFERS = 3
 MAX_ENROLLED = 1000
 LOAD_CACHE_SECONDS = 300
+# "Delete history older than ...": the only choices the prune endpoint accepts.
+PRUNE_OPTIONS = {30: "1 month", 90: "3 months", 180: "6 months", 365: "1 year", 730: "2 years", 1095: "3 years"}
 
 
 def _token_hash(token: str) -> str:
@@ -94,7 +96,7 @@ logging.getLogger("asyncssh").setLevel(logging.WARNING)
 async def lifespan(app: FastAPI):
     conf = cfg.load()
     log.info("config: %s", cfg.config_path())
-    store = Store(cfg.DATA_DIR / "serverstats.db", conf.settings.retention_days)
+    store = Store(cfg.DATA_DIR / "serverstats.db")
     key = load_or_create_key(conf.settings.ssh_key)
     poller = SSHPoller(conf.hosts, store, key, conf.settings.max_procs)
 
@@ -108,11 +110,11 @@ async def lifespan(app: FastAPI):
     poller.start()
 
     async def maintenance():
-        # Roll samples up into the 5-minute/hourly tiers, then apply retention.
+        # Roll samples up into the 5-minute/hourly tiers; drop what they now cover.
         while True:
             try:
                 store.rollup()
-                store.prune({h.name for h in all_hosts(app)})
+                store.compact({h.name for h in all_hosts(app)})
             except Exception:
                 log.exception("history maintenance failed")
             await asyncio.sleep(300)
@@ -219,7 +221,7 @@ async def meta(request: Request):
         "user": request.headers.get(settings.auth_header),
         "ssh_public_key": request.app.state.public_key,
         "stale_after": settings.stale_after,
-        "retention_days": settings.retention_days,
+        "prune_options": [{"days": d, "label": label} for d, label in PRUNE_OPTIONS.items()],
         "agent_version": AGENT_VERSION,
         "join_key": request.app.state.join_key,
     }
@@ -386,6 +388,39 @@ async def rotate_join_key(request: Request):
         raise HTTPException(409, "enrollment is turned off in config.yaml")
     request.app.state.join_key = _load_join_key(rotate=True)
     return {"join_key": request.app.state.join_key}
+
+
+def _prune_args(request: Request, days, host) -> tuple[int, str | None]:
+    if not isinstance(days, int) or isinstance(days, bool) or days not in PRUNE_OPTIONS:
+        raise HTTPException(400, f"days must be one of {sorted(PRUNE_OPTIONS)}")
+    if host is not None:
+        host = _host_or_404(request, str(host)).name
+    return days, host
+
+
+@app.get("/api/prune")
+async def prune_preview(request: Request, days: int, host: str | None = None):
+    """How much history a prune would delete."""
+    days, host = _prune_args(request, days, host)
+    return request.app.state.store.prune_preview(days, host)
+
+
+@app.post("/api/prune")
+async def prune(request: Request):
+    """Delete history older than one of PRUNE_OPTIONS, for all hosts or one."""
+    _require_action_header(request)
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(400, "expected a JSON body") from None
+    if not isinstance(body, dict):
+        raise HTTPException(400, "expected a JSON object")
+    days, host = _prune_args(request, body.get("days"), body.get("host"))
+    result = await asyncio.to_thread(request.app.state.store.prune_older_than, days, host)
+    request.app.state.load_cache = None  # the load scores may have lost data
+    log.info("pruned history older than %s%s: %d rows, %d bytes freed", PRUNE_OPTIONS[days],
+             f" for {host}" if host else "", result["rows"], result["freed"])
+    return result
 
 
 @app.post("/api/hosts/{name}/remove")

@@ -16,6 +16,7 @@
     </a>
     <span id="fleet-summary" class="fleet-summary"></span>
     <span class="spacer"></span>
+    <button id="prune-btn" class="btn btn-quiet" type="button">Prune</button>
     <button id="add-host-btn" class="btn" type="button">Add host</button>
     <span id="user" class="user" hidden></span>
   </header>
@@ -246,6 +247,23 @@
 
     <label class="check dialog-docker"><input id="add-docker" type="checkbox"> Also show Docker containers and compose stacks</label>
     <p id="docker-warning" class="muted" hidden>This lets the collector read the Docker socket (docker group), which is root-equivalent on that host. It only makes fixed, read-only requests.</p>
+  </dialog>
+
+  <!-- Prune dialog -->
+  <dialog id="prune-dialog" class="dialog">
+    <div class="dialog-head">
+      <h2>Prune history</h2>
+      <button class="btn btn-quiet" type="button" data-action="close" aria-label="Close">&times;</button>
+    </div>
+    <p>ServerStats keeps history forever. To free up space, delete everything older than:</p>
+    <div class="seg prune-ages" role="radiogroup" aria-label="Delete history older than" id="prune-ages"></div>
+    <label class="field">For
+      <select id="prune-host" class="input"></select></label>
+    <p id="prune-preview" class="prune-preview" aria-live="polite"></p>
+    <div class="dialog-actions">
+      <button class="btn" type="button" data-action="close">Cancel</button>
+      <button id="prune-go" class="btn btn-danger" type="button" disabled>Delete</button>
+    </div>
   </dialog>
 
   <div id="tooltip" class="tooltip" role="status" hidden></div>
