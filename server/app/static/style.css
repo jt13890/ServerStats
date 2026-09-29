@@ -325,3 +325,8 @@ td .meter { grid-template-columns: 1fr 52px; }
   background: var(--surface-2); border: 1px solid var(--border); font-size: 13px; color: var(--ink-2);
 }
 .update-note { font-size: 12.5px; }
+
+.docker-state {
+  margin: 8px 0 0; padding: 8px 12px; border-radius: 8px; font-size: 13px;
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--ink-2);
+}

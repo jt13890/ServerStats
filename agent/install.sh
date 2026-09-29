@@ -13,10 +13,14 @@
 #
 # Options:
 #   --name NAME       with --join: the name to show (default: this hostname)
-#   --docker          also report Docker containers/compose stacks. This gives
-#                     the collector read access to the Docker socket (docker
-#                     group), which is root-equivalent: only enable it if you
-#                     trust this setup. The collector only sends fixed GETs.
+#   --docker          agent mode: start with Docker stats turned on (you can
+#                     turn them on/off in the dashboard any time). On hosts
+#                     with Docker, agent mode always installs a small helper
+#                     service that gives the agent a read-only container list;
+#                     the agent itself never gets Docker access.
+#                     SSH mode: adds the serverstats user to the docker group
+#                     (root-equivalent) so it can report containers.
+#   --no-docker       agent mode: don't install the Docker helper
 #   --ssh-from ADDR   SSH mode: only accept the key from this address/CIDR
 #   --no-updates      agent mode: refuse remote updates from the server (by
 #                     default the "Update agent" button in the UI can replace
@@ -37,6 +41,7 @@ NAME=""
 SSH_KEY=""
 SSH_FROM=""
 DOCKER=0
+NO_DOCKER=0
 INTERVAL="15"
 CA_FILE=""
 UNINSTALL=0
@@ -47,6 +52,9 @@ ENV_FILE=/etc/serverstats-agent.env
 UNIT=/etc/systemd/system/serverstats-agent.service
 DROPIN_DIR=/etc/systemd/system/serverstats-agent.service.d
 INITD=/etc/init.d/serverstats-agent
+HELPER_UNIT=/etc/systemd/system/serverstats-docker.service
+HELPER_INITD=/etc/init.d/serverstats-docker
+HELPER_USER=serverstats-docker
 OPENRC_LOG=/var/log/serverstats-agent.log
 AGENT_USER=serverstats-agent   # OpenRC only; systemd uses a DynamicUser
 # Where remote updates are stored (systemd: StateDirectory, maybe under private/).
@@ -55,7 +63,7 @@ SSH_USER=serverstats
 FORCED='command="/usr/local/bin/serverstats-agent --once"'
 
 die() { echo "error: $*" >&2; exit 1; }
-usage() { die "usage: install.sh --url <server url> (--join <join key> [--name name] | --token <token> | --ssh-key '<public key>') [--docker] [--no-updates] [--ssh-from addr] [--interval 15] [--ca-file path] | --uninstall"; }
+usage() { die "usage: install.sh --url <server url> (--join <join key> [--name name] | --token <token> | --ssh-key '<public key>') [--docker | --no-docker] [--no-updates] [--ssh-from addr] [--interval 15] [--ca-file path] | --uninstall"; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -66,6 +74,7 @@ while [ $# -gt 0 ]; do
         --ssh-key) SSH_KEY="${2:-}"; shift 2 ;;
         --ssh-from) SSH_FROM="${2:-}"; shift 2 ;;
         --docker) DOCKER=1; shift ;;
+        --no-docker) NO_DOCKER=1; shift ;;
         --no-updates) UPDATES=0; shift ;;
         --interval) INTERVAL="${2:-}"; shift 2 ;;
         --ca-file) CA_FILE="${2:-}"; shift 2 ;;
@@ -99,7 +108,14 @@ if [ "$UNINSTALL" -eq 1 ]; then
         rc-service serverstats-agent stop 2>/dev/null || true
         rc-update del serverstats-agent default 2>/dev/null || true
     fi
-    rm -rf "$BIN" "$ENV_FILE" "$UNIT" "$DROPIN_DIR" "$INITD" $STATE_DIRS
+    if [ "$INIT" = systemd ]; then
+        systemctl disable --now serverstats-docker 2>/dev/null || true
+    fi
+    if [ -f "$HELPER_INITD" ]; then
+        rc-service serverstats-docker stop 2>/dev/null || true
+        rc-update del serverstats-docker default 2>/dev/null || true
+    fi
+    rm -rf "$BIN" "$ENV_FILE" "$UNIT" "$DROPIN_DIR" "$INITD" "$HELPER_UNIT" "$HELPER_INITD" $STATE_DIRS
     [ "$INIT" = systemd ] && systemctl daemon-reload
     if user_exists "$SSH_USER"; then
         AK="$(user_home "$SSH_USER")/.ssh/authorized_keys"
@@ -118,7 +134,7 @@ for v in "$TOKEN" "$JOIN" "$SSH_KEY"; do [ -n "$v" ] && MODES=$((MODES + 1)); do
 [ "$MODES" -eq 1 ] || { [ "$MODES" -eq 0 ] && usage; die "use one of --join, --token or --ssh-key"; }
 URL="${URL%/}"
 command -v python3 >/dev/null 2>&1 || die "python3 is required (e.g. apt install python3 / apk add python3)"
-if [ "$DOCKER" -eq 1 ]; then group_exists docker || die "--docker: no docker group on this host"; fi
+if [ "$DOCKER" -eq 1 ] && [ -n "$SSH_KEY" ]; then group_exists docker || die "--docker: no docker group on this host"; fi
 
 # -- install the collector ---------------------------------------------------
 SRC_DIR=$(dirname "$0" 2>/dev/null || echo .)
@@ -224,6 +240,30 @@ EOF
     return 0
 }
 
+# Group shared by the agent and the Docker helper: the helper's socket is
+# readable by this group only.
+if ! group_exists "$AGENT_USER"; then
+    groupadd --system "$AGENT_USER" 2>/dev/null || addgroup -S "$AGENT_USER" || die "could not create group $AGENT_USER"
+fi
+
+# Docker helper: a separate service whose user is in the docker group. It
+# only ever hands the agent a fixed, read-only list of running containers,
+# and it runs the installed code (never a remote update), so the agent - and
+# anything the server could push to it - never gets Docker access itself.
+HAVE_DOCKER=0
+if group_exists docker && { [ -S /var/run/docker.sock ] || [ -S /run/docker.sock ] || command -v dockerd >/dev/null 2>&1; }; then
+    HAVE_DOCKER=1
+fi
+HELPER=0
+[ "$HAVE_DOCKER" -eq 1 ] && [ "$NO_DOCKER" -eq 0 ] && HELPER=1
+[ "$DOCKER" -eq 1 ] && [ "$HELPER" -eq 0 ] && echo "note: no Docker found here (or --no-docker given); Docker stats stay off."
+if [ "$HELPER" -eq 1 ] && ! user_exists "$HELPER_USER"; then
+    useradd --system --no-create-home --home-dir /nonexistent --shell "$(nologin_shell)" -g "$AGENT_USER" "$HELPER_USER" 2>/dev/null \
+        || adduser -S -D -H -h /nonexistent -s "$(nologin_shell)" -G "$AGENT_USER" "$HELPER_USER" \
+        || die "could not create user $HELPER_USER"
+fi
+[ "$HELPER" -eq 1 ] && add_to_group "$HELPER_USER" docker
+
 if [ "$INIT" = systemd ]; then
     umask 077
     write_env
@@ -243,6 +283,8 @@ Restart=always
 RestartSec=10
 # Writable home for remote updates (the rest of the system stays read-only).
 StateDirectory=serverstats-agent
+# Lets it read the Docker helper's socket (not Docker itself).
+SupplementaryGroups=serverstats-agent
 
 # Runs as a throwaway unprivileged user; /proc and cgroup stats are
 # world-readable so no privileges are needed to read them.
@@ -269,21 +311,56 @@ SystemCallArchitectures=native
 [Install]
 WantedBy=multi-user.target
 EOF
+    rm -rf "$DROPIN_DIR"   # older installs gave the agent the docker group here
 
-    rm -rf "$DROPIN_DIR"
-    if [ "$DOCKER" -eq 1 ]; then
-        mkdir -p "$DROPIN_DIR"
-        cat > "$DROPIN_DIR/docker.conf" <<'EOF'
-# Read access to the Docker socket for the Docker/compose section.
+    if [ "$HELPER" -eq 1 ]; then
+        cat > "$HELPER_UNIT" <<'EOF'
+[Unit]
+Description=ServerStats Docker helper (read-only container list for the agent)
+After=docker.service
+
 [Service]
+ExecStart=/usr/local/bin/serverstats-agent --docker-helper /run/serverstats-docker/docker.sock
+User=serverstats-docker
+Group=serverstats-agent
 SupplementaryGroups=docker
+RuntimeDirectory=serverstats-docker
+RuntimeDirectoryMode=0750
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
 EOF
+    else
+        systemctl disable --now serverstats-docker >/dev/null 2>&1 || true
+        rm -f "$HELPER_UNIT"
     fi
 
     systemctl daemon-reload
+    if [ "$HELPER" -eq 1 ]; then
+        systemctl enable serverstats-docker >/dev/null 2>&1
+        systemctl restart serverstats-docker
+    fi
     systemctl enable serverstats-agent >/dev/null 2>&1
     systemctl restart serverstats-agent
     echo "ServerStats agent installed and running. Logs: journalctl -u serverstats-agent -f"
+    [ "$HELPER" -eq 1 ] && echo "Docker helper installed: turn Docker stats on or off from this host's page in the dashboard."
     exit 0
 fi
 
@@ -291,15 +368,13 @@ fi
 # token is read from the env file (root:$AGENT_USER 0640) rather than passed on
 # the command line, where any user could see it in `ps`.
 if ! user_exists "$AGENT_USER"; then
-    useradd --system --no-create-home --home-dir /nonexistent --shell "$(nologin_shell)" "$AGENT_USER" 2>/dev/null \
-        || { addgroup -S "$AGENT_USER" 2>/dev/null || true; adduser -S -D -H -h /nonexistent -s "$(nologin_shell)" -G "$AGENT_USER" "$AGENT_USER"; } \
+    useradd --system --no-create-home --home-dir /nonexistent --shell "$(nologin_shell)" -g "$AGENT_USER" "$AGENT_USER" 2>/dev/null \
+        || adduser -S -D -H -h /nonexistent -s "$(nologin_shell)" -G "$AGENT_USER" "$AGENT_USER" \
         || die "could not create user $AGENT_USER"
 fi
 AGENT_GROUP=$(id -gn "$AGENT_USER")
-if [ "$DOCKER" -eq 1 ]; then
-    add_to_group "$AGENT_USER" docker
-elif id -Gn "$AGENT_USER" | tr ' ' '\n' | grep -qx docker; then
-    # Re-run without --docker: take the access away again.
+if id -Gn "$AGENT_USER" | tr ' ' '\n' | grep -qx docker; then
+    # Older installs gave the agent the docker group; the helper replaces that.
     if command -v gpasswd >/dev/null 2>&1; then gpasswd -d "$AGENT_USER" docker >/dev/null; else delgroup "$AGENT_USER" docker; fi
 fi
 
@@ -328,7 +403,7 @@ no_new_privs="yes"
 
 depend() {
     need net
-    after firewall
+    after firewall serverstats-docker
 }
 
 start_pre() {
@@ -337,6 +412,43 @@ start_pre() {
 EOF
 chmod 0755 "$INITD"
 
+if [ "$HELPER" -eq 1 ]; then
+    cat > "$HELPER_INITD" <<EOF
+#!/sbin/openrc-run
+# ServerStats Docker helper (installed by install.sh): read-only container
+# list for the agent, so the agent itself never gets Docker access.
+name="serverstats-docker"
+description="ServerStats Docker helper"
+command="$BIN"
+command_args="--docker-helper /run/serverstats-docker/docker.sock"
+command_user="$HELPER_USER:$AGENT_GROUP"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+output_log="/var/log/serverstats-docker.log"
+error_log="/var/log/serverstats-docker.log"
+no_new_privs="yes"
+
+depend() {
+    after docker
+}
+
+start_pre() {
+    checkpath --directory --owner "$HELPER_USER:$AGENT_GROUP" --mode 0750 /run/serverstats-docker
+    checkpath --file --owner "$HELPER_USER:$AGENT_GROUP" --mode 0640 /var/log/serverstats-docker.log
+}
+EOF
+    chmod 0755 "$HELPER_INITD"
+    rc-update add serverstats-docker default >/dev/null 2>&1 || true
+    rc-service serverstats-docker restart >/dev/null 2>&1 || rc-service serverstats-docker start
+elif [ -f "$HELPER_INITD" ]; then
+    rc-service serverstats-docker stop >/dev/null 2>&1 || true
+    rc-update del serverstats-docker default >/dev/null 2>&1 || true
+    rm -f "$HELPER_INITD"
+fi
+
 rc-update add serverstats-agent default >/dev/null 2>&1 || true
 rc-service serverstats-agent restart >/dev/null 2>&1 || rc-service serverstats-agent start
 echo "ServerStats agent installed and running (OpenRC). Logs: tail -f $OPENRC_LOG"
+[ "$HELPER" -eq 1 ] && echo "Docker helper installed: turn Docker stats on or off from this host's page in the dashboard."
+exit 0

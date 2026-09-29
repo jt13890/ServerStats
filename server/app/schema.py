@@ -166,5 +166,8 @@ def normalize(d: dict, max_procs: int) -> dict:
         "net": {"rx_rate": _num(net.get("rx_rate")), "tx_rate": _num(net.get("tx_rate"))},
         "tasks": {k: _int(tasks.get(k)) for k in ("total", "running", "sleeping", "zombie", "threads")},
         "docker": _docker(d.get("docker"), ncpu),
+        # What the agent can do about Docker, so the dashboard can offer the toggle.
+        "docker_ctl": {k: _dict(d.get("docker_ctl")).get(k) is True for k in ("present", "available", "enabled")}
+        if isinstance(d.get("docker_ctl"), dict) else None,
         "processes": processes,
     }

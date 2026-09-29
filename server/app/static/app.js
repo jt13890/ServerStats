@@ -124,15 +124,18 @@ async function api(path) {
 
 // State-changing requests carry this header; the server refuses them without
 // it, which stops other sites from triggering them via a signed-in browser.
-async function apiPost(path) {
+async function apiPost(path, body) {
+  const headers = { Accept: 'application/json', 'X-ServerStats-Action': '1' };
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
   const res = await fetch(path, {
     method: 'POST',
-    headers: { Accept: 'application/json', 'X-ServerStats-Action': '1' },
+    headers,
     credentials: 'same-origin',
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
-  return body;
+  const reply = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(reply.detail || `HTTP ${res.status}`);
+  return reply;
 }
 
 function connectionLost(lost) {
@@ -555,11 +558,42 @@ function renderDetail(name) {
 
   function drawDocker() {
     const dk = host.docker;
-    $('#docker-card').hidden = !dk;
-    if (!dk) return;
+    const ctl = host.docker_ctl; // null for SSH hosts and agents older than 1.4.0
+    $('#docker-card').hidden = !dk && !(ctl && ctl.present);
+    if ($('#docker-card').hidden) return;
+
+    // On/off from the dashboard (agent hosts whose agent can read Docker).
+    const on = ctl ? ctl.enabled : !!dk;
+    const want = host.docker_pref != null ? host.docker_pref : on;
+    const toggle = $('#docker-toggle');
+    toggle.hidden = !(host.mode === 'agent' && ctl && ctl.available);
+    toggle.textContent = want ? 'Turn off Docker stats' : 'Turn on Docker stats';
+    toggle.dataset.want = String(!want);
+    let stateText = '';
+    if (host.mode === 'agent' && ctl && !ctl.available) {
+      stateText = "Docker is running on this host, but the agent can't read it yet. Rerun the installer on this host once "
+        + '(it sets up read-only access to Docker), then turn Docker stats on here.';
+    } else if (want !== on) {
+      stateText = want ? 'Turning Docker stats on; the agent picks this up on its next report.'
+        : 'Turning Docker stats off; the agent picks this up on its next report.';
+    } else if (!on) {
+      stateText = "Docker stats are off for this host. Turn them on to see each compose stack's share of CPU, memory, "
+        + 'disk and network. The agent reads Docker through a read-only helper; it never gets Docker access itself.';
+    }
+    $('#docker-state').hidden = !stateText;
+    $('#docker-state').textContent = stateText;
+
     const err = $('#docker-error');
-    err.hidden = !dk.error;
-    err.textContent = dk.error || '';
+    err.hidden = !(dk && dk.error);
+    err.textContent = (dk && dk.error) || '';
+    const showData = !!(dk && !dk.error);
+    $('#docker-body').hidden = !showData;
+    if (!showData) {
+      $('#docker-count').textContent = '';
+      $('#docker-summary').textContent = '';
+      $('#docker-note').textContent = '';
+      return;
+    }
     const containers = dk.containers || [];
     const ncpu = (host.cpu && host.cpu.count) || 1;
 
@@ -647,6 +681,20 @@ function renderDetail(name) {
       ? `Disk space is container writable layers plus their volumes (bind mounts not included), measured ${fmtAgo(serverNow() - dk.disk_at)}. CPU share is of all ${ncpu} cores.`
       : 'Disk space per stack is measured by the push agent every 15 minutes; it isn\'t available over SSH.';
   }
+
+  $('#docker-toggle').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try {
+      await apiPost(`/api/hosts/${enc}/docker`, { enabled: btn.dataset.want === 'true' });
+      await loadHost();
+    } catch (err) {
+      $('#docker-state').hidden = false;
+      $('#docker-state').textContent = `Couldn't change the Docker setting: ${err.message}`;
+    } finally {
+      btn.disabled = false;
+    }
+  });
 
   function drawProcs() {
     const q = proc.filter.trim().toLowerCase();

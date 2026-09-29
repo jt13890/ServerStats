@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -397,61 +397,51 @@ def _cgroup_counters(pid):
     return cpu, mem, rd, wr
 
 
-class _Docker(object):
+class _DockerReader(object):
+    """Reads the Docker API directly. Used by the Docker helper service, by SSH
+    mode, and by agents that were given the docker group (older --docker installs)."""
+
     def __init__(self):
         self.pids = {}  # container id -> (pid, host networking?)
         self.disk = None
         self._disk_thread = None
 
-    def snapshot(self):
-        """Raw per-container counters, None if Docker isn't there, or an error."""
-        if os.environ.get("SERVERSTATS_DOCKER", "1") == "0":
-            # Say so rather than hiding the section, so it's clear how to turn it on.
-            if os.path.exists(DOCKER_SOCK):
-                return {"error": "Docker is running on this host, but the agent wasn't installed with --docker. "
-                                 "Rerun the installer with --docker to see containers and compose stacks."}
-            return None
-        try:
-            listed = _docker_get("/containers/json")
-        except (FileNotFoundError, ConnectionRefusedError):
-            return None  # Docker not installed / not running
-        except PermissionError:
-            return {"error": "The agent can't read the Docker socket. Rerun the installer with --docker "
-                             "(it adds the agent to the docker group) to see containers and compose stacks."}
-        except (OSError, ValueError) as e:
-            return {"error": "Docker API error: %s" % e}
-
-        containers = {}
+    def listing(self):
+        """Running containers with just what the agent needs. Raises OSError
+        (incl. FileNotFoundError / PermissionError) if Docker can't be read."""
+        listed = _docker_get("/containers/json")
+        out = []
         for c in listed if isinstance(listed, list) else []:
             cid = c.get("Id", "")
             if not _CONTAINER_ID.match(cid):
                 continue
-            try:
-                if cid not in self.pids:
+            if cid not in self.pids:
+                try:
                     info = _docker_get("/containers/%s/json" % cid)
-                    host_net = (info.get("HostConfig") or {}).get("NetworkMode") == "host"
-                    self.pids[cid] = (int((info.get("State") or {}).get("Pid") or 0), host_net)
-                pid, host_net = self.pids[cid]
-                counters = _cgroup_counters(pid) if pid else None
-                net = None if host_net or not pid else _net_bytes("/proc/%d/net/dev" % pid)
-            except (OSError, ValueError):
-                self.pids.pop(cid, None)
-                counters = net = None
+                except (OSError, ValueError):
+                    continue
+                host_net = (info.get("HostConfig") or {}).get("NetworkMode") == "host"
+                self.pids[cid] = (int((info.get("State") or {}).get("Pid") or 0), host_net)
+            pid, host_net = self.pids[cid]
             labels = c.get("Labels") or {}
-            containers[cid] = {
+            out.append({
+                "id": cid,
                 "name": ((c.get("Names") or ["/?"])[0]).lstrip("/"),
+                # Only the compose labels: other labels can hold secrets.
                 "project": labels.get("com.docker.compose.project"),
                 "service": labels.get("com.docker.compose.service"),
                 "image": c.get("Image"),
                 "status": c.get("Status"),
-                "counters": counters,
-                "net": net,
+                "pid": pid,
+                "host_net": host_net,
                 "volumes": [m.get("Name") for m in c.get("Mounts") or [] if m.get("Type") == "volume"],
-            }
+            })
+        live = set(c["id"] for c in out)
         for cid in list(self.pids):
-            if cid not in containers:
+            if cid not in live:
                 del self.pids[cid]
-        return {"containers": containers}
+        self.refresh_disk_in_background()
+        return {"containers": out, "disk": self.disk}
 
     def refresh_disk_in_background(self):
         """Disk usage (`docker system df`) can take a while; poll it off-thread."""
@@ -480,6 +470,133 @@ class _Docker(object):
             self._disk_thread.start()
 
 
+# -- Docker helper service -----------------------------------------------------
+#
+# Lets the agent see containers without Docker access of its own: the installer
+# runs this as a separate service (installed, root-owned code only; never a
+# remote update) whose user is in the docker group. It answers each connection
+# on its socket with the fixed listing above and nothing else. The socket is
+# readable only by the agent's group.
+
+DOCKER_HELPER_SOCK = os.environ.get("SERVERSTATS_DOCKER_HELPER", "/run/serverstats-docker/docker.sock")
+
+
+def serve_docker_helper(path):
+    reader = _DockerReader()
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(path)
+    os.chmod(path, 0o660)  # owner (this service) and its group (the agent) only
+    server.listen(8)
+    print("serverstats docker helper %s listening on %s" % (VERSION, path), flush=True)
+    while True:
+        conn, _ = server.accept()
+        try:
+            conn.settimeout(30)
+            try:
+                reply = reader.listing()
+            except PermissionError:
+                reply = {"error": "the Docker helper can't read the Docker socket (is its user in the docker group?)"}
+            except (FileNotFoundError, ConnectionRefusedError):
+                reply = {"error": "Docker isn't running"}
+            except (OSError, ValueError) as e:
+                reply = {"error": "Docker API error: %s" % e}
+            conn.sendall(json.dumps(reply, separators=(",", ":")).encode())
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+
+def _helper_listing():
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(30)
+    try:
+        sock.connect(DOCKER_HELPER_SOCK)
+        chunks, size = [], 0
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > 32 * 1024 * 1024:
+                raise ValueError("Docker helper reply too large")
+            chunks.append(chunk)
+    finally:
+        sock.close()
+    reply = json.loads(b"".join(chunks).decode("utf-8", "replace"))
+    if not isinstance(reply, dict):
+        raise ValueError("unexpected reply from the Docker helper")
+    return reply
+
+
+class _Docker(object):
+    """The agent's view of Docker: on/off (the dashboard decides), and counters."""
+
+    def __init__(self):
+        self.override = None  # set from the dashboard via the server's replies
+        self.direct = _DockerReader()
+
+    def enabled(self):
+        if self.override is not None:
+            return self.override
+        return os.environ.get("SERVERSTATS_DOCKER", "1") != "0"
+
+    def status(self):
+        """Lets the dashboard offer the right Docker controls for this host."""
+        present = os.path.exists(DOCKER_SOCK)
+        helper = os.path.exists(DOCKER_HELPER_SOCK)
+        direct = present and os.access(DOCKER_SOCK, os.R_OK | os.W_OK)
+        return {"present": present or helper, "available": helper or direct, "enabled": self.enabled()}
+
+    def snapshot(self):
+        """Raw per-container counters, None if off or no Docker, or an error."""
+        if not self.enabled():
+            return None
+        try:
+            if os.path.exists(DOCKER_HELPER_SOCK):
+                listing = _helper_listing()
+            else:
+                listing = self.direct.listing()
+        except (FileNotFoundError, ConnectionRefusedError):
+            if os.path.exists(DOCKER_HELPER_SOCK):
+                return {"error": "The ServerStats Docker helper isn't running on this host."}
+            return None  # Docker not installed / not running
+        except PermissionError:
+            return {"error": "The agent can't read Docker yet. Rerun the installer on this host once "
+                             "(it sets up read-only Docker access), then turn Docker on in the dashboard."}
+        except (OSError, ValueError) as e:
+            return {"error": "Docker error: %s" % e}
+        if listing.get("error"):
+            return {"error": str(listing["error"])}
+
+        containers = {}
+        for c in listing.get("containers") or []:
+            cid = str(c.get("id", ""))
+            if not _CONTAINER_ID.match(cid):
+                continue
+            pid = c.get("pid") if isinstance(c.get("pid"), int) else 0
+            try:
+                counters = _cgroup_counters(pid) if pid else None
+                net = None if c.get("host_net") or not pid else _net_bytes("/proc/%d/net/dev" % pid)
+            except (OSError, ValueError):
+                counters = net = None
+            containers[cid] = {
+                "name": c.get("name"),
+                "project": c.get("project"),
+                "service": c.get("service"),
+                "image": c.get("image"),
+                "status": c.get("status"),
+                "counters": counters,
+                "net": net,
+                "volumes": [v for v in c.get("volumes") or [] if isinstance(v, str)],
+            }
+        return {"containers": containers, "disk": listing.get("disk")}
+
+
 _DOCKER = _Docker()
 
 
@@ -487,7 +604,7 @@ def _docker_delta(before, after, elapsed, mem_total):
     if after is None or "error" in after:
         return after
     prev = (before or {}).get("containers") or {}
-    disk = _DOCKER.disk or {}
+    disk = after.get("disk") or {}
     out = []
     for cid, c in after["containers"].items():
         p = prev.get(cid) or {}
@@ -612,6 +729,7 @@ def collect(sample_seconds=1.0, max_procs=500, prev=None):
         "disks": _disks(),
         "disk_io": _disk_io(io0, io1, elapsed),
         "docker": _docker_delta(docker0, docker1, elapsed, mem["total"]),
+        "docker_ctl": _DOCKER.status(),
         "net": {
             "rx_rate": max(rx1 - rx0, 0) / elapsed,
             "tx_rate": max(tx1 - tx0, 0) / elapsed,
@@ -789,7 +907,6 @@ def run_agent(args, argv):
     failures = 0
     snapshot = None
     can_update = updates_enabled()
-    _DOCKER.refresh_disk_in_background()
     print("serverstats-agent %s reporting to %s every %ss (remote updates %s)"
           % (VERSION, args.url, interval, "on" if can_update else "off"), flush=True)
     while True:
@@ -805,6 +922,11 @@ def run_agent(args, argv):
                 print("reporting recovered after %d failure(s)" % failures, flush=True)
             failures = 0
             _mark_update_healthy()
+            settings = reply.get("settings")
+            if isinstance(settings, dict) and isinstance(settings.get("docker"), bool):
+                if _DOCKER.override != settings["docker"]:
+                    print("Docker stats turned %s from the dashboard" % ("on" if settings["docker"] else "off"), flush=True)
+                _DOCKER.override = settings["docker"]
             if can_update and isinstance(reply.get("update"), dict):
                 try:
                     _apply_update(opener, args.url, reply["update"], argv)
@@ -887,6 +1009,8 @@ def main():
     ap = argparse.ArgumentParser(description="ServerStats agent / collector")
     ap.add_argument("--env-file", help="read SERVERSTATS_* settings from this KEY=VALUE file")
     ap.add_argument("--once", action="store_true", help="print one JSON sample to stdout and exit")
+    ap.add_argument("--docker-helper", nargs="?", const=DOCKER_HELPER_SOCK, metavar="SOCKET",
+                    help="run the Docker helper service (needs Docker access) on SOCKET")
     ap.add_argument("--enroll", metavar="NAME", help="join the server as NAME using SERVERSTATS_JOIN_KEY, print 'name token'")
     ap.add_argument("--url", default=env("SERVERSTATS_URL"), help="server base URL, e.g. https://stats.example.com")
     ap.add_argument("--token", default=env("SERVERSTATS_TOKEN"), help="per-host token from the server config")
@@ -897,6 +1021,10 @@ def main():
     ap.add_argument("--version", action="version", version=VERSION)
     args = ap.parse_args()
 
+    if args.docker_helper:
+        # Always the installed code: the helper never runs a remote update.
+        serve_docker_helper(args.docker_helper)
+        return
     if args.enroll:
         enroll(args.url, args.enroll, args.ca_file)
         return

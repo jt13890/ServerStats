@@ -108,6 +108,7 @@ class Store:
                 host TEXT PRIMARY KEY, received_at REAL NOT NULL, data TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS host_prefs (name TEXT PRIMARY KEY, docker INTEGER);
             CREATE TABLE IF NOT EXISTS enrolled (
                 name TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE,
                 hostname TEXT, created REAL NOT NULL
@@ -178,9 +179,20 @@ class Store:
                 return False
         return True
 
+    def docker_pref(self, name: str) -> bool | None:
+        """Docker on/off chosen in the dashboard; None = the agent's install-time default."""
+        with self._lock:
+            row = self._db.execute("SELECT docker FROM host_prefs WHERE name = ?", (name,)).fetchone()
+        return None if row is None or row[0] is None else bool(row[0])
+
+    def set_docker_pref(self, name: str, enabled: bool) -> None:
+        with self._lock, self._db:
+            self._db.execute("INSERT OR REPLACE INTO host_prefs (name, docker) VALUES (?, ?)", (name, int(enabled)))
+
     def remove_host(self, name: str) -> None:
         """Forget an enrolled host and all of its data."""
         with self._lock, self._db:
+            self._db.execute("DELETE FROM host_prefs WHERE name = ?", (name,))
             for table in ("enrolled", "latest", "history", "history_5m", "history_1h", "storage_history", "storage_1h"):
                 self._db.execute(f"DELETE FROM {table} WHERE {'name' if table == 'enrolled' else 'host'} = ?", (name,))
         self.states.pop(name, None)
