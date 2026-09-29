@@ -52,8 +52,6 @@ settings:
   # Mark a host offline after this many seconds without a report (or 3x its
   # reporting interval, if longer).
   stale_after: 60
-  # Days of history to keep. Older data is stored as hourly averages.
-  retention_days: 400
   # Default poll interval for SSH hosts, in seconds.
   ssh_interval: 15
   # Report at most this many processes per host (busiest first).
@@ -109,7 +107,6 @@ class Host:
 @dataclass
 class Settings:
     stale_after: float = 60.0
-    retention_days: float = 400.0
     ssh_interval: float = 15.0
     ssh_key: Path = field(default_factory=lambda: DATA_DIR / "ssh" / "id_ed25519")
     max_procs: int = 500
@@ -136,7 +133,6 @@ def load(path: Path | None = None) -> Config:
     s = raw.get("settings") or {}
     settings = Settings(
         stale_after=float(s.get("stale_after", 60)),
-        retention_days=float(s.get("retention_days", 400)),
         ssh_interval=float(s.get("ssh_interval", 15)),
         ssh_key=Path(s["ssh_key"]) if s.get("ssh_key") else DATA_DIR / "ssh" / "id_ed25519",
         max_procs=int(s.get("max_procs", 500)),
@@ -149,10 +145,10 @@ def load(path: Path | None = None) -> Config:
     if env_require is not None:
         settings.require_auth_header = env_require
 
-    if "history_hours" in s:
-        log.warning("settings.history_hours is no longer used; history is kept for retention_days (default 400)")
-    if settings.retention_days < 1:
-        raise ConfigError("settings.retention_days must be at least 1")
+    for old in ("history_hours", "retention_days"):
+        if old in s:
+            log.warning("settings.%s is no longer used: history is kept forever. "
+                        "Delete old history with Prune in the dashboard.", old)
 
     hosts: list[Host] = []
     seen_names: set[str] = set()

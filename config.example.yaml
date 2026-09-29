@@ -5,9 +5,8 @@ settings:
   # Mark a host offline when it hasn't reported for this many seconds, or for
   # 3x its reporting/poll interval if that's longer.
   stale_after: 60
-  # How long to keep history (days). The charts go up to a year. Older data is
-  # kept as hourly averages, so this costs only a few MB per host.
-  retention_days: 400
+  # History is kept forever (older data as hourly averages, a few MB per host
+  # per year). Delete old history with "Prune" in the dashboard.
   # Default poll interval for SSH hosts (seconds).
   ssh_interval: 15
   # Report at most this many processes per host (busiest first).

@@ -1,14 +1,16 @@
 """Latest-sample cache plus SQLite history of host-level metrics.
 
-History is kept in tiers so a year of it stays small:
+History is kept forever, in tiers so years of it stay small:
 
-  history      every sample (~15s)       kept RAW_DAYS
-  history_5m   5-minute averages         kept M5_DAYS
-  history_1h   1-hour averages           kept retention_days
+  history      every sample (~15s)       kept RAW_DAYS, then only as averages
+  history_5m   5-minute averages         kept M5_DAYS, then only as averages
+  history_1h   1-hour averages           kept until pruned from the dashboard
 
 A background job rolls samples up into the coarser tiers; queries pick the
 coarsest tier that still has enough detail for the requested range and fill
-in the not-yet-rolled-up recent part from the finer tiers.
+in the not-yet-rolled-up recent part from the finer tiers. Nothing is
+deleted outright unless someone prunes it (Store.prune_older_than) or
+removes the host.
 """
 
 import json
@@ -40,6 +42,7 @@ LOAD_HOURS = RAW_DAYS * 24  # the "Load · 3d" average
 PEAK_DAYS = 7               # the "1% high" and the load peaks section
 SLOT = 300                  # load is scored per 5-minute slot
 # What was running at the busiest moment of each slot, for explaining peaks.
+# After SNAPSHOT_DAYS only the busiest one of each hour is kept.
 SNAPSHOT_DAYS = PEAK_DAYS + 1
 SNAPSHOT_PROCS = 6          # top processes by CPU, and again by memory
 SNAPSHOT_STACKS = 6
@@ -51,6 +54,9 @@ def _avg(m: str) -> str:
 
 
 # Tiers from finest to coarsest: (table, resolution seconds, rollup marker).
+# Every table holding a host's history (column `host`, timestamp `ts`).
+HOST_TABLES = ("history", "history_5m", "history_1h", "storage_history", "storage_1h", "load_snapshots")
+
 TIERS = (("history", 0, None), ("history_5m", 300, "m5"), ("history_1h", 3600, "h1"))
 STORAGE_TIERS = (("storage_history", STORAGE_SAMPLE_SECONDS, None), ("storage_1h", 3600, "s1h"))
 
@@ -144,9 +150,8 @@ def peak_snapshot(data: dict, values: dict, load: float, parts: dict) -> dict:
 
 
 class Store:
-    def __init__(self, db_path: Path, retention_days: float):
+    def __init__(self, db_path: Path):
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.retention_days = retention_days
         self._lock = threading.Lock()
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         cols = ", ".join(f"{m} REAL" for m in METRICS)
@@ -285,12 +290,11 @@ class Store:
         """Forget an enrolled host and all of its data."""
         with self._lock, self._db:
             self._db.execute("DELETE FROM host_prefs WHERE name = ?", (name,))
-            for table in ("enrolled", "latest", "history", "history_5m", "history_1h", "storage_history", "storage_1h",
-                          "load_snapshots"):
+            for table in ("enrolled", "latest", *HOST_TABLES):
                 self._db.execute(f"DELETE FROM {table} WHERE {'name' if table == 'enrolled' else 'host'} = ?", (name,))
         self.states.pop(name, None)
 
-    # -- rollups and retention ----------------------------------------------
+    # -- rollups, compaction and pruning ------------------------------------
 
     def _mark(self, key: str) -> float:
         row = self._db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
@@ -329,27 +333,73 @@ class Store:
                 )
                 self._set_mark(key, end)
 
-    def prune(self, known_hosts: set[str], now: float | None = None) -> None:
+    def compact(self, known_hosts: set[str], now: float | None = None) -> None:
+        """Drop fine-grained rows that the coarser tiers now cover, and data
+        for hosts removed from the config. Hourly history is kept forever."""
         now = time.time() if now is None else now
-        keep = self.retention_days * DAY
         with self._lock, self._db:
             # Never drop fine-grained rows that haven't been rolled up yet.
             cutoffs = {
                 "history": min(now - RAW_DAYS * DAY, self._mark("m5")),
                 "history_5m": min(now - M5_DAYS * DAY, self._mark("h1")),
-                "history_1h": now - keep,
                 "storage_history": min(now - M5_DAYS * DAY, self._mark("s1h")),
-                "storage_1h": now - keep,
-                "load_snapshots": now - SNAPSHOT_DAYS * DAY,
             }
             for table, cutoff in cutoffs.items():
                 self._db.execute(f"DELETE FROM {table} WHERE ts < ?", (cutoff,))
+            # Peak snapshots: past SNAPSHOT_DAYS, keep only each hour's busiest.
+            per_hour = 3600 // SLOT
+            start = self._mark("snap1h")
+            end = ((now - SNAPSHOT_DAYS * DAY) // 3600) * 3600
+            if end > start:
+                self._db.execute(
+                    f"""DELETE FROM load_snapshots AS a WHERE ts >= ? AND ts < ? AND EXISTS (
+                            SELECT 1 FROM load_snapshots AS b
+                            WHERE b.host = a.host AND b.slot / {per_hour} = a.slot / {per_hour} AND b.slot != a.slot
+                              AND (b.load > a.load OR (b.load = a.load AND b.slot < a.slot)))""",
+                    (start, end),
+                )
+                self._set_mark("snap1h", end)
             # Drop data for hosts that were removed from the config.
             for (host,) in self._db.execute("SELECT DISTINCT host FROM latest").fetchall():
                 if host not in known_hosts:
-                    for table in ("latest", *cutoffs):
+                    for table in ("latest", *HOST_TABLES):
                         self._db.execute(f"DELETE FROM {table} WHERE host = ?", (host,))
                     self.states.pop(host, None)
+
+    def prune_preview(self, days: float, host: str | None = None) -> dict:
+        """What prune_older_than(days, host) would delete."""
+        cutoff = time.time() - days * DAY
+        where = "ts < ?" + (" AND host = ?" if host else "")
+        params = (cutoff, host) if host else (cutoff,)
+        rows, oldest, hosts = 0, None, set()
+        with self._lock:
+            for table in HOST_TABLES:
+                n, lo = self._db.execute(f"SELECT COUNT(*), MIN(ts) FROM {table} WHERE {where}", params).fetchone()
+                rows += n
+                if lo is not None and (oldest is None or lo < oldest):
+                    oldest = lo
+                hosts.update(h for (h,) in self._db.execute(f"SELECT DISTINCT host FROM {table} WHERE {where}", params))
+        return {"cutoff": cutoff, "rows": rows, "oldest": oldest, "hosts": sorted(hosts)}
+
+    def prune_older_than(self, days: float, host: str | None = None) -> dict:
+        """Delete all history older than `days` (for one host, or all), then
+        give the space back to the filesystem."""
+        cutoff = time.time() - days * DAY
+        where = "ts < ?" + (" AND host = ?" if host else "")
+        params = (cutoff, host) if host else (cutoff,)
+        with self._lock:
+            before = self._db_bytes()
+            with self._db:
+                rows = sum(self._db.execute(f"DELETE FROM {table} WHERE {where}", params).rowcount
+                           for table in HOST_TABLES)
+            if rows:
+                self._db.execute("VACUUM")
+            after = self._db_bytes()
+        return {"cutoff": cutoff, "rows": rows, "freed": max(before - after, 0)}
+
+    def _db_bytes(self) -> int:
+        pages = self._db.execute("PRAGMA page_count").fetchone()[0]
+        return pages * self._db.execute("PRAGMA page_size").fetchone()[0]
 
     # -- reads --------------------------------------------------------------
 
@@ -371,7 +421,7 @@ class Store:
         return " UNION ALL ".join(parts), params
 
     def history(self, host: str, hours: float, points: int = 240) -> dict:
-        hours = min(max(hours, 0.1), self.retention_days * 24)
+        hours = min(max(hours, 0.1), 100 * 365 * 24)
         now = time.time()
         since = now - hours * 3600
         bucket = max(hours * 3600 / points, 1)

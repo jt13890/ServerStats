@@ -158,19 +158,19 @@ def test_interval_is_clamped(client):
 
 # -- long-term history ----------------------------------------------------------
 
-def test_year_of_history_is_rolled_up_and_pruned(tmp_path):
+def test_history_is_rolled_up_and_kept_forever(tmp_path):
     import time as _time
 
     from app.store import Store
 
-    store = Store(tmp_path / "db.sqlite", retention_days=400)
+    store = Store(tmp_path / "db.sqlite")
     now = _time.time()
     # One sample every 2h for 420 days; CPU ramps smoothly with age so values can be checked.
     for k in range(420 * 12, -1, -1):
         t = now - k * 7200
         store.record("h", {"cpu": {"percent": (now - t) / 86400 / 4.2}, "disks": []}, now=t)
     store.rollup(now)
-    store.prune({"h"}, now)
+    store.compact({"h"}, now)
 
     def count(table):
         return store._db.execute(f"SELECT COUNT(*), MIN(ts) FROM {table}").fetchone()
@@ -178,8 +178,8 @@ def test_year_of_history_is_rolled_up_and_pruned(tmp_path):
     raw, m5, h1 = count("history"), count("history_5m"), count("history_1h")
     assert raw[1] >= now - 3 * 86400 - 3600        # raw kept ~3 days
     assert m5[1] >= now - 90 * 86400 - 3600        # 5-minute tier kept 90 days
-    assert h1[1] >= now - 400 * 86400 - 7200       # hourly tier kept retention_days
-    assert h1[0] > 400 * 11                        # ...and it has most of a year+
+    assert h1[1] <= now - 420 * 86400 + 7200       # hourly tier keeps everything
+    assert h1[0] > 419 * 12
 
     year = store.history("h", 24 * 365)
     pts = year["metrics"]
@@ -199,7 +199,7 @@ def test_rollup_is_idempotent(tmp_path):
 
     from app.store import Store
 
-    store = Store(tmp_path / "db.sqlite", retention_days=400)
+    store = Store(tmp_path / "db.sqlite")
     now = _time.time()
     for k in range(100):
         store.record("h", {"cpu": {"percent": 50.0}, "disks": []}, now=now - 10000 + k * 60)
@@ -217,17 +217,16 @@ def test_trends_endpoint(client):
     assert {"t", "cpu", "mem", "disk_util", "storage"} <= tr["hosts"]["alpha"].keys()
 
 
-def test_retention_setting(tmp_path):
-    from app.config import ConfigError, load
+def test_old_retention_settings_are_ignored(tmp_path, caplog):
+    from app.config import load
 
     p = tmp_path / "c.yaml"
-    p.write_text("settings: {history_hours: 24}\nhosts: []\n")
-    assert load(p).settings.retention_days == 400  # old setting ignored (logged)
-    p.write_text("settings: {retention_days: 30}\nhosts: []\n")
-    assert load(p).settings.retention_days == 30
-    p.write_text("settings: {retention_days: 0}\nhosts: []\n")
-    with pytest.raises(ConfigError):
-        load(p)
+    for old in ("history_hours: 24", "retention_days: 30", "retention_days: 0"):
+        p.write_text(f"settings: {{{old}}}\nhosts: []\n")
+        caplog.clear()
+        settings = load(p).settings
+        assert not hasattr(settings, "retention_days")
+        assert "kept forever" in caplog.text
 
 
 # -- SSH: no code is ever sent --------------------------------------------------
@@ -521,9 +520,10 @@ def test_generates_config_when_missing(tmp_path, monkeypatch):
     conf = config.load()
     assert mounted.exists()
     assert conf.hosts == [] and conf.settings.require_auth_header and conf.settings.enrollment
-    assert config.load().settings.retention_days == 400  # the generated file parses as the defaults
-    mounted.write_text("settings: {retention_days: 30}\n")
-    assert config.load().settings.retention_days == 30
+    assert config.load().settings.stale_after == 60  # the generated file parses as the defaults
+    assert "retention_days" not in mounted.read_text()
+    mounted.write_text("settings: {stale_after: 30}\n")
+    assert config.load().settings.stale_after == 30
 
 
 def test_env_overrides_require_auth_header(tmp_path, monkeypatch):
@@ -632,7 +632,7 @@ def test_load_score_weights_busy_resources(tmp_path):
 
     from app.store import Store
 
-    store = Store(tmp_path / "db.sqlite", retention_days=400)
+    store = Store(tmp_path / "db.sqlite")
     now = _time.time()
 
     def put(host, ts, cpu, mem, disk, storage):
@@ -677,7 +677,7 @@ def test_one_percent_high_and_peaks(tmp_path):
 
     from app.store import Store
 
-    store = Store(tmp_path / "db.sqlite", retention_days=400)
+    store = Store(tmp_path / "db.sqlite")
     now = _time.time()
     n = 12 * 24 * 7  # a week of 5-minute slots
     rows = []
@@ -714,7 +714,7 @@ def test_one_percent_high_and_peaks(tmp_path):
 def test_peak_snapshots_keep_the_busiest_moment(tmp_path):
     from app.store import SLOT, Store
 
-    store = Store(tmp_path / "db.sqlite", retention_days=400)
+    store = Store(tmp_path / "db.sqlite")
     t0 = (1_800_000_000 // SLOT) * SLOT
 
     def data(cpu, top):
@@ -740,7 +740,7 @@ def test_peak_snapshots_keep_the_busiest_moment(tmp_path):
     assert snap["parts"]["cpu"] > snap["parts"]["mem"] and snap["values"]["cpu"] == 95
 
     # A fresh Store (restart) still only replaces the snapshot with a busier moment.
-    store2 = Store(tmp_path / "db.sqlite", retention_days=400)
+    store2 = Store(tmp_path / "db.sqlite")
     store2.record("h", data(60, "after-restart"), now=t0 + 250)
     assert store2.load_moment("h", t0)["processes"][0]["name"] == "busy"
     store2.record("h", data(99, "peak"), now=t0 + 280)
@@ -749,9 +749,14 @@ def test_peak_snapshots_keep_the_busiest_moment(tmp_path):
     assert store2.load_moment("h", t0 + SLOT)["processes"][0]["name"] == "next"
     assert store2.load_moment("h", t0 - SLOT) is None
 
-    # Kept for 8 days, then pruned.
-    store2.prune({"h"}, now=t0 + 9 * 86400)
-    assert store2.load_moment("h", t0) is None
+    # After 8 days only the busiest snapshot of each hour is kept (t0 is on the hour).
+    store2.record("h", data(40, "next-hour"), now=t0 + 3600 + 5)
+    store2.compact({"h"}, now=t0 + 9 * 86400)
+    assert store2.load_moment("h", t0)["processes"][0]["name"] == "peak"
+    assert store2.load_moment("h", t0 + SLOT) is None
+    assert store2.load_moment("h", t0 + 3600)["processes"][0]["name"] == "next-hour"
+    store2.compact({"h"}, now=t0 + 30 * 86400)  # idempotent
+    assert store2.load_moment("h", t0)["processes"][0]["name"] == "peak"
 
 
 def test_load_endpoints(client):
@@ -766,3 +771,49 @@ def test_load_endpoints(client):
     assert client.get("/api/hosts/alpha/load").status_code in (401, 403)
     tr = client.get("/api/trends", headers=USER).json()
     assert tr["load"]["peak_days"] == 7 and "high1" in tr["load"]["hosts"]["alpha"]
+
+
+def test_prune(client):
+    import time as _time
+
+    store = client.app.state.store
+    now = _time.time()
+    for host in ("alpha", "beta"):
+        for days in (10, 200, 400, 800, 1200):
+            t = now - days * 86400
+            # (Only tables the app's background rollup doesn't write to.)
+            store._db.execute("INSERT INTO history_1h (host, ts, cpu) VALUES (?, ?, 5)", (host, t))
+            store._db.execute("INSERT INTO storage_1h (host, ts, mount, used, total) VALUES (?, ?, '/', 1, 2)", (host, t))
+            store._db.execute("INSERT INTO load_snapshots (host, slot, ts, load, data) VALUES (?, ?, ?, 1, x'00')",
+                              (host, int(t // 300), t))
+    store._db.commit()
+
+    def remaining(host):
+        return sorted(round((now - t) / 86400) for (t,) in
+                      store._db.execute("SELECT ts FROM history_1h WHERE host = ?", (host,)))
+
+    meta = client.get("/api/meta", headers=USER).json()
+    assert [o["days"] for o in meta["prune_options"]] == [30, 90, 180, 365, 730, 1095]  # nothing past 3 years
+
+    # Preview: 1 year for alpha only -> its 400/800/1200-day rows, in 3 tables.
+    p = client.get("/api/prune?days=365&host=alpha", headers=USER).json()
+    assert p["rows"] == 3 * 3 and p["hosts"] == ["alpha"] and p["oldest"] == pytest.approx(now - 1200 * 86400)
+    assert client.get("/api/prune?days=365", headers=USER).json()["hosts"] == ["alpha", "beta"]
+    assert client.get("/api/prune?days=1500", headers=USER).status_code == 400
+
+    def post(body, headers=None):
+        return client.post("/api/prune", json=body, headers={**USER, **({"X-ServerStats-Action": "1"} if headers is None else headers)})
+
+    assert post({"days": 365}, headers={}).status_code == 403  # CSRF guard
+    assert client.post("/api/prune", json={"days": 365}, headers={"X-ServerStats-Action": "1"}).status_code in (401, 403)
+    for bad in (1500, 7, 0, -365, "365", 365.5, True, None):
+        assert post({"days": bad}).status_code == 400, bad
+    assert post({"days": 365, "host": "nope"}).status_code == 404
+    assert post([365]).status_code == 400
+
+    assert post({"days": 365, "host": "alpha"}).json()["rows"] == 3 * 3
+    assert remaining("alpha") == [10, 200] and remaining("beta") == [10, 200, 400, 800, 1200]
+    assert post({"days": 1095}).json()["rows"] == 3 and remaining("beta") == [10, 200, 400, 800]
+    assert post({"days": 1095}).json()["rows"] == 0
+    assert post({"days": 180}).json()["rows"] == 4 * 3  # alpha's 200, beta's 200/400/800
+    assert remaining("alpha") == [10] and remaining("beta") == [10]
