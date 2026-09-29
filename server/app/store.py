@@ -12,9 +12,11 @@ in the not-yet-rolled-up recent part from the finer tiers.
 """
 
 import json
+import math
 import sqlite3
 import threading
 import time
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,9 +34,16 @@ METRICS = (
 # Percentages are clamped when averaged, so bad values that older agents
 # stored can't blow up the charts.
 PERCENT_METRICS = {"cpu", "mem", "swap", "disk_util", "storage"}
-# Components of a host's overall load score (see Store.load_scores).
+# Components of a host's overall load score (see load_of).
 LOAD_PARTS = ("cpu", "mem", "disk_util", "storage")
-LOAD_HOURS = RAW_DAYS * 24
+LOAD_HOURS = RAW_DAYS * 24  # the "Load · 3d" average
+PEAK_DAYS = 7               # the "1% high" and the load peaks section
+SLOT = 300                  # load is scored per 5-minute slot
+# What was running at the busiest moment of each slot, for explaining peaks.
+SNAPSHOT_DAYS = PEAK_DAYS + 1
+SNAPSHOT_PROCS = 6          # top processes by CPU, and again by memory
+SNAPSHOT_STACKS = 6
+SNAPSHOT_DISKS = 3
 
 
 def _avg(m: str) -> str:
@@ -79,6 +88,61 @@ def metrics_from_sample(data: dict) -> dict:
     }
 
 
+def load_of(u: dict) -> tuple[float, dict]:
+    """Overall load (0-100) from component percentages, plus each one's share.
+
+    Each component is weighted by its own value, so load = sum(u^2) / sum(u)
+    and the busiest one dominates: one pegged resource reads high even if the
+    rest are idle. A component's share, u^2 / sum(u), is what it adds to the
+    total, so the shares stack up to the load.
+    """
+    vals = {k: min(max(v, 0.0), 100.0) for k, v in u.items() if k in LOAD_PARTS and _num(v) is not None}
+    total = sum(vals.values())
+    parts = {k: (v * v / total if total > 0 else 0.0) for k, v in vals.items()}
+    return sum(parts.values()), parts
+
+
+def _group_stacks(containers: list) -> list:
+    """Docker containers summed per compose project (standalone ones alone)."""
+    stacks: dict[str, dict] = {}
+    for c in containers:
+        if not isinstance(c, dict):
+            continue
+        name = c.get("project") or c.get("name") or "?"
+        st = stacks.setdefault(name, {"name": name, "stack": bool(c.get("project")), "containers": 0,
+                                      "cpu": 0.0, "mem": 0.0, "mem_percent": 0.0, "read_rate": 0.0, "write_rate": 0.0})
+        st["containers"] += 1
+        for k in ("cpu", "mem", "mem_percent", "read_rate", "write_rate"):
+            st[k] += _num(c.get(k)) or 0.0
+    return list(stacks.values())
+
+
+def peak_snapshot(data: dict, values: dict, load: float, parts: dict) -> dict:
+    """The few things worth keeping about one moment, to explain a load peak."""
+    procs = [p for p in data.get("processes") or [] if isinstance(p, dict)]
+    keep: dict[int, dict] = {}
+    for key in ("cpu", "mem"):
+        for p in sorted(procs, key=lambda p: _num(p.get(key)) or 0, reverse=True)[:SNAPSHOT_PROCS]:
+            keep[p.get("pid")] = {k: p.get(k) for k in ("pid", "name", "user", "cpu", "mem", "rss")} | {
+                "cmd": str(p.get("cmd") or "")[:160]}
+    dk = data.get("docker") or {}
+    stacks = sorted(_group_stacks(dk.get("containers") or []), key=lambda s: s["cpu"] + s["mem_percent"], reverse=True)
+    dio = data.get("disk_io") or {}
+    disks = sorted((d for d in dio.get("devices") or [] if isinstance(d, dict)),
+                   key=lambda d: _num(d.get("util")) or 0, reverse=True)[:SNAPSHOT_DISKS]
+    return {
+        "load": round(load, 1),
+        "parts": {k: round(v, 1) for k, v in parts.items()},
+        "values": {k: (round(v, 1) if v is not None else None) for k, v in values.items()},
+        "ncpu": (data.get("cpu") or {}).get("count"),
+        "mem_total": (data.get("memory") or {}).get("total"),
+        "processes": list(keep.values()),
+        "stacks": [{k: (round(v, 2) if isinstance(v, float) else v) for k, v in st.items()}
+                   for st in stacks[:SNAPSHOT_STACKS]] if dk.get("containers") else None,
+        "disks": [{k: d.get(k) for k in ("label", "util", "read_rate", "write_rate")} for d in disks],
+    }
+
+
 class Store:
     def __init__(self, db_path: Path, retention_days: float):
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -112,6 +176,11 @@ class Store:
             );
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS host_prefs (name TEXT PRIMARY KEY, docker INTEGER);
+            CREATE TABLE IF NOT EXISTS load_snapshots (
+                host TEXT NOT NULL, slot INTEGER NOT NULL, ts REAL NOT NULL,
+                load REAL NOT NULL, data BLOB NOT NULL,
+                PRIMARY KEY (host, slot)
+            );
             CREATE TABLE IF NOT EXISTS enrolled (
                 name TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE,
                 hostname TEXT, created REAL NOT NULL
@@ -127,6 +196,7 @@ class Store:
 
         self.states: dict[str, HostState] = {}
         self._storage_last: dict[str, float] = {}
+        self._snapshot_best: dict[str, tuple[int, float]] = {}  # host -> (slot, load) already stored
         for host, received_at, data in self._db.execute("SELECT host, received_at, data FROM latest"):
             self.states[host] = HostState(data=json.loads(data), received_at=received_at)
 
@@ -155,10 +225,29 @@ class Store:
                         if isinstance(d, dict) and d.get("total")
                     ],
                 )
+            self._record_snapshot(host, data, m, now)
             self._db.execute(
                 "INSERT OR REPLACE INTO latest (host, received_at, data) VALUES (?,?,?)",
                 (host, now, json.dumps(data, separators=(",", ":"))),
             )
+
+    def _record_snapshot(self, host: str, data: dict, m: dict, now: float) -> None:
+        """Keep the busiest moment of each 5-minute slot (caller holds the lock)."""
+        values = {k: m.get(k) for k in LOAD_PARTS}
+        load, parts = load_of(values)
+        slot = int(now // SLOT)
+        best = self._snapshot_best.get(host)
+        if best is not None and best[0] == slot and best[1] >= load:
+            return
+        if best is None or best[0] != slot:
+            row = self._db.execute("SELECT load FROM load_snapshots WHERE host = ? AND slot = ?", (host, slot)).fetchone()
+            if row is not None and row[0] >= load:
+                self._snapshot_best[host] = (slot, row[0])
+                return
+        self._snapshot_best[host] = (slot, load)
+        blob = zlib.compress(json.dumps(peak_snapshot(data, values, load, parts), separators=(",", ":")).encode())
+        self._db.execute("INSERT OR REPLACE INTO load_snapshots (host, slot, ts, load, data) VALUES (?,?,?,?,?)",
+                         (host, slot, now, load, blob))
 
     def record_error(self, host: str, error: str) -> None:
         st = self.state(host)
@@ -196,7 +285,8 @@ class Store:
         """Forget an enrolled host and all of its data."""
         with self._lock, self._db:
             self._db.execute("DELETE FROM host_prefs WHERE name = ?", (name,))
-            for table in ("enrolled", "latest", "history", "history_5m", "history_1h", "storage_history", "storage_1h"):
+            for table in ("enrolled", "latest", "history", "history_5m", "history_1h", "storage_history", "storage_1h",
+                          "load_snapshots"):
                 self._db.execute(f"DELETE FROM {table} WHERE {'name' if table == 'enrolled' else 'host'} = ?", (name,))
         self.states.pop(name, None)
 
@@ -250,6 +340,7 @@ class Store:
                 "history_1h": now - keep,
                 "storage_history": min(now - M5_DAYS * DAY, self._mark("s1h")),
                 "storage_1h": now - keep,
+                "load_snapshots": now - SNAPSHOT_DAYS * DAY,
             }
             for table, cutoff in cutoffs.items():
                 self._db.execute(f"DELETE FROM {table} WHERE ts < ?", (cutoff,))
@@ -305,58 +396,108 @@ class Store:
             storage.setdefault(mount, []).append({"t": t, "used": used, "total": total})
         return {"bucket": bucket, "metrics": metrics, "storage": storage}
 
-    def load_scores(self, hours: float = LOAD_HOURS, bucket: int = 300) -> dict:
-        """Each host's overall load over the last few days, 0-100%.
+    def _load_slots(self, since: float, host: str | None = None) -> dict[str, list]:
+        """Per-host, per-5-minute-slot load since `since`: {host: [(t, load, parts, values)]}.
 
-        For every `bucket`-second slot, each component (CPU, memory, disk
-        busy, fullest filesystem) is weighted by its own value, so
-        load = sum(u^2) / sum(u). The busiest component dominates: one pegged
-        resource reads high, even if the rest are idle. Each component's share,
-        u^2 / sum(u), is what it adds to that total, so the shares stack up to
-        the load. Loads and shares are averaged over all slots that have data.
+        Rolled-up 5-minute averages cover what's older than the last rollup;
+        raw samples, averaged per slot the same way, cover the rest.
         """
-        since = time.time() - hours * 3600
+        cols = ", ".join(_avg(k) for k in LOAD_PARTS)
+        where = " AND host = ?" if host else ""
         with self._lock:
+            mark = max(self._mark("m5"), since)
             rows = self._db.execute(
-                f"""SELECT host, CAST(ts / ? AS INTEGER), {', '.join(_avg(k) for k in LOAD_PARTS)}
-                    FROM history WHERE ts >= ? GROUP BY 1, 2 ORDER BY 1, 2""",
-                (bucket, since),
+                f"""SELECT host, CAST(ts / {SLOT} AS INTEGER) AS s, {', '.join(LOAD_PARTS)}
+                        FROM history_5m WHERE ts >= ? AND ts < ?{where}
+                    UNION ALL
+                    SELECT host, CAST(ts / {SLOT} AS INTEGER) AS s, {cols}
+                        FROM history WHERE ts >= ?{where} GROUP BY 1, 2
+                    ORDER BY 1, 2""",
+                (since, mark, *([host] if host else []), mark, *([host] if host else [])),
             ).fetchall()
-        acc: dict[str, dict] = {}
-        for host, _, *vals in rows:
-            a = acc.setdefault(host, {"n": 0, "load": 0.0, "last": {}, "parts": dict.fromkeys(LOAD_PARTS, 0.0),
-                                      "avg": dict.fromkeys(LOAD_PARTS, 0.0), "seen": dict.fromkeys(LOAD_PARTS, 0)})
+        out: dict[str, list] = {}
+        last_storage: dict[str, float] = {}
+        for h, slot, *vals in rows:
+            u = dict(zip(LOAD_PARTS, vals))
             # Filesystem usage is sampled less often; carry the last value forward.
-            u = {}
-            for k, v in zip(LOAD_PARTS, vals):
-                if v is None and k == "storage":
-                    v = a["last"].get(k)
-                if v is not None:
-                    u[k] = v
-                    a["last"][k] = v
-            if not u:
+            if u["storage"] is None:
+                u["storage"] = last_storage.get(h)
+            else:
+                last_storage[h] = u["storage"]
+            if all(v is None for v in u.values()):
                 continue
-            total = sum(u.values())
-            a["n"] += 1
-            for k, v in u.items():
-                a["avg"][k] += v
-                a["seen"][k] += 1
-                if total > 0:
-                    share = v * v / total
-                    a["parts"][k] += share
-                    a["load"] += share
+            load, parts = load_of(u)
+            out.setdefault(h, []).append((slot * SLOT, load, parts, u))
+        return out
+
+    @staticmethod
+    def _one_percent_high(slots: list) -> dict:
+        """The busiest 1% of slots (at least one), averaged."""
+        k = max(1, math.ceil(len(slots) * 0.01))
+        top = sorted(slots, key=lambda s: s[1], reverse=True)[:k]
+        return {
+            "load": round(sum(s[1] for s in top) / k, 1),
+            "parts": {p: round(sum(s[2].get(p, 0.0) for s in top) / k, 1) for p in LOAD_PARTS},
+            "slots": k,
+            "hours": round(len(slots) * SLOT / 3600, 1),
+        }
+
+    def load_scores(self, hours: float = LOAD_HOURS, peak_days: float = PEAK_DAYS) -> dict:
+        """Each host's overall load: the average over `hours` (all slots with
+        data, each scored with load_of), and the 1% high over `peak_days`."""
+        now = time.time()
+        since = now - hours * 3600
         hosts = {}
-        for host, a in acc.items():
-            n = a["n"]
-            if not n:
-                continue
-            hosts[host] = {
-                "load": round(a["load"] / n, 1),
-                "parts": {k: round(v / n, 1) for k, v in a["parts"].items()},
-                "avg": {k: (round(a["avg"][k] / a["seen"][k], 1) if a["seen"][k] else None) for k in LOAD_PARTS},
-                "hours": round(n * bucket / 3600, 1),
-            }
-        return {"window_hours": hours, "hosts": hosts}
+        for host, slots in self._load_slots(now - max(hours * 3600, peak_days * DAY)).items():
+            recent = [s for s in slots if s[0] >= since - SLOT]
+            score = {"high1": self._one_percent_high([s for s in slots if s[0] >= now - peak_days * DAY - SLOT])}
+            if recent:
+                n = len(recent)
+                avg = {}
+                for k in LOAD_PARTS:
+                    seen = [s[3][k] for s in recent if s[3].get(k) is not None]
+                    avg[k] = round(sum(seen) / len(seen), 1) if seen else None
+                score.update({
+                    "load": round(sum(s[1] for s in recent) / n, 1),
+                    "parts": {k: round(sum(s[2].get(k, 0.0) for s in recent) / n, 1) for k in LOAD_PARTS},
+                    "avg": avg,
+                    "hours": round(n * SLOT / 3600, 1),
+                })
+            hosts[host] = score
+        return {"window_hours": hours, "peak_days": peak_days, "hosts": hosts}
+
+    def load_week(self, host: str, days: float = PEAK_DAYS, peaks: int = 5) -> dict:
+        """One host's load per 5-minute slot, its 1% high, and its busiest
+        separate times (at least 3 hours apart), for the load peaks section."""
+        slots = self._load_slots(time.time() - days * DAY, host).get(host, [])
+        chosen: list = []
+        for s in sorted(slots, key=lambda s: s[1], reverse=True):
+            if len(chosen) >= peaks or s[1] <= 0:
+                break
+            if all(abs(s[0] - c[0]) >= 3 * 3600 for c in chosen):
+                chosen.append(s)
+        r1 = lambda v: round(v, 1) if v is not None else None
+        return {
+            "days": days,
+            "slot": SLOT,
+            # Columns rather than rows: a week is ~2000 slots.
+            "t": [s[0] for s in slots],
+            "load": [r1(s[1]) for s in slots],
+            "parts": {k: [r1(s[2].get(k, 0.0)) for s in slots] for k in LOAD_PARTS},
+            "values": {k: [r1(s[3].get(k)) for s in slots] for k in LOAD_PARTS},
+            "high1": self._one_percent_high(slots) if slots else None,
+            "peaks": [{"t": s[0], "load": r1(s[1])} for s in chosen],
+        }
+
+    def load_moment(self, host: str, t: float) -> dict | None:
+        """What was running at the busiest moment of the 5-minute slot at `t`."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT ts, data FROM load_snapshots WHERE host = ? AND slot = ?", (host, int(t // SLOT))
+            ).fetchone()
+        if row is None:
+            return None
+        return {"ts": row[0], **json.loads(zlib.decompress(row[1]))}
 
     def trends(self, hours: float = 1.0, points: int = 60) -> dict:
         """Recent CPU/memory/disk/storage for every host (overview sparklines)."""

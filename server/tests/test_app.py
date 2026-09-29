@@ -1,4 +1,5 @@
 import json
+import math
 
 import pytest
 from fastapi.testclient import TestClient
@@ -648,7 +649,8 @@ def test_load_score_weights_busy_resources(tmp_path):
     put("old", now - 5 * 86400, 99, 99, 99, 99)  # outside the 3-day window
 
     hosts = store.load_scores()["hosts"]
-    assert "old" not in hosts
+    assert "load" not in hosts["old"]  # nothing in the 3-day window...
+    assert hosts["old"]["high1"]["load"] == 99  # ...but it counts toward the week's 1% high
     p = hosts["pegged"]
     assert p["load"] == pytest.approx((90**2 + 3 * 10**2) / 120, abs=0.1)  # 70%, not the plain mean of 30%
     assert p["load"] > 60 and p["parts"]["cpu"] > 3 * p["parts"]["mem"]
@@ -668,3 +670,99 @@ def test_trends_include_load_scores(client):
     alpha = tr["load"]["hosts"]["alpha"]
     assert set(alpha["parts"]) == {"cpu", "mem", "disk_util", "storage"}
     assert 0 <= alpha["load"] <= 100
+
+
+def test_one_percent_high_and_peaks(tmp_path):
+    import time as _time
+
+    from app.store import Store
+
+    store = Store(tmp_path / "db.sqlite", retention_days=400)
+    now = _time.time()
+    n = 12 * 24 * 7  # a week of 5-minute slots
+    rows = []
+    for k in range(n):
+        t = now - 60 - k * 300
+        cpu = 10.0
+        if k in (100, 101, 102):
+            cpu = 100.0          # a short spike, three slots long
+        elif k == 1000:
+            cpu = 80.0           # a second, separate busy spell
+        rows.append(("h", t, cpu, 10.0, 10.0, 10.0))
+    store._db.executemany("INSERT INTO history (host, ts, cpu, mem, disk_util, storage) VALUES (?,?,?,?,?,?)", rows)
+    store.rollup(now)  # older slots now come from the 5-minute tier, recent ones from raw samples
+
+    week = store.load_week("h")
+    assert n - 1 <= len(week["t"]) <= n + 1 and set(week["parts"]) == {"cpu", "mem", "disk_util", "storage"}
+    assert sorted(week["t"]) == week["t"]
+    hi = week["high1"]
+    assert hi["slots"] == math.ceil(len(week["t"]) * 0.01)  # ~21 slots
+    spike = (100**2 + 3 * 10**2) / 130
+    busy = (80**2 + 3 * 10**2) / 110
+    base = 10.0
+    expected = (3 * spike + busy + (hi["slots"] - 4) * base) / hi["slots"]
+    assert hi["load"] == pytest.approx(expected, abs=0.2)
+    assert sum(hi["parts"].values()) == pytest.approx(hi["load"], abs=0.3)
+    # Peaks: highest first, and separate busy spells rather than neighbouring slots.
+    peaks = week["peaks"]
+    assert peaks[0]["load"] == pytest.approx(spike, abs=0.1)
+    assert peaks[1]["load"] == pytest.approx(busy, abs=0.1)
+    assert all(abs(a["t"] - b["t"]) >= 3 * 3600 for a in peaks for b in peaks if a is not b)
+    assert store.load_scores()["hosts"]["h"]["high1"]["load"] == hi["load"]
+
+
+def test_peak_snapshots_keep_the_busiest_moment(tmp_path):
+    from app.store import SLOT, Store
+
+    store = Store(tmp_path / "db.sqlite", retention_days=400)
+    t0 = (1_800_000_000 // SLOT) * SLOT
+
+    def data(cpu, top):
+        return {
+            "cpu": {"count": 4, "percent": cpu}, "memory": {"percent": 20.0, "total": 8e9},
+            "disk_io": {"util": 5.0, "devices": [{"label": "sda", "util": 5.0, "read_rate": 1, "write_rate": 2}]},
+            "disks": [{"mount": "/", "percent": 30.0, "used": 3, "total": 10}],
+            "processes": [{"pid": 1, "name": top, "user": "root", "cpu": cpu * 4, "mem": 1.0, "rss": 1, "cmd": top + " --x"},
+                          {"pid": 2, "name": "hog", "user": "u", "cpu": 0.5, "mem": 30.0, "rss": 9, "cmd": "x" * 999}],
+            "docker": {"containers": [{"project": "web", "name": "a", "cpu": 50.0, "mem": 1e9, "mem_percent": 12.5},
+                                      {"project": "web", "name": "b", "cpu": 25.0, "mem": 1e9, "mem_percent": 12.5}]},
+        }
+
+    store.record("h", data(30, "calm"), now=t0 + 10)
+    store.record("h", data(95, "busy"), now=t0 + 100)
+    store.record("h", data(50, "later"), now=t0 + 200)  # lower than the busy moment: not kept
+    snap = store.load_moment("h", t0 + 1)
+    assert snap["ts"] == t0 + 100 and snap["processes"][0]["name"] == "busy"
+    assert {p["name"] for p in snap["processes"]} == {"busy", "hog"}  # top by CPU and by memory
+    assert len(snap["processes"][1]["cmd"]) <= 160
+    assert snap["stacks"] == [{"name": "web", "stack": True, "containers": 2, "cpu": 75.0, "mem": 2e9,
+                               "mem_percent": 25.0, "read_rate": 0.0, "write_rate": 0.0}]
+    assert snap["parts"]["cpu"] > snap["parts"]["mem"] and snap["values"]["cpu"] == 95
+
+    # A fresh Store (restart) still only replaces the snapshot with a busier moment.
+    store2 = Store(tmp_path / "db.sqlite", retention_days=400)
+    store2.record("h", data(60, "after-restart"), now=t0 + 250)
+    assert store2.load_moment("h", t0)["processes"][0]["name"] == "busy"
+    store2.record("h", data(99, "peak"), now=t0 + 280)
+    assert store2.load_moment("h", t0)["processes"][0]["name"] == "peak"
+    store2.record("h", data(10, "next"), now=t0 + SLOT + 5)
+    assert store2.load_moment("h", t0 + SLOT)["processes"][0]["name"] == "next"
+    assert store2.load_moment("h", t0 - SLOT) is None
+
+    # Kept for 8 days, then pruned.
+    store2.prune({"h"}, now=t0 + 9 * 86400)
+    assert store2.load_moment("h", t0) is None
+
+
+def test_load_endpoints(client):
+    ingest(client, TOKEN_A, sample())
+    week = client.get("/api/hosts/alpha/load", headers=USER).json()
+    assert week["days"] == 7 and len(week["t"]) == 1 and week["high1"]["slots"] == 1
+    assert week["peaks"] == [] or week["peaks"][0]["t"] == week["t"][0]
+    snap = client.get(f"/api/hosts/alpha/load/moment?t={week['t'][0]}", headers=USER).json()
+    assert snap["processes"] and "load" in snap
+    assert client.get("/api/hosts/alpha/load/moment?t=1000", headers=USER).json() is None
+    assert client.get("/api/hosts/nope/load", headers=USER).status_code == 404
+    assert client.get("/api/hosts/alpha/load").status_code in (401, 403)
+    tr = client.get("/api/trends", headers=USER).json()
+    assert tr["load"]["peak_days"] == 7 and "high1" in tr["load"]["hosts"]["alpha"]
