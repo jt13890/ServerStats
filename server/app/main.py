@@ -191,6 +191,7 @@ def _summary(request: Request, host: cfg.Host, with_processes: bool = False) -> 
         enrolled=host.enrolled,
         server_time=now,
         update_pending=host.name in request.app.state.update_pending,
+        docker_pref=request.app.state.store.docker_pref(host.name),
         update_available=host.mode == "agent" and bool(data)
         and _version_tuple(data.get("agent_version")) < _version_tuple(AGENT_VERSION),
     )
@@ -277,6 +278,23 @@ async def update_host(request: Request, name: str):
     if reason:
         raise HTTPException(409, reason)
     return {"ok": True, "pending": True}
+
+
+@app.post("/api/hosts/{name}/docker")
+async def set_docker(request: Request, name: str):
+    """Turn Docker stats on or off for an agent host; applied on its next report."""
+    _require_action_header(request)
+    host = _host_or_404(request, name)
+    if host.mode != "agent":
+        raise HTTPException(409, "SSH hosts report Docker when the installer was run with --docker")
+    try:
+        enabled = (await request.json())["enabled"]
+    except (ValueError, KeyError, TypeError):
+        raise HTTPException(400, 'expected {"enabled": true|false}')
+    if not isinstance(enabled, bool):
+        raise HTTPException(400, 'expected {"enabled": true|false}')
+    request.app.state.store.set_docker_pref(host.name, enabled)
+    return {"ok": True, "enabled": enabled}
 
 
 @app.post("/api/update-agents")
@@ -382,6 +400,9 @@ async def ingest(request: Request):
     sample = normalize(data, request.app.state.conf.settings.max_procs)
     request.app.state.store.record(host.name, sample)
     reply = {"ok": True, "host": host.name}
+    docker_pref = request.app.state.store.docker_pref(host.name)
+    if docker_pref is not None:
+        reply["settings"] = {"docker": docker_pref}
     pending = request.app.state.update_pending
     if host.name in pending:
         done = _version_tuple(sample["agent_version"]) >= _version_tuple(AGENT_VERSION)

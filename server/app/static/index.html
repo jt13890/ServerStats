@@ -137,10 +137,13 @@
       <div class="card" id="docker-card" hidden>
         <div class="proc-head">
           <h2>Docker <span id="docker-count" class="muted"></span></h2>
+          <span class="spacer"></span>
+          <button id="docker-toggle" class="btn" type="button" hidden></button>
         </div>
+        <p id="docker-state" class="docker-state" hidden></p>
         <p id="docker-summary" class="docker-summary"></p>
         <div id="docker-error" class="banner" hidden></div>
-        <div class="table-wrap">
+        <div class="table-wrap" id="docker-body">
           <table class="table docker-table" id="docker-table">
             <thead>
               <tr>

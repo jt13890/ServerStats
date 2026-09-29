@@ -112,13 +112,15 @@ When the server has a newer agent than a host is running, the host's page shows 
 
 The host key is **trusted on first use** and pinned in `/data/known_hosts.json`. If it later changes, ServerStats refuses to connect and shows an error on the dashboard. You can pin a key up front with `host_key: "SHA256:…"` (get it with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`).
 
-### Docker and compose stacks (optional)
+### Docker and compose stacks
 
-Add `--docker` to either installer command to get a **Docker** section on the host's page. It shows how much of the host's CPU, memory, disk I/O, network and disk space each compose stack uses, and you can expand each stack into its containers.
+On hosts with Docker, the host's page has a **Docker** section. Turn it on with **Turn on Docker stats** (and off again the same way); the agent picks up the change on its next report. It shows how much of the host's CPU, memory, disk I/O, network and disk space each compose stack uses, and you can expand each stack into its containers. Install with `--docker` to have it on from the start.
 
+- **The agent never gets Docker access itself.** Reading the Docker socket is root-equivalent, and an agent that accepts remote updates runs code the server provides, so on Docker hosts the installer adds a small separate service, `serverstats-docker`, whose user is in the `docker` group. It only ever sends three fixed, read-only requests to Docker (`GET /containers/json`, `GET /containers/<id>/json`, `GET /system/df`) and hands the agent a minimal list: names, compose project/service, image, status, PID and volume names (no other labels, environment or config). Its socket is readable only by the agent's group, and it always runs the installed, root-owned code, never a remote update. `--no-docker` skips it.
 - **Usage comes from the kernel.** CPU, memory and I/O are read from each container's cgroup, the same numbers `docker stats` uses, without its per-container delay.
-- **Disk space** is each container's writable layer plus its volumes (bind mounts aren't counted). The push agent measures it every 15 minutes; it isn't available in SSH mode.
-- **Grouping into stacks needs the Docker API.** Stacks are identified by the `com.docker.compose.project` label, which only the Docker API has. So `--docker` adds the collector to the `docker` group, and **access to the Docker socket is root-equivalent on that host**. The collector only ever sends three fixed, read-only requests (`GET /containers/json`, `GET /containers/<id>/json`, `GET /system/df`). It never acts on anything the server sends, but it's still your call whether that access is acceptable. Without `--docker`, nothing changes.
+- **Disk space** is each container's writable layer plus its volumes (bind mounts aren't counted), measured every 15 minutes.
+- **Hosts installed before 1.4.0** need the installer rerun once to get the helper (the dashboard says so). The toggle works from then on.
+- **SSH mode:** `--docker` adds the `serverstats` user to the `docker` group so the collector can list containers; its key is still locked to the collector.
 - Per-container disk I/O needs cgroup v2 (the default on current distros). On cgroup v1 hosts it shows 0, as it does in `docker stats`.
 
 ## Putting it behind Authentik

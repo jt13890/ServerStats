@@ -571,13 +571,56 @@ def test_absurd_percentages_are_clamped(client):
     assert all(0 <= p["cpu"] <= 100 for p in hist)
 
 
-def test_docker_not_enabled_is_explained(monkeypatch, tmp_path):
+def test_docker_status_and_off_switch(monkeypatch, tmp_path):
     import agent_collector as a
 
     sock = tmp_path / "docker.sock"
     sock.write_text("")
     monkeypatch.setattr(a, "DOCKER_SOCK", str(sock))
+    monkeypatch.setattr(a, "DOCKER_HELPER_SOCK", str(tmp_path / "no-helper.sock"))
     monkeypatch.setenv("SERVERSTATS_DOCKER", "0")
-    assert "--docker" in a._Docker().snapshot()["error"]
-    sock.unlink()  # no Docker on the host: no section at all
-    assert a._Docker().snapshot() is None
+    d = a._Docker()
+    assert d.snapshot() is None  # off: Docker isn't touched at all
+    assert d.status() == {"present": True, "available": True, "enabled": False}
+    d.override = True  # turned on from the dashboard
+    assert d.status()["enabled"] is True
+    sock.unlink()
+    assert a._Docker().status()["present"] is False
+
+
+def test_docker_helper_serves_fixed_listing(monkeypatch, tmp_path):
+    """The agent gets containers from the helper's socket, not the Docker API."""
+    import threading
+
+    import agent_collector as a
+
+    listing = {"containers": [{"id": "b" * 64, "name": "web-app-1", "project": "web", "service": "app",
+                               "image": "img", "status": "Up", "pid": 0, "host_net": False, "volumes": ["v"]}],
+               "disk": None}
+    monkeypatch.setattr(a._DockerReader, "listing", lambda self: listing)
+    path = str(tmp_path / "helper.sock")
+    threading.Thread(target=a.serve_docker_helper, args=(path,), daemon=True).start()
+    import os
+    import time
+    for _ in range(50):
+        if os.path.exists(path):
+            break
+        time.sleep(0.05)
+    assert oct(os.stat(path).st_mode & 0o777) == "0o660"
+    monkeypatch.setattr(a, "DOCKER_HELPER_SOCK", path)
+    monkeypatch.setenv("SERVERSTATS_DOCKER", "1")
+    snap = a._Docker().snapshot()
+    assert list(snap["containers"]) == ["b" * 64] and snap["containers"]["b" * 64]["project"] == "web"
+
+
+def test_docker_toggle_from_dashboard(client):
+    ingest(client, TOKEN_A, sample(docker_ctl={"present": True, "available": True, "enabled": False}))
+    h = client.get("/api/hosts/alpha", headers=USER).json()
+    assert h["docker_ctl"] == {"present": True, "available": True, "enabled": False} and h["docker_pref"] is None
+    assert "settings" not in ingest(client, TOKEN_A, sample()).json()
+
+    assert client.post("/api/hosts/alpha/docker", json={"enabled": True}, headers=USER).status_code == 403
+    assert client.post("/api/hosts/alpha/docker", json={"enabled": "yes"}, headers=ACTION).status_code == 400
+    assert client.post("/api/hosts/alpha/docker", json={"enabled": True}, headers=ACTION).status_code == 200
+    assert ingest(client, TOKEN_A, sample()).json()["settings"] == {"docker": True}
+    assert client.get("/api/hosts/alpha", headers=USER).json()["docker_pref"] is True
