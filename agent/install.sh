@@ -56,7 +56,7 @@ HELPER_UNIT=/etc/systemd/system/serverstats-docker.service
 HELPER_INITD=/etc/init.d/serverstats-docker
 HELPER_USER=serverstats-docker
 OPENRC_LOG=/var/log/serverstats-agent.log
-AGENT_USER=serverstats-agent   # OpenRC only; systemd uses a DynamicUser
+AGENT_USER=serverstats-agent   # the agent's unprivileged system user (systemd and OpenRC)
 # Where remote updates are stored (systemd: StateDirectory, maybe under private/).
 STATE_DIRS="/var/lib/serverstats-agent /var/lib/private/serverstats-agent"
 SSH_USER=serverstats
@@ -86,11 +86,37 @@ done
 [ "$(id -u)" -eq 0 ] || die "must run as root (use sudo)"
 
 # -- helpers that work with both shadow-utils and busybox (Alpine) --------------
-user_exists() { grep -q "^$1:" /etc/passwd; }
+# getent sees every account NSS knows about (incl. systemd's), not just the
+# files; busybox systems may lack it, so fall back to the files there.
+user_exists() { if command -v getent >/dev/null 2>&1; then getent passwd "$1" >/dev/null; else grep -q "^$1:" /etc/passwd; fi; }
 user_home() { awk -F: -v u="$1" '$1 == u { print $6 }' /etc/passwd; }
-group_exists() { grep -q "^$1:" /etc/group; }
-add_to_group() { usermod -aG "$2" "$1" 2>/dev/null || addgroup "$1" "$2"; }
+group_exists() { if command -v getent >/dev/null 2>&1; then getent group "$1" >/dev/null; else grep -q "^$1:" /etc/group; fi; }
 nologin_shell() { command -v nologin 2>/dev/null || echo /bin/false; }
+# Pick the account tools by what's installed (shadow-utils, else busybox)
+# rather than trying one and falling back on any error: a fallback hides the
+# real error, and Debian's own addgroup/adduser take different options.
+if command -v useradd >/dev/null 2>&1; then SHADOW=1; else SHADOW=0; fi
+add_to_group() { if [ "$SHADOW" -eq 1 ]; then usermod -aG "$2" "$1"; else addgroup "$1" "$2"; fi; }
+# create_system_user NAME HOME SHELL [PRIMARY_GROUP]: no password, no login
+# unless SHELL allows it; creates a same-named group unless one is given.
+create_system_user() {
+    if [ "$SHADOW" -eq 1 ]; then
+        if [ -n "${4:-}" ]; then set -- "$1" "$2" "$3" -g "$4"; elif group_exists "$1"; then set -- "$1" "$2" "$3" -g "$1"; else set -- "$1" "$2" "$3" -U; fi
+        if [ "$2" = none ]; then
+            useradd --system --no-create-home --home-dir /nonexistent --shell "$3" "$4" ${5:+"$5"} "$1"
+        else
+            useradd --system --create-home --home-dir "$2" --shell "$3" "$4" ${5:+"$5"} "$1"
+        fi
+    else
+        group="${4:-$1}"
+        group_exists "$group" || addgroup -S "$group"
+        if [ "$2" = none ]; then
+            adduser -S -D -H -h /nonexistent -s "$3" -G "$group" "$1"
+        else
+            adduser -S -D -h "$2" -s "$3" -G "$group" "$1"
+        fi
+    fi
+}
 
 if [ -d /run/systemd/system ]; then
     INIT=systemd
@@ -178,9 +204,7 @@ if [ -n "$SSH_KEY" ]; then
     fi
 
     if ! user_exists "$SSH_USER"; then
-        useradd --system --create-home --shell /bin/sh "$SSH_USER" 2>/dev/null \
-            || adduser -S -D -h "/home/$SSH_USER" -s /bin/sh "$SSH_USER" \
-            || die "could not create user $SSH_USER"
+        create_system_user "$SSH_USER" "/home/$SSH_USER" /bin/sh || die "could not create user $SSH_USER"
     fi
     # No usable password, but not "locked" (!) either: sshd refuses key logins
     # to locked accounts when it isn't using PAM (e.g. Alpine, postmarketOS).
@@ -240,11 +264,17 @@ EOF
     return 0
 }
 
-# Group shared by the agent and the Docker helper: the helper's socket is
-# readable by this group only.
-if ! group_exists "$AGENT_USER"; then
-    groupadd --system "$AGENT_USER" 2>/dev/null || addgroup -S "$AGENT_USER" || die "could not create group $AGENT_USER"
+# The agent runs as a static, unprivileged system user on both systemd and
+# OpenRC. (Agents before 1.4.1 used systemd's DynamicUser=, whose transient
+# account has this same name: stop that first so it's released, or creating
+# the real account clashes with it.)
+if [ "$INIT" = systemd ]; then
+    systemctl stop serverstats-agent 2>/dev/null || true
 fi
+if ! user_exists "$AGENT_USER"; then
+    create_system_user "$AGENT_USER" none "$(nologin_shell)" || die "could not create user $AGENT_USER"
+fi
+AGENT_GROUP=$(id -gn "$AGENT_USER")
 
 # Docker helper: a separate service whose user is in the docker group. It
 # only ever hands the agent a fixed, read-only list of running containers,
@@ -257,10 +287,9 @@ fi
 HELPER=0
 [ "$HAVE_DOCKER" -eq 1 ] && [ "$NO_DOCKER" -eq 0 ] && HELPER=1
 [ "$DOCKER" -eq 1 ] && [ "$HELPER" -eq 0 ] && echo "note: no Docker found here (or --no-docker given); Docker stats stay off."
+# The helper's primary group is the agent's, so the agent can read its socket.
 if [ "$HELPER" -eq 1 ] && ! user_exists "$HELPER_USER"; then
-    useradd --system --no-create-home --home-dir /nonexistent --shell "$(nologin_shell)" -g "$AGENT_USER" "$HELPER_USER" 2>/dev/null \
-        || adduser -S -D -H -h /nonexistent -s "$(nologin_shell)" -G "$AGENT_USER" "$HELPER_USER" \
-        || die "could not create user $HELPER_USER"
+    create_system_user "$HELPER_USER" none "$(nologin_shell)" "$AGENT_GROUP" || die "could not create user $HELPER_USER"
 fi
 [ "$HELPER" -eq 1 ] && add_to_group "$HELPER_USER" docker
 
@@ -283,12 +312,13 @@ Restart=always
 RestartSec=10
 # Writable home for remote updates (the rest of the system stays read-only).
 StateDirectory=serverstats-agent
-# Lets it read the Docker helper's socket (not Docker itself).
-SupplementaryGroups=serverstats-agent
 
-# Runs as a throwaway unprivileged user; /proc and cgroup stats are
-# world-readable so no privileges are needed to read them.
-DynamicUser=yes
+# An unprivileged system user; /proc and cgroup stats are world-readable, so
+# no privileges are needed to read them. Its group can read the Docker
+# helper's socket (not Docker itself).
+User=serverstats-agent
+Group=serverstats-agent
+RemoveIPC=yes
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 ProtectSystem=strict
@@ -364,15 +394,9 @@ EOF
     exit 0
 fi
 
-# OpenRC: no DynamicUser, so run as a dedicated unprivileged system user. The
+# OpenRC: runs as the same unprivileged system user. The
 # token is read from the env file (root:$AGENT_USER 0640) rather than passed on
 # the command line, where any user could see it in `ps`.
-if ! user_exists "$AGENT_USER"; then
-    useradd --system --no-create-home --home-dir /nonexistent --shell "$(nologin_shell)" -g "$AGENT_USER" "$AGENT_USER" 2>/dev/null \
-        || adduser -S -D -H -h /nonexistent -s "$(nologin_shell)" -G "$AGENT_USER" "$AGENT_USER" \
-        || die "could not create user $AGENT_USER"
-fi
-AGENT_GROUP=$(id -gn "$AGENT_USER")
 if id -Gn "$AGENT_USER" | tr ' ' '\n' | grep -qx docker; then
     # Older installs gave the agent the docker group; the helper replaces that.
     if command -v gpasswd >/dev/null 2>&1; then gpasswd -d "$AGENT_USER" docker >/dev/null; else delgroup "$AGENT_USER" docker; fi
