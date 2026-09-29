@@ -8,6 +8,7 @@ A small, self-hosted dashboard for the Linux machines you run. It tracks:
 - **Storage space**: used/free per filesystem, tracked over time so you can see disks filling up
 - **Network** throughput, **load average**, **task counts** and **processes** (sortable/filterable, like `top` for your whole fleet)
 - **Docker** (optional): CPU, memory, disk I/O, network and disk space per compose stack and container
+- **Overall load**: one bar per host on the overview, out of 100%, averaged over the past 3 days. CPU, memory, disk I/O and storage each count in proportion to how busy they are, so a single maxed-out resource reads as high load even if the rest are idle. The bar is split into colored segments matching each resource, so you can see what is driving the load. Hover it for the breakdown.
 
 History is kept for 400 days by default, so the charts go from the last hour out to a full year. Full-detail samples are kept for 3 days, 5-minute averages for 90 days, and hourly averages after that, so a year of history is only a few MB per host. It runs in one Docker container with SQLite, has no build step, and is designed to sit behind **Authentik**.
 
@@ -20,7 +21,7 @@ Both modes run the same collector (`agent/serverstats_agent.py`). It uses only t
 | Install on host | One Python file plus a systemd or OpenRC service (a one-line installer) | One Python file plus a locked-down `authorized_keys` entry (a one-line installer) |
 | Network | Host makes outbound HTTPS to ServerStats. Works behind NAT, and the host needs no open ports | ServerStats must reach the host's SSH port |
 | If the ServerStats server is compromised | The attacker can push agent code to hosts that accept [remote updates](#updating-agents) (the default), running as the agent's user. Install with `--no-updates` and the server only receives data | The attacker can make hosts run the collector, and nothing else: the key is locked to it by a forced command |
-| Runs as | Unprivileged user: a throwaway `DynamicUser` in a locked-down systemd sandbox, or `serverstats-agent` under OpenRC | Unprivileged `serverstats` user |
+| Runs as | Dedicated unprivileged `serverstats-agent` user (in a locked-down sandbox under systemd) | Unprivileged `serverstats` user |
 | Accuracy | CPU and disk rates are averaged over the whole report interval | 1-second sample at each poll |
 
 **Why agents are the default:** a monitoring server that holds SSH keys to every machine is a juicy target, and this one is internet-facing. With the push model, the server never has credentials for your hosts. Each host only has a token that lets it submit its own stats. The one thing a host trusts the server with is remote updates, and you can turn those off per host. SSH mode is handy when a host can't reach the server, or you'd rather not run a service on it.
@@ -66,7 +67,7 @@ The host joins with the server's **join key** and appears on the dashboard withi
 Alternatively, list the host in `config/config.yaml` yourself (`name`, `mode: agent`, and a token from `openssl rand -hex 32`), restart ServerStats, and install with `--token <the token>` instead of `--join`.
 
    This installs `/usr/local/bin/serverstats-agent`, writes the token to `/etc/serverstats-agent.env`, and starts the service:
-   - **systemd:** a hardened `serverstats-agent.service` running as a throwaway user. Logs: `journalctl -u serverstats-agent -f`.
+   - **systemd:** a hardened `serverstats-agent.service` running as the unprivileged `serverstats-agent` system user. Logs: `journalctl -u serverstats-agent -f`.
    - **OpenRC** (Alpine, postmarketOS, Gentoo): an `/etc/init.d/serverstats-agent` service supervised by `supervise-daemon`, running as a dedicated unprivileged `serverstats-agent` user. The agent reads the token from the env file (readable only by root and that user), so it never appears in `ps`. Logs: `/var/log/serverstats-agent.log`.
 
    To remove it, run the same script with `--uninstall`.
@@ -120,6 +121,7 @@ On hosts with Docker, the host's page has a **Docker** section. Turn it on with 
 - **Usage comes from the kernel.** CPU, memory and I/O are read from each container's cgroup, the same numbers `docker stats` uses, without its per-container delay.
 - **Disk space** is each container's writable layer plus its volumes (bind mounts aren't counted), measured every 15 minutes.
 - **Hosts installed before 1.4.0** need the installer rerun once to get the helper (the dashboard says so). The toggle works from then on.
+- **systemd hosts installed with 1.4.0** can crash-loop with `status=217/USER`. The unit's `DynamicUser=` clashed with the `serverstats-agent` group that the installer created. Rerun the current installer (1.4.1 or later) to fix it. It switches the unit to a static `serverstats-agent` user, and systemd moves the state directory over by itself. Rerunning it is also safe on hosts you already patched by hand.
 - **SSH mode:** `--docker` adds the `serverstats` user to the `docker` group so the collector can list containers; its key is still locked to the collector.
 - Per-container disk I/O needs cgroup v2 (the default on current distros). On cgroup v1 hosts it shows 0, as it does in `docker stats`.
 

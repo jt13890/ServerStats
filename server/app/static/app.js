@@ -194,6 +194,40 @@ function meter(label, pct, title, trend, valueText) {
     h('span', { class: 'meter-value', text: valueText || fmtPct(pct) }));
 }
 
+// Overall load over the past few days (see Store.load_scores on the server):
+// one bar out of 100%, split into a colored segment per resource.
+const LOAD_PARTS = [
+  ['cpu', 'CPU', 'CPU'], ['mem', 'Memory', 'memory'], ['disk_util', 'Disk I/O', 'disk I/O'], ['storage', 'Storage', 'storage'],
+];
+function loadMeter(score) {
+  const track = h('div', {
+    class: 'meter-track load-track', role: 'meter', 'aria-valuemin': 0, 'aria-valuemax': 100,
+    'aria-valuenow': score ? score.load : 0, 'aria-label': 'Overall load',
+  });
+  let caption = 'Not enough data yet';
+  let title = 'Overall load: not enough history yet.';
+  if (score) {
+    const parts = LOAD_PARTS.filter(([k]) => score.parts[k] > 0);
+    for (const [k] of parts) {
+      const seg = h('div', { class: 'load-seg', 'data-part': k });
+      seg.style.width = Math.min(100, score.parts[k]) + '%';
+      track.append(seg);
+    }
+    const span = score.hours >= 71.5 ? '3 days' : score.hours >= 24 ? `${Math.floor(score.hours / 24)}d ${Math.round(score.hours % 24)}h`
+      : score.hours >= 1 ? `${Math.round(score.hours)}h` : `${Math.max(1, Math.round(score.hours * 60))} min`;
+    const top = parts.slice().sort((a, b) => score.parts[b[0]] - score.parts[a[0]])[0];
+    caption = top && score.load >= 1 ? `Mostly ${top[2]}` : 'Idle';
+    if (score.hours < 71.5) caption += ` · ${span}`;  // newer hosts: say how much data this is
+    title = `Overall load, averaged over the past ${span}. Busier resources count for more, `
+      + 'so one maxed-out resource shows as high load even if the rest are idle.\n'
+      + LOAD_PARTS.map(([k, label]) => `${label}: adds ${fmtPct(score.parts[k])} (average ${fmtPct(score.avg[k])} used)`).join('\n');
+  }
+  return h('div', { class: 'meter meter-load', title },
+    h('span', { class: 'meter-label', text: 'Load · 3d' }),
+    h('div', { class: 'meter-viz' }, h('span', { class: 'load-caption', text: caption }), track),
+    h('span', { class: 'meter-value', text: score ? fmtPct(score.load) : '—' }));
+}
+
 // Last-hour trend on a fixed 0-100% scale, so hosts compare honestly.
 function sparkline(points) {
   const W = 120, H = 22;
@@ -303,9 +337,12 @@ function renderOverview() {
   let trends = null;
   function trendFor(name) {
     const tr = trends && trends.hosts[name];
-    if (!tr) return {};
+    if (!tr) return { load: trends && trends.load && trends.load.hosts[name] };
     const series = (key) => tr.t.map((t, i) => ({ t, v: tr[key][i] })).filter((p) => p.v != null);
-    return { cpu: series('cpu'), mem: series('mem'), disk: series('disk_util'), storage: series('storage') };
+    return {
+      cpu: series('cpu'), mem: series('mem'), disk: series('disk_util'), storage: series('storage'),
+      load: trends.load && trends.load.hosts[name],
+    };
   }
 
   every(5000, async () => { await refreshHosts(); draw(); });
@@ -323,15 +360,17 @@ function updateCard(card, host, trend = {}) {
   if (host.cpu) {
     const disk = fullestDisk(host);
     const mem = host.memory || {};
+    const keyed = (part, m) => { m.dataset.part = part; return m; };
     meters.push(
-      meter('CPU', host.cpu.percent, `${host.cpu.count} cores`, trend.cpu || []),
-      meter('Memory', mem.percent, `${fmtBytes(mem.used)} of ${fmtBytes(mem.total)} used`, trend.mem || []),
-      meter('Disk I/O', host.disk_io ? host.disk_io.util : null,
+      loadMeter(trend.load),
+      keyed('cpu', meter('CPU', host.cpu.percent, `${host.cpu.count} cores`, trend.cpu || [])),
+      keyed('mem', meter('Memory', mem.percent, `${fmtBytes(mem.used)} of ${fmtBytes(mem.total)} used`, trend.mem || [])),
+      keyed('disk_util', meter('Disk I/O', host.disk_io ? host.disk_io.util : null,
         host.disk_io ? `Busiest disk. Read ${fmtRate(host.disk_io.read_rate)}, write ${fmtRate(host.disk_io.write_rate)}` : 'Not reported',
-        trend.disk || []),
-      meter('Storage', disk ? disk.percent : null,
+        trend.disk || [])),
+      keyed('storage', meter('Storage', disk ? disk.percent : null,
         disk ? `Fullest filesystem: ${disk.mount} (${fmtBytes(disk.used)} of ${fmtBytes(disk.total)})` : 'No filesystems',
-        trend.storage || []),
+        trend.storage || [])),
     );
   }
   $('.meters', card).replaceChildren(...meters);
@@ -340,7 +379,6 @@ function updateCard(card, host, trend = {}) {
   const age = host.last_seen ? host.server_time - host.last_seen : null;
   const item = (label, value) => h('span', null, label + ' ', h('b', { text: value }));
   foot.replaceChildren(...[
-    host.load && item('Load', host.load[0].toFixed(2)),
     host.uptime != null && item('Up', fmtDuration(host.uptime)),
     item(host.status === 'online' ? 'Updated' : 'Last seen', fmtAgo(age)),
   ].filter(Boolean));

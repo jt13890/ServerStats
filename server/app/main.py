@@ -20,7 +20,7 @@ from .schema import normalize
 from .ssh_poller import AGENT_SCRIPT, SSHPoller, load_or_create_key
 from .store import Store
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 STATIC = Path(__file__).parent / "static"
 INSTALL_SH = AGENT_SCRIPT.parent / "install.sh"
 MAX_INGEST_BYTES = 4 * 1024 * 1024
@@ -35,6 +35,7 @@ AGENT_VERSION = re.search(rb'^VERSION = "([0-9.]+)"', _agent_code, re.M).group(1
 ACTION_HEADER = "X-ServerStats-Action"
 MAX_UPDATE_OFFERS = 3
 MAX_ENROLLED = 1000
+LOAD_CACHE_SECONDS = 300
 
 
 def _token_hash(token: str) -> str:
@@ -242,10 +243,19 @@ async def get_history(request: Request, name: str, hours: float = 1.0):
 
 @app.get("/api/trends")
 async def get_trends(request: Request):
-    """Last hour of CPU/memory/disk/storage for every host, for the overview."""
+    """Last hour of CPU/memory/disk/storage and the 3-day load score for every host, for the overview."""
     known = {h.name for h in all_hosts(request.app)}
     trends = request.app.state.store.trends()
     trends["hosts"] = {k: v for k, v in trends["hosts"].items() if k in known}
+    # Days of data move slowly, so recompute the load scores every few minutes.
+    now = time.monotonic()
+    cached = getattr(request.app.state, "load_cache", None)
+    if cached is None or now - cached[0] > LOAD_CACHE_SECONDS:
+        cached = (now, request.app.state.store.load_scores())
+        request.app.state.load_cache = cached
+    scores = cached[1]
+    trends["load"] = {"window_hours": scores["window_hours"],
+                      "hosts": {k: v for k, v in scores["hosts"].items() if k in known}}
     return trends
 
 
