@@ -624,3 +624,47 @@ def test_docker_toggle_from_dashboard(client):
     assert client.post("/api/hosts/alpha/docker", json={"enabled": True}, headers=ACTION).status_code == 200
     assert ingest(client, TOKEN_A, sample()).json()["settings"] == {"docker": True}
     assert client.get("/api/hosts/alpha", headers=USER).json()["docker_pref"] is True
+
+
+def test_load_score_weights_busy_resources(tmp_path):
+    import time as _time
+
+    from app.store import Store
+
+    store = Store(tmp_path / "db.sqlite", retention_days=400)
+    now = _time.time()
+
+    def put(host, ts, cpu, mem, disk, storage):
+        store._db.execute("INSERT INTO history (host, ts, cpu, mem, disk_util, storage) VALUES (?, ?, ?, ?, ?, ?)",
+                          (host, ts, cpu, mem, disk, storage))
+
+    for k in range(12 * 24):  # one day, every 5 minutes
+        t = now - k * 300
+        put("pegged", t, 90, 10, 10, 10)      # one resource maxed out
+        put("even", t, 50, 50, 50, 50)
+        put("idle", t, 0, 0, 0, 0)
+        # Storage is only reported now and then; it carries forward.
+        put("sparse", t, 20, 20, 0, 60 if k % 4 == 0 else None)
+    put("old", now - 5 * 86400, 99, 99, 99, 99)  # outside the 3-day window
+
+    hosts = store.load_scores()["hosts"]
+    assert "old" not in hosts
+    p = hosts["pegged"]
+    assert p["load"] == pytest.approx((90**2 + 3 * 10**2) / 120, abs=0.1)  # 70%, not the plain mean of 30%
+    assert p["load"] > 60 and p["parts"]["cpu"] > 3 * p["parts"]["mem"]
+    assert sum(p["parts"].values()) == pytest.approx(p["load"], abs=0.2)
+    assert p["avg"]["cpu"] == 90 and 23 <= p["hours"] <= 25
+    assert hosts["even"]["load"] == 50
+    assert hosts["idle"]["load"] == 0
+    s = hosts["sparse"]
+    assert s["load"] == pytest.approx((20**2 * 2 + 60**2) / 100, abs=0.5)
+    assert s["parts"]["storage"] == pytest.approx(36, abs=0.5)
+
+
+def test_trends_include_load_scores(client):
+    ingest(client, TOKEN_A, sample())
+    tr = client.get("/api/trends", headers=USER).json()
+    assert tr["load"]["window_hours"] == 72
+    alpha = tr["load"]["hosts"]["alpha"]
+    assert set(alpha["parts"]) == {"cpu", "mem", "disk_util", "storage"}
+    assert 0 <= alpha["load"] <= 100

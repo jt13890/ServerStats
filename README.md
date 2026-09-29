@@ -8,6 +8,7 @@ A small, self-hosted dashboard for the Linux machines you run. It tracks:
 - **Storage space**: used/free per filesystem, tracked over time so you can see disks filling up
 - **Network** throughput, **load average**, **task counts** and **processes** (sortable/filterable, like `top` for your whole fleet)
 - **Docker** (optional): CPU, memory, disk I/O, network and disk space per compose stack and container
+- **Overall load**: one bar per host on the overview, out of 100%, averaged over the past 3 days. CPU, memory, disk I/O and storage each count in proportion to how busy they are, so a single maxed-out resource reads as high load even if the rest are idle. The bar is split into colored segments matching each resource, so you can see what is driving the load. Hover it for the breakdown.
 
 History is kept for 400 days by default, so the charts go from the last hour out to a full year. Full-detail samples are kept for 3 days, 5-minute averages for 90 days, and hourly averages after that, so a year of history is only a few MB per host. It runs in one Docker container with SQLite, has no build step, and is designed to sit behind **Authentik**.
 

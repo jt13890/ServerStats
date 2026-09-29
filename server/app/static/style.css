@@ -294,6 +294,24 @@ td .meter { grid-template-columns: 1fr 52px; }
 .spark-line { fill: none; stroke: var(--series-1); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
 .spark-area { fill: var(--series-1); opacity: 0.10; }
 .host-card .meters { gap: 10px; }
+.host-card .meter { grid-template-columns: 70px 1fr 52px; }
+
+/* overall load: one stacked bar, one color per resource, matching the charts */
+.meter-load { padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+.meter-load .meter-value { font-weight: 600; }
+.load-caption { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.load-track { display: flex; height: 8px; border-radius: 4px; }
+.load-seg { height: 100%; transition: width .4s ease; }
+.load-seg + .load-seg { border-left: 1px solid var(--surface); }
+[data-part="cpu"] { --part: var(--series-1); }
+[data-part="mem"] { --part: var(--series-2); }
+[data-part="disk_util"] { --part: var(--series-3); }
+[data-part="storage"] { --part: var(--series-7); }
+.load-seg { background: var(--part); }
+.meter[data-part] .meter-label::before {
+  content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 2px;
+  background: var(--part); margin-right: 5px; vertical-align: 0;
+}
 
 /* range picker: 7 short options */
 .seg button:disabled { color: var(--muted); cursor: not-allowed; opacity: .5; }

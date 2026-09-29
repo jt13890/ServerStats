@@ -32,6 +32,9 @@ METRICS = (
 # Percentages are clamped when averaged, so bad values that older agents
 # stored can't blow up the charts.
 PERCENT_METRICS = {"cpu", "mem", "swap", "disk_util", "storage"}
+# Components of a host's overall load score (see Store.load_scores).
+LOAD_PARTS = ("cpu", "mem", "disk_util", "storage")
+LOAD_HOURS = RAW_DAYS * 24
 
 
 def _avg(m: str) -> str:
@@ -301,6 +304,59 @@ class Store:
         for t, mount, used, total in srows:
             storage.setdefault(mount, []).append({"t": t, "used": used, "total": total})
         return {"bucket": bucket, "metrics": metrics, "storage": storage}
+
+    def load_scores(self, hours: float = LOAD_HOURS, bucket: int = 300) -> dict:
+        """Each host's overall load over the last few days, 0-100%.
+
+        For every `bucket`-second slot, each component (CPU, memory, disk
+        busy, fullest filesystem) is weighted by its own value, so
+        load = sum(u^2) / sum(u). The busiest component dominates: one pegged
+        resource reads high, even if the rest are idle. Each component's share,
+        u^2 / sum(u), is what it adds to that total, so the shares stack up to
+        the load. Loads and shares are averaged over all slots that have data.
+        """
+        since = time.time() - hours * 3600
+        with self._lock:
+            rows = self._db.execute(
+                f"""SELECT host, CAST(ts / ? AS INTEGER), {', '.join(_avg(k) for k in LOAD_PARTS)}
+                    FROM history WHERE ts >= ? GROUP BY 1, 2 ORDER BY 1, 2""",
+                (bucket, since),
+            ).fetchall()
+        acc: dict[str, dict] = {}
+        for host, _, *vals in rows:
+            a = acc.setdefault(host, {"n": 0, "load": 0.0, "last": {}, "parts": dict.fromkeys(LOAD_PARTS, 0.0),
+                                      "avg": dict.fromkeys(LOAD_PARTS, 0.0), "seen": dict.fromkeys(LOAD_PARTS, 0)})
+            # Filesystem usage is sampled less often; carry the last value forward.
+            u = {}
+            for k, v in zip(LOAD_PARTS, vals):
+                if v is None and k == "storage":
+                    v = a["last"].get(k)
+                if v is not None:
+                    u[k] = v
+                    a["last"][k] = v
+            if not u:
+                continue
+            total = sum(u.values())
+            a["n"] += 1
+            for k, v in u.items():
+                a["avg"][k] += v
+                a["seen"][k] += 1
+                if total > 0:
+                    share = v * v / total
+                    a["parts"][k] += share
+                    a["load"] += share
+        hosts = {}
+        for host, a in acc.items():
+            n = a["n"]
+            if not n:
+                continue
+            hosts[host] = {
+                "load": round(a["load"] / n, 1),
+                "parts": {k: round(v / n, 1) for k, v in a["parts"].items()},
+                "avg": {k: (round(a["avg"][k] / a["seen"][k], 1) if a["seen"][k] else None) for k in LOAD_PARTS},
+                "hours": round(n * bucket / 3600, 1),
+            }
+        return {"window_hours": hours, "hosts": hosts}
 
     def trends(self, hours: float = 1.0, points: int = 60) -> dict:
         """Recent CPU/memory/disk/storage for every host (overview sparklines)."""
