@@ -20,7 +20,7 @@ from .schema import normalize
 from .ssh_poller import AGENT_SCRIPT, SSHPoller, load_or_create_key
 from .store import Store
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 STATIC = Path(__file__).parent / "static"
 INSTALL_SH = AGENT_SCRIPT.parent / "install.sh"
 MAX_INGEST_BYTES = 4 * 1024 * 1024
@@ -241,9 +241,23 @@ async def get_history(request: Request, name: str, hours: float = 1.0):
     return request.app.state.store.history(host.name, hours)
 
 
+@app.get("/api/hosts/{name}/load")
+async def get_load(request: Request, name: str):
+    """The past week's load per 5 minutes, its 1% high and busiest times."""
+    host = _host_or_404(request, name)
+    return request.app.state.store.load_week(host.name)
+
+
+@app.get("/api/hosts/{name}/load/moment")
+async def get_load_moment(request: Request, name: str, t: float):
+    """Top processes, stacks and disks at the busiest moment of the 5 minutes at `t` (null if not recorded)."""
+    host = _host_or_404(request, name)
+    return request.app.state.store.load_moment(host.name, t)
+
+
 @app.get("/api/trends")
 async def get_trends(request: Request):
-    """Last hour of CPU/memory/disk/storage and the 3-day load score for every host, for the overview."""
+    """Last hour of CPU/memory/disk/storage, plus the 3-day load and 7-day 1% high, for every host."""
     known = {h.name for h in all_hosts(request.app)}
     trends = request.app.state.store.trends()
     trends["hosts"] = {k: v for k, v in trends["hosts"].items() if k in known}
@@ -254,7 +268,7 @@ async def get_trends(request: Request):
         cached = (now, request.app.state.store.load_scores())
         request.app.state.load_cache = cached
     scores = cached[1]
-    trends["load"] = {"window_hours": scores["window_hours"],
+    trends["load"] = {"window_hours": scores["window_hours"], "peak_days": scores["peak_days"],
                       "hosts": {k: v for k, v in scores["hosts"].items() if k in known}}
     return trends
 

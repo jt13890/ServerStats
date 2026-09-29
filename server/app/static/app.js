@@ -194,37 +194,56 @@ function meter(label, pct, title, trend, valueText) {
     h('span', { class: 'meter-value', text: valueText || fmtPct(pct) }));
 }
 
-// Overall load over the past few days (see Store.load_scores on the server):
-// one bar out of 100%, split into a colored segment per resource.
+// Overall load (see load_of on the server): one bar out of 100%, split into
+// a colored segment per resource, so it's clear what drives it.
 const LOAD_PARTS = [
   ['cpu', 'CPU', 'CPU'], ['mem', 'Memory', 'memory'], ['disk_util', 'Disk I/O', 'disk I/O'], ['storage', 'Storage', 'storage'],
 ];
-function loadMeter(score) {
+const topPart = (parts) => LOAD_PARTS.filter(([k]) => parts[k] > 0).sort((a, b) => parts[b[0]] - parts[a[0]])[0];
+
+function loadTrack(parts, label, load) {
   const track = h('div', {
     class: 'meter-track load-track', role: 'meter', 'aria-valuemin': 0, 'aria-valuemax': 100,
-    'aria-valuenow': score ? score.load : 0, 'aria-label': 'Overall load',
+    'aria-valuenow': load == null ? 0 : load, 'aria-label': label,
   });
+  for (const [k] of LOAD_PARTS) {
+    if (!(parts && parts[k] > 0)) continue;
+    const seg = h('div', { class: 'load-seg', 'data-part': k });
+    seg.style.width = Math.min(100, parts[k]) + '%';
+    track.append(seg);
+  }
+  return track;
+}
+
+function fmtSpan(hours) {
+  if (hours >= 24) return `${Math.floor(hours / 24)}d` + (Math.round(hours % 24) ? ` ${Math.round(hours % 24)}h` : '');
+  return hours >= 1 ? `${Math.round(hours)}h` : `${Math.max(1, Math.round(hours * 60))} min`;
+}
+
+// `kind`: 'avg' (3-day average) or 'high' (the busiest 1% of the past week).
+function loadMeter(score, kind) {
+  const high = kind === 'high';
+  const full = high ? 167.5 : 71.5; // hours in the window, give or take a slot
+  const [label, sub] = high ? ['1% high', 'past 7 days'] : ['Load', '3-day avg'];
   let caption = 'Not enough data yet';
-  let title = 'Overall load: not enough history yet.';
+  let title = high ? 'Peak load: not enough history yet.' : 'Overall load: not enough history yet.';
   if (score) {
-    const parts = LOAD_PARTS.filter(([k]) => score.parts[k] > 0);
-    for (const [k] of parts) {
-      const seg = h('div', { class: 'load-seg', 'data-part': k });
-      seg.style.width = Math.min(100, score.parts[k]) + '%';
-      track.append(seg);
-    }
-    const span = score.hours >= 71.5 ? '3 days' : score.hours >= 24 ? `${Math.floor(score.hours / 24)}d ${Math.round(score.hours % 24)}h`
-      : score.hours >= 1 ? `${Math.round(score.hours)}h` : `${Math.max(1, Math.round(score.hours * 60))} min`;
-    const top = parts.slice().sort((a, b) => score.parts[b[0]] - score.parts[a[0]])[0];
+    const top = topPart(score.parts);
     caption = top && score.load >= 1 ? `Mostly ${top[2]}` : 'Idle';
-    if (score.hours < 71.5) caption += ` · ${span}`;  // newer hosts: say how much data this is
-    title = `Overall load, averaged over the past ${span}. Busier resources count for more, `
-      + 'so one maxed-out resource shows as high load even if the rest are idle.\n'
-      + LOAD_PARTS.map(([k, label]) => `${label}: adds ${fmtPct(score.parts[k])} (average ${fmtPct(score.avg[k])} used)`).join('\n');
+    if (score.hours < full) caption += ` · ${fmtSpan(score.hours)}`; // newer hosts: say how much data this is
+    const span = score.hours < full ? fmtSpan(score.hours) : high ? '7 days' : '3 days';
+    title = (high
+      ? `Peak load: the busiest 1% of the past ${span} (the top ${score.slots} five-minute stretches, `
+        + `${fmtSpan(score.slots / 12)} in all), averaged. Open the host to see what caused it.\n`
+      : `Overall load, averaged over the past ${span}. Busier resources count for more, `
+        + 'so one maxed-out resource shows as high load even if the rest are idle.\n')
+      + LOAD_PARTS.map(([k, name]) => `${name}: adds ${fmtPct(score.parts[k])}`
+        + (score.avg ? ` (average ${fmtPct(score.avg[k])} used)` : '')).join('\n');
   }
   return h('div', { class: 'meter meter-load', title },
-    h('span', { class: 'meter-label', text: 'Load · 3d' }),
-    h('div', { class: 'meter-viz' }, h('span', { class: 'load-caption', text: caption }), track),
+    h('span', { class: 'meter-label' }, label, h('small', { text: sub })),
+    h('div', { class: 'meter-viz' }, h('span', { class: 'load-caption', text: caption }),
+      loadTrack(score && score.parts, high ? 'Peak load, past week' : 'Overall load', score && score.load)),
     h('span', { class: 'meter-value', text: score ? fmtPct(score.load) : '—' }));
 }
 
@@ -362,7 +381,9 @@ function updateCard(card, host, trend = {}) {
     const mem = host.memory || {};
     const keyed = (part, m) => { m.dataset.part = part; return m; };
     meters.push(
-      loadMeter(trend.load),
+      h('div', { class: 'load-block' },
+        loadMeter(trend.load && trend.load.load != null ? trend.load : null, 'avg'),
+        loadMeter(trend.load && trend.load.high1, 'high')),
       keyed('cpu', meter('CPU', host.cpu.percent, `${host.cpu.count} cores`, trend.cpu || [])),
       keyed('mem', meter('Memory', mem.percent, `${fmtBytes(mem.used)} of ${fmtBytes(mem.total)} used`, trend.mem || [])),
       keyed('disk_util', meter('Disk I/O', host.disk_io ? host.disk_io.util : null,
@@ -858,9 +879,302 @@ function renderDetail(name) {
     });
   }
 
-  state.redraw = drawCharts;
+  // -- load peaks: the past week's load, and what was running at its busiest --
+
+  let week = null;
+  let pick = null;       // start of the selected 5-minute slot
+  let pickUser = false;  // chosen by the user, so refreshes keep it
+  let momentSeq = 0;
+
+  async function loadPeaks() {
+    const data = await api(`/api/hosts/${enc}/load`);
+    week = data;
+    const keep = pickUser && pick != null && week.t.includes(pick);
+    const before = pick;
+    if (!keep) pick = week.peaks.length ? week.peaks[0].t : null;
+    drawPeaks();
+    if (pick != null && (pick !== before || !$('#peak-moment').childElementCount)) loadMoment(pick);
+    if (pick == null) $('#peak-moment').replaceChildren();
+  }
+
+  function selectMoment(t) {
+    pick = t;
+    pickUser = true;
+    // Redrawing replaces the chart; keep keyboard focus on it.
+    const refocus = $('#chart-peaks').contains(document.activeElement);
+    drawPeaks();
+    if (refocus) $('#chart-peaks svg').focus();
+    loadMoment(t);
+  }
+
+  function drawPeaks() {
+    if (!week) return;
+    const n = week.t.length;
+    const now = serverNow();
+    const stats = $('#peak-stats');
+    const chips = $('#peak-chips');
+    if (!n) {
+      stats.replaceChildren();
+      chips.replaceChildren();
+      $('#chart-peaks').replaceChildren(h('p', { class: 'muted', text: 'No load history yet. It fills in as the host reports.' }));
+      return;
+    }
+    const recent = week.t.map((t, i) => [t, i]).filter(([t]) => t >= now - 72 * 3600).map(([, i]) => i);
+    const avg3 = recent.length ? recent.reduce((a, i) => a + week.load[i], 0) / recent.length : null;
+    const avgParts = {};
+    for (const [k] of LOAD_PARTS) avgParts[k] = recent.reduce((a, i) => a + (week.parts[k][i] || 0), 0) / (recent.length || 1);
+    const mostly = (parts) => { const top = topPart(parts); return top ? `mostly ${top[2]}` : 'idle'; };
+    const hi = week.high1;
+    const peak = week.peaks[0];
+    stats.replaceChildren(
+      tile('Load · 3-day average', fmtPct(avg3), avg3 == null ? 'no data in the past 3 days' : mostly(avgParts)),
+      tile('1% high · 7 days', fmtPct(hi.load), `${mostly(hi.parts)} · busiest ${fmtSpan(hi.slots / 12)} averaged`),
+      tile('Busiest 5 minutes', peak ? fmtPct(peak.load) : '—', peak ? fmtWhen(peak.t) : ''),
+    );
+
+    loadChart($('#chart-peaks'), { week, x0: now - week.days * 86400, x1: now, pick, onPick: selectMoment });
+
+    chips.replaceChildren(
+      h('span', { class: 'muted', text: 'Busiest times:' }),
+      ...week.peaks.map((p) => h('button', {
+        class: 'chip', type: 'button', 'aria-pressed': String(p.t === pick),
+        onclick: () => selectMoment(p.t),
+      }, fmtWhen(p.t), ' ', h('b', { text: fmtPct(p.load) }))));
+  }
+
+  async function loadMoment(t) {
+    const seq = ++momentSeq;
+    const panel = $('#peak-moment');
+    panel.classList.add('loading');
+    let snap;
+    try {
+      snap = await api(`/api/hosts/${enc}/load/moment?t=${t}`);
+    } finally {
+      if (seq === momentSeq) panel.classList.remove('loading');
+    }
+    if (seq !== momentSeq || !week) return;
+    drawMoment(t, snap);
+  }
+
+  function drawMoment(t, snap) {
+    const i = week.t.indexOf(t);
+    if (i < 0) return;
+    const parts = {}, values = {};
+    for (const [k] of LOAD_PARTS) { parts[k] = week.parts[k][i]; values[k] = week.values[k][i]; }
+    const load = week.load[i];
+
+    const breakdown = h('div', { class: 'moment-parts' },
+      ...LOAD_PARTS.map(([k, name]) => h('div', { class: 'moment-part', 'data-part': k },
+        h('span', { class: 'swatch' }),
+        h('span', { text: name }),
+        h('b', { text: values[k] == null ? '—' : `${fmtPct(values[k])} used` }),
+        h('span', { class: 'muted', text: `adds ${fmtPct(parts[k])}` }))));
+
+    const kids = [
+      h('div', { class: 'moment-head' },
+        h('h3', { text: `${fmtWhen(t)}–${fmtClock(t + week.slot, false)}` }),
+        h('span', { class: 'muted', text: 'load ' }), h('b', { text: fmtPct(load) }),
+        h('span', { class: 'muted', text: ' (5-minute average)' })),
+      loadTrack(parts, 'Load at this time', load),
+      breakdown,
+    ];
+
+    if (!snap) {
+      kids.push(h('p', { class: 'muted moment-note', text: "What was running isn't recorded for this time. "
+        + 'ServerStats keeps it for 8 days, from when the server was updated to record it.' }));
+    } else {
+      const ncpu = snap.ncpu || (host && host.cpu && host.cpu.count) || 1;
+      const procs = snap.processes || [];
+      const byCpu = procs.slice().sort((a, b) => b.cpu - a.cpu).slice(0, 6).filter((p) => p.cpu > 0);
+      const byMem = procs.slice().sort((a, b) => b.mem - a.mem).slice(0, 6).filter((p) => p.mem > 0);
+      const procRow = (p, pct, value, part, title) => rankRow(part, p.name || String(p.pid), p.user, `${p.cmd || p.name} (PID ${p.pid})\n${title}`, pct, value);
+      const lists = [
+        rankList('Processes by CPU', 'Share of all cores', byCpu.map((p) => procRow(p, p.cpu / ncpu, fmtPct(p.cpu / ncpu), 'cpu',
+          `${p.cpu.toFixed(0)}% of one core`))),
+        rankList('Processes by memory', 'Share of RAM', byMem.map((p) => procRow(p, p.mem, fmtPct(p.mem), 'mem',
+          `${fmtBytes(p.rss)} resident`))),
+      ];
+      if (snap.stacks && snap.stacks.length) {
+        lists.push(
+          rankList('Docker by CPU', 'Share of all cores', snap.stacks.slice().sort((a, b) => b.cpu - a.cpu).filter((x) => x.cpu > 0).map((x) =>
+            rankRow('cpu', x.name, x.stack ? `${x.containers} container${x.containers > 1 ? 's' : ''}` : 'container',
+              `${x.cpu.toFixed(0)}% of one core`, x.cpu / ncpu, fmtPct(x.cpu / ncpu)))),
+          rankList('Docker by memory', 'Share of RAM', snap.stacks.slice().sort((a, b) => b.mem_percent - a.mem_percent).filter((x) => x.mem_percent > 0).map((x) =>
+            rankRow('mem', x.name, fmtBytes(x.mem), `${fmtBytes(x.mem)} used`, x.mem_percent, fmtPct(x.mem_percent)))));
+      }
+      if ((snap.disks || []).length) {
+        lists.push(rankList('Busiest disks', 'Time busy', snap.disks.map((d) => rankRow('disk_util', d.label, `${fmtRate(d.read_rate)} read · ${fmtRate(d.write_rate)} write`,
+          `${d.label}: read ${fmtRate(d.read_rate)}, write ${fmtRate(d.write_rate)}`, d.util, fmtPct(d.util)))));
+      }
+      kids.push(
+        h('p', { class: 'moment-note' }, h('span', { class: 'muted', text: 'At the busiest moment in these 5 minutes, ' }),
+          h('b', { text: fmtClock(snap.ts, false) }), h('span', { class: 'muted', text: `, load was ${fmtPct(snap.load)}:` })),
+        h('div', { class: 'rank-grid' }, ...lists));
+    }
+    $('#peak-moment').replaceChildren(...kids);
+  }
+
+  state.redraw = () => { drawCharts(); drawPeaks(); };
   every(5000, loadHost);
   every(30000, loadHistory);
+  every(300000, loadPeaks);
+}
+
+function fmtWhen(t) {
+  return new Date(t * 1000).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+// A short ranked list ("what was using the most X"), each row with a bar in
+// its resource's color.
+function rankList(title, unit, rows) {
+  return h('div', { class: 'rank-list' },
+    h('div', { class: 'rank-title' }, h('b', { text: title }), h('span', { class: 'muted', text: unit })),
+    rows.length ? rows : h('p', { class: 'muted', text: 'Nothing notable' }));
+}
+function rankRow(part, name, sub, title, pct, value) {
+  const m = meter(null, pct, title, null, value);
+  m.dataset.part = part;
+  return h('div', { class: 'rank-row', title },
+    h('div', { class: 'rank-name' }, h('span', { class: 'pname', text: name }), sub ? h('span', { class: 'muted', text: ' ' + sub }) : null),
+    m);
+}
+
+// -- load peaks chart: stacked areas per resource, 5-minute steps ------------
+
+function loadChart(container, opts) {
+  const { week, x0, x1, onPick } = opts;
+  container.replaceChildren();
+  const W = Math.max(container.clientWidth, 280);
+  const H = 210;
+  const M = { l: 44, r: 12, t: 12, b: 24 };
+  const iw = W - M.l - M.r;
+  const ih = H - M.t - M.b;
+  const X = (t) => M.l + ((Math.min(Math.max(t, x0), x1) - x0) / (x1 - x0)) * iw;
+  const Y = (v) => M.t + ih - (Math.min(Math.max(v, 0), 100) / 100) * ih;
+  const slot = week.slot;
+  const n = week.t.length;
+  const hi = week.high1;
+
+  const legend = h('div', { class: 'legend' },
+    ...LOAD_PARTS.map(([k, name]) => h('span', { class: 'legend-item', 'data-part': k }, h('span', { class: 'swatch' }), name)),
+    hi && h('span', { class: 'legend-item' }, h('span', { class: 'key key-dashed' }), '1% high ', h('b', { text: fmtPct(hi.load) })));
+  container.append(legend);
+
+  const root = svg('svg', {
+    viewBox: `0 0 ${W} ${H}`, width: W, height: H, tabindex: 0, role: 'img',
+    'aria-label': `Load over the past ${week.days} days, by resource. 1% high ${fmtPct(hi && hi.load)}. `
+      + 'Use the arrow keys to move and Enter to see what was running.',
+  });
+  container.append(root);
+
+  for (const v of [0, 25, 50, 75, 100]) {
+    root.append(svg('line', { class: v === 0 ? 'baseline' : 'grid', x1: M.l, x2: W - M.r, y1: Y(v), y2: Y(v) }));
+    const label = svg('text', { class: 'tick', x: M.l - 8, y: Y(v) + 4, 'text-anchor': 'end' });
+    label.textContent = `${v}%`;
+    root.append(label);
+  }
+  timeAxis(root, { x0, x1, X, iw, W, M, H });
+
+  // Contiguous runs of slots; a gap (host offline) breaks the areas.
+  const runs = [];
+  for (let i = 0; i < n; i++) {
+    if (i && week.t[i] - week.t[i - 1] <= 3 * slot) runs[runs.length - 1].push(i);
+    else runs.push([i]);
+  }
+  for (const run of runs) {
+    const lower = run.map(() => 0);
+    for (const [k] of LOAD_PARTS) {
+      const upper = run.map((i, j) => lower[j] + (week.parts[k][i] || 0));
+      let top = '', bottom = '';
+      run.forEach((i, j) => {
+        const xa = X(week.t[i]).toFixed(1), xb = X(week.t[i] + slot).toFixed(1);
+        top += `${j ? 'L' : 'M'}${xa},${Y(upper[j]).toFixed(1)}L${xb},${Y(upper[j]).toFixed(1)}`;
+        bottom = `L${xb},${Y(lower[j]).toFixed(1)}L${xa},${Y(lower[j]).toFixed(1)}` + bottom;
+      });
+      root.append(svg('path', { class: 'area', 'data-part': k, d: top + bottom + 'Z' }));
+      upper.forEach((v, j) => { lower[j] = v; });
+    }
+  }
+
+  if (hi) {
+    const y = Y(hi.load);
+    root.append(svg('line', { class: 'high-line', x1: M.l, x2: W - M.r, y1: y, y2: y }));
+    const label = svg('text', { class: 'high-label', x: W - M.r - 4, y: y - 5, 'text-anchor': 'end' });
+    label.textContent = `1% high ${fmtPct(hi.load)}`;
+    root.append(label);
+  }
+
+  // Selected time
+  if (opts.pick != null) {
+    const x = X(opts.pick + slot / 2);
+    const i = week.t.indexOf(opts.pick);
+    root.append(svg('line', { class: 'pick-line', x1: x, x2: x, y1: M.t, y2: M.t + ih }));
+    if (i >= 0) root.append(svg('circle', { class: 'pick-dot', cx: x, cy: Y(week.load[i]), r: 4.5 }));
+  }
+
+  // hover: crosshair + breakdown; click or Enter picks that time
+  const cross = svg('line', { class: 'crosshair', y1: M.t, y2: M.t + ih, visibility: 'hidden' });
+  const hit = svg('rect', { x: M.l, y: M.t, width: iw, height: ih, fill: 'transparent', class: 'hit' });
+  root.append(cross, hit);
+  const tip = $('#tooltip');
+  let idx = -1;
+
+  function show(i, clientX, clientY) {
+    if (!n) return;
+    idx = Math.max(0, Math.min(n - 1, i));
+    const t = week.t[idx];
+    const x = X(t + slot / 2);
+    cross.setAttribute('x1', x);
+    cross.setAttribute('x2', x);
+    cross.setAttribute('visibility', 'visible');
+    tip.replaceChildren(
+      h('div', { class: 'tt-time', text: `${fmtWhen(t)}–${fmtClock(t + slot, false)}` }),
+      h('div', { class: 'tt-row' }, h('span', { class: 'key key-blank' }), h('b', { text: fmtPct(week.load[idx]) }), h('span', { text: 'Load' })),
+      ...LOAD_PARTS.map(([k, name]) => h('div', { class: 'tt-row', 'data-part': k },
+        h('span', { class: 'swatch' }), h('b', { text: `+${fmtPct(week.parts[k][idx])}` }),
+        h('span', { text: `${name} · ${fmtPct(week.values[k][idx])} used` }))),
+      h('div', { class: 'tt-hint', text: 'Click to see what was running' }));
+    tip.hidden = false;
+    const rect = root.getBoundingClientRect();
+    if (clientX == null) {
+      clientX = rect.left + (x / W) * rect.width;
+      clientY = rect.top + M.t;
+    }
+    const tw = tip.offsetWidth, th = tip.offsetHeight;
+    let left = clientX + 14;
+    if (left + tw > window.innerWidth - 8) left = clientX - tw - 14;
+    tip.style.left = Math.max(8, left) + 'px';
+    tip.style.top = Math.max(8, Math.min(clientY - th / 2, window.innerHeight - th - 8)) + 'px';
+  }
+  function hide() {
+    idx = -1;
+    tip.hidden = true;
+    cross.setAttribute('visibility', 'hidden');
+  }
+  function nearest(clientX) {
+    const rect = root.getBoundingClientRect();
+    const t = x0 + ((((clientX - rect.left) / rect.width) * W - M.l) / iw) * (x1 - x0) - slot / 2;
+    let best = 0;
+    for (let i = 1; i < n; i++) if (Math.abs(week.t[i] - t) < Math.abs(week.t[best] - t)) best = i;
+    return best;
+  }
+
+  hit.addEventListener('pointermove', (e) => show(nearest(e.clientX), e.clientX, e.clientY));
+  hit.addEventListener('pointerleave', hide);
+  hit.addEventListener('click', (e) => { const i = nearest(e.clientX); hide(); onPick(week.t[i]); });
+  root.addEventListener('focus', () => show(opts.pick != null ? week.t.indexOf(opts.pick) : n - 1));
+  root.addEventListener('blur', hide);
+  root.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      e.preventDefault();
+      show((idx < 0 ? n - 1 : idx) + (e.key === 'ArrowLeft' ? -1 : 1));
+    } else if (e.key === 'Enter' && idx >= 0) {
+      e.preventDefault();
+      onPick(week.t[idx]);
+    } else if (e.key === 'Escape') {
+      hide();
+    }
+  });
 }
 
 // -- line chart --------------------------------------------------------------
@@ -906,8 +1220,45 @@ function cadence(times) {
   return steps[(steps.length - 1) >> 1]; // lower median: few samples shouldn't bridge a real gap
 }
 
-const TIME_STEPS = [300, 600, 900, 1800, 3600, 7200, 10800, 14400, 21600, 43200, 86400, 172800, 604800, 1209600];
+const TIME_STEPS = [300, 600, 900, 1800, 3600, 7200, 10800, 14400, 21600, 43200, 86400, 172800, 259200, 604800, 1209600];
 const MIN_TICK_GAP = 76; // px between x-axis labels
+
+// x axis: steps aligned to local time (months for long ranges)
+function timeAxis(root, { x0, x1, X, iw, W, M, H }) {
+  const span = x1 - x0;
+  const maxTicks = Math.max(2, Math.floor(iw / MIN_TICK_GAP));
+  const xTicks = [];
+  if (span > 90 * 86400) {
+    // Months, starting at the first 1st-of-the-month in range.
+    const d = new Date(x0 * 1000);
+    d.setDate(1);
+    d.setHours(0, 0, 0, 0);
+    d.setMonth(d.getMonth() + 1);
+    const months = [];
+    while (d.getTime() / 1000 <= x1) {
+      months.push(d.getTime() / 1000);
+      d.setMonth(d.getMonth() + 1);
+    }
+    const every = Math.ceil(months.length / maxTicks);
+    months.filter((_, i) => i % every === 0).forEach((t) => xTicks.push([t,
+      new Date(t * 1000).toLocaleDateString([], { month: 'short', year: '2-digit' })]));
+  } else {
+    const step = TIME_STEPS.find((s) => span / s <= maxTicks) || TIME_STEPS[TIME_STEPS.length - 1];
+    const off = -new Date().getTimezoneOffset() * 60;
+    for (let t = Math.ceil((x0 + off) / step) * step - off; t <= x1; t += step) {
+      xTicks.push([t, step >= 86400
+        ? new Date(t * 1000).toLocaleDateString([], { month: 'short', day: 'numeric' })
+        : fmtClock(t, false)]);
+    }
+  }
+  for (const [t, text] of xTicks) {
+    const x = X(t);
+    if (x < M.l + 16 || x > W - M.r - 16) continue;
+    const label = svg('text', { class: 'tick', x, y: H - 6, 'text-anchor': 'middle' });
+    label.textContent = text;
+    root.append(label);
+  }
+}
 
 function lineChart(container, opts) {
   const { series, x0, x1, fmt } = opts;
@@ -951,40 +1302,7 @@ function lineChart(container, opts) {
     root.append(label);
   }
 
-  // x axis: steps aligned to local time
-  const span = x1 - x0;
-  const maxTicks = Math.max(2, Math.floor(iw / MIN_TICK_GAP));
-  const xTicks = [];
-  if (span > 90 * 86400) {
-    // Months, starting at the first 1st-of-the-month in range.
-    const d = new Date(x0 * 1000);
-    d.setDate(1);
-    d.setHours(0, 0, 0, 0);
-    d.setMonth(d.getMonth() + 1);
-    const months = [];
-    while (d.getTime() / 1000 <= x1) {
-      months.push(d.getTime() / 1000);
-      d.setMonth(d.getMonth() + 1);
-    }
-    const every = Math.ceil(months.length / maxTicks);
-    months.filter((_, i) => i % every === 0).forEach((t) => xTicks.push([t,
-      new Date(t * 1000).toLocaleDateString([], { month: 'short', year: '2-digit' })]));
-  } else {
-    const step = TIME_STEPS.find((s) => span / s <= maxTicks) || TIME_STEPS[TIME_STEPS.length - 1];
-    const off = -new Date().getTimezoneOffset() * 60;
-    for (let t = Math.ceil((x0 + off) / step) * step - off; t <= x1; t += step) {
-      xTicks.push([t, step >= 86400
-        ? new Date(t * 1000).toLocaleDateString([], { month: 'short', day: 'numeric' })
-        : fmtClock(t, false)]);
-    }
-  }
-  for (const [t, text] of xTicks) {
-    const x = X(t);
-    if (x < M.l + 16 || x > W - M.r - 16) continue;
-    const label = svg('text', { class: 'tick', x, y: H - 6, 'text-anchor': 'middle' });
-    label.textContent = text;
-    root.append(label);
-  }
+  timeAxis(root, { x0, x1, X, iw, W, M, H });
 
   if (!hasData) {
     const msg = svg('text', { class: 'empty-msg', x: M.l + iw / 2, y: M.t + ih / 2, 'text-anchor': 'middle' });

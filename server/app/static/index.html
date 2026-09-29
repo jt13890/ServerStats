@@ -114,6 +114,15 @@
         </figure>
       </div>
 
+      <div class="card" id="peaks-card">
+        <h2>Load peaks <span class="muted">past 7 days</span></h2>
+        <p class="muted peaks-intro">Overall load every 5 minutes, colored by what drove it. Pick one of the busiest times, or click anywhere on the chart, to see what was running then.</p>
+        <div id="peak-stats" class="tiles peak-stats"></div>
+        <div class="chart" id="chart-peaks"></div>
+        <div id="peak-chips" class="peak-chips" role="group" aria-label="Busiest times"></div>
+        <div id="peak-moment" class="peak-moment" aria-live="polite"></div>
+      </div>
+
       <div class="card">
         <h2>Storage</h2>
         <div class="table-wrap">
