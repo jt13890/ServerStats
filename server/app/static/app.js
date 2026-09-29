@@ -379,7 +379,6 @@ function updateCard(card, host, trend = {}) {
   const age = host.last_seen ? host.server_time - host.last_seen : null;
   const item = (label, value) => h('span', null, label + ' ', h('b', { text: value }));
   foot.replaceChildren(...[
-    host.load && item('Load avg', host.load[0].toFixed(2)),
     host.uptime != null && item('Up', fmtDuration(host.uptime)),
     item(host.status === 'online' ? 'Updated' : 'Last seen', fmtAgo(age)),
   ].filter(Boolean));
