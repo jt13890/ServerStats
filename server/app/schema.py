@@ -43,7 +43,7 @@ def _opt(v):
     return _num(v, None)
 
 
-def _docker(v):
+def _docker(v, ncpu=1):
     if not isinstance(v, dict):
         return None
     if v.get("error"):
@@ -61,6 +61,11 @@ def _docker(v):
             "status": _str(c.get("status"), 64),
             **{k: _opt(c.get(k)) for k in ("cpu", "mem", "mem_percent", "read_rate", "write_rate", "rx_rate", "tx_rate", "disk")},
         })
+        c2 = containers[-1]
+        if c2["cpu"] is not None:
+            c2["cpu"] = min(max(c2["cpu"], 0.0), 100.0 * ncpu)
+        if c2["mem_percent"] is not None:
+            c2["mem_percent"] = min(max(c2["mem_percent"], 0.0), 100.0)
     volumes = None
     if isinstance(v.get("volumes"), list):
         volumes = [
@@ -76,8 +81,14 @@ def _docker(v):
     return {"containers": containers, "volumes": volumes, "disk_at": _opt(v.get("disk_at"))}
 
 
+def _pct(v, top=100.0):
+    """A percentage clamped to 0..top (older agents could report absurd CPU%)."""
+    return min(max(_num(v), 0.0), top)
+
+
 def normalize(d: dict, max_procs: int) -> dict:
     cpu, mem, net, tasks, dio = (_dict(d.get(k)) for k in ("cpu", "memory", "net", "tasks", "disk_io"))
+    ncpu = max(_int(cpu.get("count"), 1), 1)
     load = [_num(x) for x in _list(d.get("load"))[:3]]
 
     disks = []
@@ -92,7 +103,7 @@ def normalize(d: dict, max_procs: int) -> dict:
             "total": total,
             "used": used,
             "free": _num(x.get("free"), max(total - used, 0)),
-            "percent": _num(x.get("percent")),
+            "percent": _pct(x.get("percent")),
         })
 
     devices = []
@@ -106,7 +117,7 @@ def normalize(d: dict, max_procs: int) -> dict:
             "virtual": bool(x.get("virtual")),
             "read_rate": _num(x.get("read_rate")),
             "write_rate": _num(x.get("write_rate")),
-            "util": _num(x.get("util")),
+            "util": _pct(x.get("util")),
         })
 
     processes = []
@@ -119,8 +130,8 @@ def normalize(d: dict, max_procs: int) -> dict:
             "name": _str(p.get("name"), 64),
             "state": _str(p.get("state"), 4),
             "user": _str(p.get("user"), 64),
-            "cpu": _num(p.get("cpu")),
-            "mem": _num(p.get("mem")),
+            "cpu": _pct(p.get("cpu"), 100.0 * ncpu),  # 100% == one core
+            "mem": _pct(p.get("mem")),
             "rss": _num(p.get("rss")),
             "threads": _int(p.get("threads")),
             "started": _num(p.get("started")),
@@ -141,18 +152,19 @@ def normalize(d: dict, max_procs: int) -> dict:
         "kernel": _str(d.get("kernel")),
         "arch": _str(d.get("arch"), 32),
         "uptime": _num(d.get("uptime"), None),
-        "cpu": {"count": _int(cpu.get("count"), 1), "percent": _num(cpu.get("percent"))},
+        "cpu": {"count": ncpu, "percent": _pct(cpu.get("percent"))},
         "load": load + [0.0] * (3 - len(load)),
-        "memory": {k: _num(mem.get(k)) for k in ("total", "available", "used", "percent", "swap_total", "swap_used")},
+        "memory": {**{k: _num(mem.get(k)) for k in ("total", "available", "used", "swap_total", "swap_used")},
+                   "percent": _pct(mem.get("percent"))},
         "disks": disks,
         "disk_io": {
             "read_rate": _num(dio.get("read_rate")),
             "write_rate": _num(dio.get("write_rate")),
-            "util": _num(dio.get("util")),
+            "util": _pct(dio.get("util")),
             "devices": devices,
         },
         "net": {"rx_rate": _num(net.get("rx_rate")), "tx_rate": _num(net.get("tx_rate"))},
         "tasks": {k: _int(tasks.get(k)) for k in ("total", "running", "sleeping", "zombie", "threads")},
-        "docker": _docker(d.get("docker")),
+        "docker": _docker(d.get("docker"), ncpu),
         "processes": processes,
     }

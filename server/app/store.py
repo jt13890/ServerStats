@@ -29,6 +29,15 @@ METRICS = (
     "cpu", "mem", "swap", "load1", "load5", "load15", "rx", "tx",
     "disk_util", "disk_read", "disk_write", "storage", "procs", "threads",
 )
+# Percentages are clamped when averaged, so bad values that older agents
+# stored can't blow up the charts.
+PERCENT_METRICS = {"cpu", "mem", "swap", "disk_util", "storage"}
+
+
+def _avg(m: str) -> str:
+    return f"AVG(MIN(MAX({m}, 0), 100))" if m in PERCENT_METRICS else f"AVG({m})"
+
+
 # Tiers from finest to coarsest: (table, resolution seconds, rollup marker).
 TIERS = (("history", 0, None), ("history_5m", 300, "m5"), ("history_1h", 3600, "h1"))
 STORAGE_TIERS = (("storage_history", STORAGE_SAMPLE_SECONDS, None), ("storage_1h", 3600, "s1h"))
@@ -188,7 +197,7 @@ class Store:
     def rollup(self, now: float | None = None) -> None:
         """Average finished periods into the coarser tiers. Safe to re-run."""
         now = time.time() if now is None else now
-        avgs = ", ".join(f"AVG({m})" for m in METRICS)
+        avgs = ", ".join(_avg(m) for m in METRICS)
         with self._lock, self._db:
             until = now
             for (src, _, _), (dst, res, key) in zip(TIERS, TIERS[1:]):
@@ -264,7 +273,7 @@ class Store:
         with self._lock:
             union, params = self._union(TIERS, bucket, host, since, ", ".join(METRICS))
             rows = self._db.execute(
-                f"""SELECT CAST(ts / ? AS INTEGER) * ? AS t, {', '.join(f'AVG({m})' for m in METRICS)}
+                f"""SELECT CAST(ts / ? AS INTEGER) * ? AS t, {', '.join(_avg(m) for m in METRICS)}
                     FROM ({union}) GROUP BY 1 ORDER BY 1""",
                 (bucket, bucket, *params),
             ).fetchall()
@@ -288,7 +297,7 @@ class Store:
         keys = ("cpu", "mem", "disk_util", "storage")
         with self._lock:
             rows = self._db.execute(
-                f"""SELECT host, CAST(ts / ? AS INTEGER) * ? AS t, {', '.join(f'AVG({k})' for k in keys)}
+                f"""SELECT host, CAST(ts / ? AS INTEGER) * ? AS t, {', '.join(_avg(k) for k in keys)}
                     FROM history WHERE ts >= ? GROUP BY 1, 2 ORDER BY 1, 2""",
                 (bucket, bucket, since),
             ).fetchall()
