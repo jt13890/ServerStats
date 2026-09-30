@@ -20,7 +20,7 @@ from .schema import normalize
 from .ssh_poller import AGENT_SCRIPT, SSHPoller, load_or_create_key
 from .store import Store
 
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 STATIC = Path(__file__).parent / "static"
 INSTALL_SH = AGENT_SCRIPT.parent / "install.sh"
 MAX_INGEST_BYTES = 4 * 1024 * 1024

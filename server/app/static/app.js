@@ -487,11 +487,43 @@ function renderDetail(name) {
       throw e;
     }
     state.skew = host.server_time - before;
+    if (frozen) return; // viewing history: keep the page still (see freeze)
+    drawLive();
+  }
+
+  function drawLive() {
+    if (!host) return;
     if (!proc.paused) procData = host.processes || [];
     drawHost();
     drawDocker();
     drawProcs();
   }
+
+  // While a past moment is open (a chart point or a picked load peak), the
+  // live parts of the page (tiles, Docker, processes, charts) hold still, so
+  // what's on screen doesn't shift while you compare. Data keeps loading in
+  // the background and shows as soon as you go back to live.
+  let frozen = null; // label of the time being viewed
+  function freeze(t) {
+    frozen = fmtWhen(t);
+    $('#d-paused-text').textContent = `Live updates paused while you look at ${frozen}.`;
+    $('#d-paused').hidden = false;
+    $('#proc-paused').hidden = false;
+  }
+  function unfreeze() {
+    if (!frozen) return;
+    frozen = null;
+    $('#d-paused').hidden = true;
+    $('#proc-paused').hidden = true;
+    drawLive();
+    drawCharts();
+    drawPeaks();
+  }
+  $('#d-resume').addEventListener('click', () => {
+    if (chartPick) closeMoment();
+    pickUser = false; // the Load peaks panel may follow the busiest time again
+    unfreeze();
+  });
 
   let historySeq = 0;
   let historyAt = 0;
@@ -506,7 +538,7 @@ function renderDetail(name) {
       if (seq !== historySeq) return; // a newer range was picked meanwhile
       history = data;
       historyAt = Date.now();
-      drawCharts();
+      if (!frozen || force) drawCharts();
     } finally {
       if (seq === historySeq) charts.forEach((c) => c.classList.remove('loading'));
     }
@@ -903,6 +935,7 @@ function renderDetail(name) {
   async function loadPeaks() {
     const data = await api(`/api/hosts/${enc}/load`);
     week = data;
+    if (frozen) return; // redrawn when going back to live
     const keep = pickUser && pick != null && week.t.includes(pick);
     const before = pick;
     if (!keep) pick = week.peaks.length ? week.peaks[0].t : null;
@@ -914,6 +947,7 @@ function renderDetail(name) {
   function selectMoment(t) {
     pick = t;
     pickUser = true;
+    freeze(t);
     // Redrawing replaces the chart; keep keyboard focus on it.
     const refocus = $('#chart-peaks').contains(document.activeElement);
     drawPeaks();
@@ -982,6 +1016,7 @@ function renderDetail(name) {
   let chartPickSeq = 0;
   async function openMoment(t, span) {
     chartPick = { t, span };
+    freeze(t);
     const card = $('#moment-card');
     const body = $('#moment-body');
     // Redrawing replaces the charts; keep keyboard focus where it was.
@@ -1002,11 +1037,15 @@ function renderDetail(name) {
     }
     if (!focused) card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
-  $('#moment-close').addEventListener('click', () => {
+  function closeMoment() {
     chartPick = null;
     ++chartPickSeq;
     $('#moment-card').hidden = true;
-    drawCharts();
+  }
+  $('#moment-close').addEventListener('click', () => {
+    closeMoment();
+    // Back to live, unless a picked load peak is still being looked at.
+    if (pickUser) { freeze(pick); drawCharts(); } else unfreeze();
   });
 
   state.redraw = () => { drawCharts(); drawPeaks(); };
@@ -1695,6 +1734,8 @@ async function boot() {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => state.redraw && state.redraw(), 150);
   });
+  // A chart tooltip is placed where the pointer was; scrolling leaves it behind.
+  window.addEventListener('scroll', () => { $('#tooltip').hidden = true; }, { passive: true });
   // Polling pauses while the tab is hidden; catch up as soon as it's visible.
   document.addEventListener('visibilitychange', () => { if (!document.hidden) state.ticks.forEach((t) => t()); });
   route();
