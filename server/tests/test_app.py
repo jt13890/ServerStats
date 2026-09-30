@@ -358,9 +358,23 @@ def test_docker_payload_is_normalized(client):
     assert client.get("/api/hosts/alpha", headers=USER).json()["docker"] == {"error": "no permission"}
 
 
-def test_ui_is_revalidated(client):
-    assert client.get("/", headers=USER).headers["cache-control"] == "no-cache"
-    assert client.get("/static/app.js", headers=USER).headers["cache-control"] == "no-cache"
+def test_ui_is_never_stale(client):
+    import hashlib
+    import re
+
+    from app.main import STATIC
+
+    page = client.get("/", headers=USER)
+    assert page.headers["cache-control"] == "no-store"
+    # Script and stylesheet URLs carry a hash of their contents, so a new
+    # release is a new URL that no cache along the way can have.
+    for name in ("app.js", "style.css"):
+        digest = hashlib.sha256((STATIC / name).read_bytes()).hexdigest()[:12]
+        assert f'"/static/{name}?v={digest}"' in page.text
+        assert f'"/static/{name}"' not in page.text
+    url = re.search(r'src="(/static/app\.js\?v=[0-9a-f]+)"', page.text).group(1)
+    js = client.get(url, headers=USER)
+    assert js.status_code == 200 and js.headers["cache-control"] == "no-cache"
     assert "cache-control" not in client.get("/api/hosts", headers=USER).headers
 
 
