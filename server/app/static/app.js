@@ -194,22 +194,33 @@ function meter(label, pct, title, trend, valueText) {
     h('span', { class: 'meter-value', text: valueText || fmtPct(pct) }));
 }
 
-// Overall load (see load_of on the server): one bar out of 100%, split into
-// a colored segment per resource, so it's clear what drives it.
+// Overall load (see load_of on the server): the busiest resource sets it, so
+// anything at 100% reads 100%; the others add more the busier they are, and
+// past 100% the host is overloaded. Drawn as one bar split into a colored
+// segment per resource, so it's clear what drives it.
 const LOAD_PARTS = [
   ['cpu', 'CPU', 'CPU'], ['mem', 'Memory', 'memory'], ['disk_util', 'Disk I/O', 'disk I/O'], ['storage', 'Storage', 'storage'],
 ];
+const OVERLOADED = 100.5; // shows as 101% or more
+const isOver = (load) => load != null && load >= OVERLOADED;
+const overBadge = () => h('span', { class: 'over-badge', text: '⚠ Overloaded' });
+const LOAD_EXPLAINED = 'The busiest resource sets the load, so anything at 100% means 100%. '
+  + 'The others add more the busier they are; over 100% means overloaded (several resources near their limit at once).';
 const topPart = (parts) => LOAD_PARTS.filter(([k]) => parts[k] > 0).sort((a, b) => parts[b[0]] - parts[a[0]])[0];
 
 function loadTrack(parts, label, load) {
+  const over = isOver(load);
   const track = h('div', {
-    class: 'meter-track load-track', role: 'meter', 'aria-valuemin': 0, 'aria-valuemax': 100,
-    'aria-valuenow': load == null ? 0 : load, 'aria-label': label,
+    class: 'meter-track load-track' + (over ? ' is-over' : ''), role: 'meter', 'aria-valuemin': 0,
+    'aria-valuemax': Math.max(100, Math.round(load || 0)), 'aria-valuenow': load == null ? 0 : load,
+    'aria-label': over ? `${label}, overloaded` : label,
   });
+  // Past 100% the bar is full; the segments keep their proportions.
+  const scale = load > 100 ? 100 / load : 1;
   for (const [k] of LOAD_PARTS) {
     if (!(parts && parts[k] > 0)) continue;
     const seg = h('div', { class: 'load-seg', 'data-part': k });
-    seg.style.width = Math.min(100, parts[k]) + '%';
+    seg.style.width = Math.min(100, parts[k] * scale) + '%';
     track.append(seg);
   }
   return track;
@@ -230,13 +241,14 @@ function loadMeter(score, kind) {
   if (score) {
     const top = topPart(score.parts);
     caption = top && score.load >= 1 ? `Mostly ${top[2]}` : 'Idle';
+    if (isOver(score.load)) caption = `⚠ Overloaded · ${top[2]}`;
     if (score.hours < full) caption += ` · ${fmtSpan(score.hours)}`; // newer hosts: say how much data this is
     const span = score.hours < full ? fmtSpan(score.hours) : high ? '7 days' : '3 days';
     title = (high
       ? `Peak load: the busiest 1% of the past ${span} (the top ${score.slots} five-minute stretches, `
         + `${fmtSpan(score.slots / 12)} in all), averaged. Open the host to see what caused it.\n`
-      : `Overall load, averaged over the past ${span}. Busier resources count for more, `
-        + 'so one maxed-out resource shows as high load even if the rest are idle.\n')
+      : `Overall load, averaged over the past ${span}. `) + LOAD_EXPLAINED + '\n'
+      + (isOver(score.load) ? 'Overloaded.\n' : '')
       + LOAD_PARTS.map(([k, name]) => `${name}: adds ${fmtPct(score.parts[k])}`
         + (score.avg ? ` (average ${fmtPct(score.avg[k])} used)` : '')).join('\n');
   }
@@ -244,7 +256,7 @@ function loadMeter(score, kind) {
     h('span', { class: 'meter-label' }, label, h('small', { text: sub })),
     h('div', { class: 'meter-viz' }, h('span', { class: 'load-caption', text: caption }),
       loadTrack(score && score.parts, high ? 'Peak load, past week' : 'Overall load', score && score.load)),
-    h('span', { class: 'meter-value', text: score ? fmtPct(score.load) : '—' }));
+    h('span', { class: 'meter-value' + (score && isOver(score.load) ? ' is-over' : ''), text: score ? fmtPct(score.load) : '—' }));
 }
 
 // Last-hour trend on a fixed 0-100% scale, so hosts compare honestly.
@@ -919,12 +931,17 @@ function renderDetail(name) {
     const avgParts = {};
     for (const [k] of LOAD_PARTS) avgParts[k] = recent.reduce((a, i) => a + (week.parts[k][i] || 0), 0) / (recent.length || 1);
     const mostly = (parts) => { const top = topPart(parts); return top ? `mostly ${top[2]}` : 'idle'; };
+    const loadTile = (label, load, sub) => {
+      const t = tile(label, fmtPct(load), isOver(load) ? `⚠ Overloaded · ${sub}` : sub);
+      t.classList.toggle('is-over', isOver(load));
+      return t;
+    };
     const hi = week.high1;
     const peak = week.peaks[0];
     stats.replaceChildren(
-      tile('Load · 3-day average', fmtPct(avg3), avg3 == null ? 'no data in the past 3 days' : mostly(avgParts)),
-      tile('1% high · 7 days', fmtPct(hi.load), `${mostly(hi.parts)} · busiest ${fmtSpan(hi.slots / 12)} averaged`),
-      tile('Busiest 5 minutes', peak ? fmtPct(peak.load) : '—', peak ? fmtWhen(peak.t) : ''),
+      loadTile('Load · 3-day average', avg3, avg3 == null ? 'no data in the past 3 days' : mostly(avgParts)),
+      loadTile('1% high · 7 days', hi.load, `${mostly(hi.parts)} · busiest ${fmtSpan(hi.slots / 12)} averaged`),
+      loadTile('Busiest 5 minutes', peak ? peak.load : null, peak ? fmtWhen(peak.t) : ''),
     );
 
     loadChart($('#chart-peaks'), { week, x0: now - week.days * 86400, x1: now, pick, onPick: selectMoment });
@@ -932,9 +949,9 @@ function renderDetail(name) {
     chips.replaceChildren(
       h('span', { class: 'muted', text: 'Busiest times:' }),
       ...week.peaks.map((p) => h('button', {
-        class: 'chip', type: 'button', 'aria-pressed': String(p.t === pick),
+        class: 'chip' + (isOver(p.load) ? ' is-over' : ''), type: 'button', 'aria-pressed': String(p.t === pick),
         onclick: () => selectMoment(p.t),
-      }, fmtWhen(p.t), ' ', h('b', { text: fmtPct(p.load) }))));
+      }, fmtWhen(p.t), ' ', h('b', { text: (isOver(p.load) ? '⚠ ' : '') + fmtPct(p.load) }))));
   }
 
   async function loadMoment(t) {
@@ -969,7 +986,7 @@ function renderDetail(name) {
       h('div', { class: 'moment-head' },
         h('h3', { text: `${fmtWhen(t)}–${fmtClock(t + week.slot, false)}` }),
         h('span', { class: 'muted', text: 'load ' }), h('b', { text: fmtPct(load) }),
-        h('span', { class: 'muted', text: ' (5-minute average)' })),
+        h('span', { class: 'muted', text: ' (5-minute average)' }), isOver(load) ? overBadge() : null),
       loadTrack(parts, 'Load at this time', load),
       breakdown,
     ];
@@ -1045,7 +1062,10 @@ function loadChart(container, opts) {
   const iw = W - M.l - M.r;
   const ih = H - M.t - M.b;
   const X = (t) => M.l + ((Math.min(Math.max(t, x0), x1) - x0) / (x1 - x0)) * iw;
-  const Y = (v) => M.t + ih - (Math.min(Math.max(v, 0), 100) / 100) * ih;
+  // 0-100%, stretched to fit overloaded times (up to 200%).
+  const maxLoad = Math.max(0, ...week.load);
+  const top = maxLoad >= OVERLOADED ? Math.ceil(maxLoad / 25) * 25 : 100;
+  const Y = (v) => M.t + ih - (Math.min(Math.max(v, 0), top) / top) * ih;
   const slot = week.slot;
   const n = week.t.length;
   const hi = week.high1;
@@ -1062,8 +1082,15 @@ function loadChart(container, opts) {
   });
   container.append(root);
 
-  for (const v of [0, 25, 50, 75, 100]) {
-    root.append(svg('line', { class: v === 0 ? 'baseline' : 'grid', x1: M.l, x2: W - M.r, y1: Y(v), y2: Y(v) }));
+  if (top > 100) {
+    root.append(svg('rect', { class: 'over-zone', x: M.l, y: Y(top), width: iw, height: Y(100) - Y(top) }));
+    const t = svg('text', { class: 'over-label', x: M.l + 6, y: Y(top) + 13 });
+    t.textContent = '⚠ Overloaded';
+    root.append(t);
+  }
+  const step = top > 150 ? 50 : 25;
+  for (let v = 0; v <= top; v += step) {
+    root.append(svg('line', { class: v === 0 ? 'baseline' : v === 100 && top > 100 ? 'full-line' : 'grid', x1: M.l, x2: W - M.r, y1: Y(v), y2: Y(v) }));
     const label = svg('text', { class: 'tick', x: M.l - 8, y: Y(v) + 4, 'text-anchor': 'end' });
     label.textContent = `${v}%`;
     root.append(label);
@@ -1124,7 +1151,8 @@ function loadChart(container, opts) {
     cross.setAttribute('visibility', 'visible');
     tip.replaceChildren(
       h('div', { class: 'tt-time', text: `${fmtWhen(t)}–${fmtClock(t + slot, false)}` }),
-      h('div', { class: 'tt-row' }, h('span', { class: 'key key-blank' }), h('b', { text: fmtPct(week.load[idx]) }), h('span', { text: 'Load' })),
+      h('div', { class: 'tt-row' }, h('span', { class: 'key key-blank' }), h('b', { text: fmtPct(week.load[idx]) }),
+        h('span', { text: isOver(week.load[idx]) ? '⚠ Load · overloaded' : 'Load' })),
       ...LOAD_PARTS.map(([k, name]) => h('div', { class: 'tt-row', 'data-part': k },
         h('span', { class: 'swatch' }), h('b', { text: `+${fmtPct(week.parts[k][idx])}` }),
         h('span', { text: `${name} · ${fmtPct(week.values[k][idx])} used` }))),

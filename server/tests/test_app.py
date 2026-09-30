@@ -648,19 +648,48 @@ def test_load_score_weights_busy_resources(tmp_path):
         put("sparse", t, 20, 20, 0, 60 if k % 4 == 0 else None)
     put("old", now - 5 * 86400, 99, 99, 99, 99)  # outside the 3-day window
 
+    from app.store import load_of
+
     hosts = store.load_scores()["hosts"]
     assert "load" not in hosts["old"]  # nothing in the 3-day window...
-    assert hosts["old"]["high1"]["load"] == 99  # ...but it counts toward the week's 1% high
+    assert hosts["old"]["high1"]["load"] == pytest.approx(195.1, abs=0.1)  # ...but it counts toward the week's 1% high (overloaded)
     p = hosts["pegged"]
-    assert p["load"] == pytest.approx((90**2 + 3 * 10**2) / 120, abs=0.1)  # 70%, not the plain mean of 30%
-    assert p["load"] > 60 and p["parts"]["cpu"] > 3 * p["parts"]["mem"]
+    assert p["load"] == pytest.approx(90, abs=0.1)  # the busiest resource, not the plain mean of 30%
+    assert p["parts"]["cpu"] == 90 and p["parts"]["mem"] < 0.1
     assert sum(p["parts"].values()) == pytest.approx(p["load"], abs=0.2)
     assert p["avg"]["cpu"] == 90 and 23 <= p["hours"] <= 25
-    assert hosts["even"]["load"] == 50
+    assert hosts["even"]["load"] == pytest.approx(load_of({k: 50 for k in ("cpu", "mem", "disk_util", "storage")})[0], abs=0.1)
     assert hosts["idle"]["load"] == 0
     s = hosts["sparse"]
-    assert s["load"] == pytest.approx((20**2 * 2 + 60**2) / 100, abs=0.5)
-    assert s["parts"]["storage"] == pytest.approx(36, abs=0.5)
+    # Storage is carried forward, so it's the busiest resource in every slot
+    # (except the first few, before any storage report).
+    assert s["load"] == pytest.approx(60, abs=1) and s["parts"]["storage"] == pytest.approx(60, abs=1)
+
+
+def test_load_formula():
+    from app.store import load_of
+
+    def load(cpu, mem, disk, storage):
+        return load_of({"cpu": cpu, "mem": mem, "disk_util": disk, "storage": storage})[0]
+
+    # Anything at 100% means the server is at 100%, however idle the rest is.
+    assert load(0, 0, 0, 100) == 100
+    assert load(3, 10, 1, 100) == pytest.approx(100, abs=0.1)
+    assert load(100, 0, 0, 0) == 100
+    # The busiest resource sets the load; others add more the busier they are.
+    assert load(90, 10, 10, 10) == pytest.approx(90, abs=0.1)
+    assert 50 < load(50, 50, 50, 50) < 60
+    assert 90 < load(70, 70, 70, 70) < 100  # busy everywhere, but not overloaded
+    assert load(70, 60, 10, 10) > load(70, 10, 10, 10)
+    # Several resources at their limit at once: over 100% = overloaded.
+    assert load(100, 90, 10, 40) > 120
+    assert load(100, 100, 100, 100) == pytest.approx(200)  # the most it can be
+    # Out-of-range and missing values.
+    assert load(-5, 150, None, None) == 100
+    assert load_of({}) == (0.0, {})
+    # What each resource adds stacks up to the load.
+    total, parts = load_of({"cpu": 100, "mem": 90, "disk_util": 10, "storage": 40})
+    assert sum(parts.values()) == pytest.approx(total) and parts["cpu"] == 100 and parts["mem"] > parts["storage"]
 
 
 def test_trends_include_load_scores(client):
@@ -697,9 +726,11 @@ def test_one_percent_high_and_peaks(tmp_path):
     assert sorted(week["t"]) == week["t"]
     hi = week["high1"]
     assert hi["slots"] == math.ceil(len(week["t"]) * 0.01)  # ~21 slots
-    spike = (100**2 + 3 * 10**2) / 130
-    busy = (80**2 + 3 * 10**2) / 110
-    base = 10.0
+    from app.store import load_of
+
+    spike = load_of({"cpu": 100, "mem": 10, "disk_util": 10, "storage": 10})[0]
+    busy = load_of({"cpu": 80, "mem": 10, "disk_util": 10, "storage": 10})[0]
+    base = load_of({"cpu": 10, "mem": 10, "disk_util": 10, "storage": 10})[0]
     expected = (3 * spike + busy + (hi["slots"] - 4) * base) / hi["slots"]
     assert hi["load"] == pytest.approx(expected, abs=0.2)
     assert sum(hi["parts"].values()) == pytest.approx(hi["load"], abs=0.3)
