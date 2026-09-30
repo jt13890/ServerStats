@@ -36,8 +36,9 @@ METRICS = (
 # Percentages are clamped when averaged, so bad values that older agents
 # stored can't blow up the charts.
 PERCENT_METRICS = {"cpu", "mem", "swap", "disk_util", "storage"}
-# Components of a host's overall load score (see load_of). Over 100 = overloaded.
-LOAD_PARTS = ("cpu", "mem", "disk_util", "storage")
+# Components of a host's overall load score (see load_of).
+# Storage isn't part of it: a full disk has its own meter, and it's not load.
+LOAD_PARTS = ("cpu", "mem", "disk_util")
 LOAD_HOURS = RAW_DAYS * 24  # the "Load · 3d" average
 PEAK_DAYS = 7               # the "1% high" and the load peaks section
 SLOT = 300                  # load is scored per 5-minute slot
@@ -95,23 +96,28 @@ def metrics_from_sample(data: dict) -> dict:
 
 
 def load_of(u: dict) -> tuple[float, dict]:
-    """Overall load from component percentages, plus what each one adds.
+    """Overall load (0-100) from component percentages, and each one's share.
 
-    The busiest component sets the base: anything at 100% (a full disk, a
-    pegged CPU) means the server is at 100%. Every other component adds
-    u * (u/100)^3 divided by how many others there are, so it adds more the
-    busier it is: with the usual four components, next to nothing when
-    idle, 2 points at 50%, 8 at 70%, 22 at 90%. The load only goes past 100%
-    (overloaded) when several things are near their limit at once. What
-    each component adds stacks up to the load.
+    Sandpiper's "volume" (Wood et al., NSDI 2007) combines resources as
+    V = 1/((1-cpu)(1-mem)(1-disk)): it grows the more heavily any resource
+    is used, and faster still when several are. As a percentage that's
+    load = 100 * (1 - 1/V) = 100 * (1 - (1-cpu)(1-mem)(1-disk)), which
+    reads 100% exactly when something is maxed out.
+
+    Each resource's share is its factor in V, -ln(1-u), as a fraction of
+    ln V. Like queueing delay it grows sharply the closer a resource is to
+    full, yet a quieter one still gets a visible share. The shares add up
+    to the load.
     """
     vals = {k: min(max(v, 0.0), 100.0) for k, v in u.items() if k in LOAD_PARTS and _num(v) is not None}
     if not vals:
         return 0.0, {}
-    top = max(vals, key=vals.get)
-    others = max(len(vals) - 1, 1)
-    parts = {k: (v if k == top else v * (v / 100) ** 3 / others) for k, v in vals.items()}
-    return sum(parts.values()), parts
+    free = math.prod(1 - v / 100 for v in vals.values())
+    load = 100 * (1 - free)
+    # 99.9% stands in for 100% so a maxed-out resource has a finite weight.
+    weight = {k: 0.0 - math.log(1 - min(v, 99.9) / 100) for k, v in vals.items()}  # (0.0 - avoids -0.0)
+    total = sum(weight.values())
+    return load, {k: (load * w / total if total > 0 else 0.0) for k, w in weight.items()}
 
 
 def _group_stacks(containers: list) -> list:
@@ -472,14 +478,8 @@ class Store:
                 (since, mark, *([host] if host else []), mark, *([host] if host else [])),
             ).fetchall()
         out: dict[str, list] = {}
-        last_storage: dict[str, float] = {}
         for h, slot, *vals in rows:
             u = dict(zip(LOAD_PARTS, vals))
-            # Filesystem usage is sampled less often; carry the last value forward.
-            if u["storage"] is None:
-                u["storage"] = last_storage.get(h)
-            else:
-                last_storage[h] = u["storage"]
             if all(v is None for v in u.values()):
                 continue
             load, parts = load_of(u)
@@ -553,7 +553,12 @@ class Store:
             ).fetchone()
         if row is None:
             return None
-        return {"ts": row[0], **json.loads(zlib.decompress(row[1]))}
+        snap = json.loads(zlib.decompress(row[1]))
+        # Re-score from the stored values, so moments saved under an older
+        # load formula read the same as everything else.
+        load, parts = load_of(snap.get("values") or {})
+        snap.update(load=round(load, 1), parts={k: round(v, 1) for k, v in parts.items()})
+        return {"ts": row[0], **snap}
 
     def trends(self, hours: float = 1.0, points: int = 60) -> dict:
         """Recent CPU/memory/disk/storage for every host (overview sparklines)."""

@@ -194,33 +194,34 @@ function meter(label, pct, title, trend, valueText) {
     h('span', { class: 'meter-value', text: valueText || fmtPct(pct) }));
 }
 
-// Overall load (see load_of on the server): the busiest resource sets it, so
-// anything at 100% reads 100%; the others add more the busier they are, and
-// past 100% the host is overloaded. Drawn as one bar split into a colored
-// segment per resource, so it's clear what drives it.
+// Overall load (see load_of on the server): Sandpiper's volume as a
+// percentage, 100 * (1 - (1-cpu)(1-mem)(1-disk)), so it's 100% when
+// something is maxed out. Drawn as one bar split into a colored segment per
+// resource, so it's clear what drives it.
 const LOAD_PARTS = [
-  ['cpu', 'CPU', 'CPU'], ['mem', 'Memory', 'memory'], ['disk_util', 'Disk I/O', 'disk I/O'], ['storage', 'Storage', 'storage'],
+  ['cpu', 'CPU', 'CPU'], ['mem', 'Memory', 'memory'], ['disk_util', 'Disk I/O', 'disk I/O'],
 ];
-const OVERLOADED = 100.5; // shows as 101% or more
-const isOver = (load) => load != null && load >= OVERLOADED;
-const overBadge = () => h('span', { class: 'over-badge', text: '⚠ Overloaded' });
-const LOAD_EXPLAINED = 'The busiest resource sets the load, so anything at 100% means 100%. '
-  + 'The others add more the busier they are; over 100% means overloaded (several resources near their limit at once).';
+const FULL = 99.5; // shows as 100%
+const isFull = (load) => load != null && load >= FULL;
+const fullBadge = () => h('span', { class: 'full-badge', text: '⚠ Full' });
+const LOAD_EXPLAINED = "Load combines CPU, memory and disk I/O the way Sandpiper's \"volume\" does: "
+  + '100% × (1 − (1−CPU)(1−memory)(1−disk)). The busier any of them, the higher it goes, faster when several are busy, '
+  + "and it's 100% (full) when one is maxed out. Storage isn't counted.";
+// Each resource's share of the load, as a percentage of it.
+const shareOf = (part, load) => (load > 0 ? (100 * (part || 0)) / load : 0);
 const topPart = (parts) => LOAD_PARTS.filter(([k]) => parts[k] > 0).sort((a, b) => parts[b[0]] - parts[a[0]])[0];
 
 function loadTrack(parts, label, load) {
-  const over = isOver(load);
+  const full = isFull(load);
   const track = h('div', {
-    class: 'meter-track load-track' + (over ? ' is-over' : ''), role: 'meter', 'aria-valuemin': 0,
-    'aria-valuemax': Math.max(100, Math.round(load || 0)), 'aria-valuenow': load == null ? 0 : load,
-    'aria-label': over ? `${label}, overloaded` : label,
+    class: 'meter-track load-track' + (full ? ' is-full' : ''), role: 'meter', 'aria-valuemin': 0,
+    'aria-valuemax': 100, 'aria-valuenow': load == null ? 0 : load,
+    'aria-label': full ? `${label}, full` : label,
   });
-  // Past 100% the bar is full; the segments keep their proportions.
-  const scale = load > 100 ? 100 / load : 1;
   for (const [k] of LOAD_PARTS) {
     if (!(parts && parts[k] > 0)) continue;
     const seg = h('div', { class: 'load-seg', 'data-part': k });
-    seg.style.width = Math.min(100, parts[k] * scale) + '%';
+    seg.style.width = Math.min(100, parts[k]) + '%';
     track.append(seg);
   }
   return track;
@@ -241,22 +242,22 @@ function loadMeter(score, kind) {
   if (score) {
     const top = topPart(score.parts);
     caption = top && score.load >= 1 ? `Mostly ${top[2]}` : 'Idle';
-    if (isOver(score.load)) caption = `⚠ Overloaded · ${top[2]}`;
+    if (isFull(score.load)) caption = `⚠ Full · ${top[2]}`;
     if (score.hours < full) caption += ` · ${fmtSpan(score.hours)}`; // newer hosts: say how much data this is
     const span = score.hours < full ? fmtSpan(score.hours) : high ? '7 days' : '3 days';
     title = (high
       ? `Peak load: the busiest 1% of the past ${span} (the top ${score.slots} five-minute stretches, `
         + `${fmtSpan(score.slots / 12)} in all), averaged. Open the host to see what caused it.\n`
       : `Overall load, averaged over the past ${span}. `) + LOAD_EXPLAINED + '\n'
-      + (isOver(score.load) ? 'Overloaded.\n' : '')
-      + LOAD_PARTS.map(([k, name]) => `${name}: adds ${fmtPct(score.parts[k])}`
+      + (isFull(score.load) ? 'Full: something is maxed out.\n' : '')
+      + LOAD_PARTS.map(([k, name]) => `${name}: ${fmtPct(shareOf(score.parts[k], score.load))} of it`
         + (score.avg ? ` (average ${fmtPct(score.avg[k])} used)` : '')).join('\n');
   }
   return h('div', { class: 'meter meter-load', title },
     h('span', { class: 'meter-label' }, label, h('small', { text: sub })),
     h('div', { class: 'meter-viz' }, h('span', { class: 'load-caption', text: caption }),
       loadTrack(score && score.parts, high ? 'Peak load, past week' : 'Overall load', score && score.load)),
-    h('span', { class: 'meter-value' + (score && isOver(score.load) ? ' is-over' : ''), text: score ? fmtPct(score.load) : '—' }));
+    h('span', { class: 'meter-value' + (score && isFull(score.load) ? ' is-full' : ''), text: score ? fmtPct(score.load) : '—' }));
 }
 
 // Last-hour trend on a fixed 0-100% scale, so hosts compare honestly.
@@ -932,8 +933,8 @@ function renderDetail(name) {
     for (const [k] of LOAD_PARTS) avgParts[k] = recent.reduce((a, i) => a + (week.parts[k][i] || 0), 0) / (recent.length || 1);
     const mostly = (parts) => { const top = topPart(parts); return top ? `mostly ${top[2]}` : 'idle'; };
     const loadTile = (label, load, sub) => {
-      const t = tile(label, fmtPct(load), isOver(load) ? `⚠ Overloaded · ${sub}` : sub);
-      t.classList.toggle('is-over', isOver(load));
+      const t = tile(label, fmtPct(load), isFull(load) ? `⚠ Full · ${sub}` : sub);
+      t.classList.toggle('is-full', isFull(load));
       return t;
     };
     const hi = week.high1;
@@ -949,9 +950,9 @@ function renderDetail(name) {
     chips.replaceChildren(
       h('span', { class: 'muted', text: 'Busiest times:' }),
       ...week.peaks.map((p) => h('button', {
-        class: 'chip' + (isOver(p.load) ? ' is-over' : ''), type: 'button', 'aria-pressed': String(p.t === pick),
+        class: 'chip' + (isFull(p.load) ? ' is-full' : ''), type: 'button', 'aria-pressed': String(p.t === pick),
         onclick: () => selectMoment(p.t),
-      }, fmtWhen(p.t), ' ', h('b', { text: (isOver(p.load) ? '⚠ ' : '') + fmtPct(p.load) }))));
+      }, fmtWhen(p.t), ' ', h('b', { text: (isFull(p.load) ? '⚠ ' : '') + fmtPct(p.load) }))));
   }
 
   async function loadMoment(t) {
@@ -980,13 +981,13 @@ function renderDetail(name) {
         h('span', { class: 'swatch' }),
         h('span', { text: name }),
         h('b', { text: values[k] == null ? '—' : `${fmtPct(values[k])} used` }),
-        h('span', { class: 'muted', text: `adds ${fmtPct(parts[k])}` }))));
+        h('span', { class: 'muted', text: `${fmtPct(shareOf(parts[k], load))} of the load` }))));
 
     const kids = [
       h('div', { class: 'moment-head' },
         h('h3', { text: `${fmtWhen(t)}–${fmtClock(t + week.slot, false)}` }),
         h('span', { class: 'muted', text: 'load ' }), h('b', { text: fmtPct(load) }),
-        h('span', { class: 'muted', text: ' (5-minute average)' }), isOver(load) ? overBadge() : null),
+        h('span', { class: 'muted', text: ' (5-minute average)' }), isFull(load) ? fullBadge() : null),
       loadTrack(parts, 'Load at this time', load),
       breakdown,
     ];
@@ -1062,10 +1063,7 @@ function loadChart(container, opts) {
   const iw = W - M.l - M.r;
   const ih = H - M.t - M.b;
   const X = (t) => M.l + ((Math.min(Math.max(t, x0), x1) - x0) / (x1 - x0)) * iw;
-  // 0-100%, stretched to fit overloaded times (up to 200%).
-  const maxLoad = Math.max(0, ...week.load);
-  const top = maxLoad >= OVERLOADED ? Math.ceil(maxLoad / 25) * 25 : 100;
-  const Y = (v) => M.t + ih - (Math.min(Math.max(v, 0), top) / top) * ih;
+  const Y = (v) => M.t + ih - (Math.min(Math.max(v, 0), 100) / 100) * ih;
   const slot = week.slot;
   const n = week.t.length;
   const hi = week.high1;
@@ -1082,15 +1080,8 @@ function loadChart(container, opts) {
   });
   container.append(root);
 
-  if (top > 100) {
-    root.append(svg('rect', { class: 'over-zone', x: M.l, y: Y(top), width: iw, height: Y(100) - Y(top) }));
-    const t = svg('text', { class: 'over-label', x: M.l + 6, y: Y(top) + 13 });
-    t.textContent = '⚠ Overloaded';
-    root.append(t);
-  }
-  const step = top > 150 ? 50 : 25;
-  for (let v = 0; v <= top; v += step) {
-    root.append(svg('line', { class: v === 0 ? 'baseline' : v === 100 && top > 100 ? 'full-line' : 'grid', x1: M.l, x2: W - M.r, y1: Y(v), y2: Y(v) }));
+  for (const v of [0, 25, 50, 75, 100]) {
+    root.append(svg('line', { class: v === 0 ? 'baseline' : 'grid', x1: M.l, x2: W - M.r, y1: Y(v), y2: Y(v) }));
     const label = svg('text', { class: 'tick', x: M.l - 8, y: Y(v) + 4, 'text-anchor': 'end' });
     label.textContent = `${v}%`;
     root.append(label);
@@ -1152,10 +1143,10 @@ function loadChart(container, opts) {
     tip.replaceChildren(
       h('div', { class: 'tt-time', text: `${fmtWhen(t)}–${fmtClock(t + slot, false)}` }),
       h('div', { class: 'tt-row' }, h('span', { class: 'key key-blank' }), h('b', { text: fmtPct(week.load[idx]) }),
-        h('span', { text: isOver(week.load[idx]) ? '⚠ Load · overloaded' : 'Load' })),
+        h('span', { text: isFull(week.load[idx]) ? '⚠ Load · full' : 'Load' })),
       ...LOAD_PARTS.map(([k, name]) => h('div', { class: 'tt-row', 'data-part': k },
-        h('span', { class: 'swatch' }), h('b', { text: `+${fmtPct(week.parts[k][idx])}` }),
-        h('span', { text: `${name} · ${fmtPct(week.values[k][idx])} used` }))),
+        h('span', { class: 'swatch' }), h('b', { text: fmtPct(shareOf(week.parts[k][idx], week.load[idx])) }),
+        h('span', { text: `${name}'s share · ${fmtPct(week.values[k][idx])} used` }))),
       h('div', { class: 'tt-hint', text: 'Click to see what was running' }));
     tip.hidden = false;
     const rect = root.getBoundingClientRect();
