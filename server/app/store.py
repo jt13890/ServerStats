@@ -36,7 +36,7 @@ METRICS = (
 # Percentages are clamped when averaged, so bad values that older agents
 # stored can't blow up the charts.
 PERCENT_METRICS = {"cpu", "mem", "swap", "disk_util", "storage"}
-# Components of a host's overall load score (see load_of).
+# Components of a host's overall load score (see load_of). Over 100 = overloaded.
 LOAD_PARTS = ("cpu", "mem", "disk_util", "storage")
 LOAD_HOURS = RAW_DAYS * 24  # the "Load · 3d" average
 PEAK_DAYS = 7               # the "1% high" and the load peaks section
@@ -95,16 +95,22 @@ def metrics_from_sample(data: dict) -> dict:
 
 
 def load_of(u: dict) -> tuple[float, dict]:
-    """Overall load (0-100) from component percentages, plus each one's share.
+    """Overall load from component percentages, plus what each one adds.
 
-    Each component is weighted by its own value, so load = sum(u^2) / sum(u)
-    and the busiest one dominates: one pegged resource reads high even if the
-    rest are idle. A component's share, u^2 / sum(u), is what it adds to the
-    total, so the shares stack up to the load.
+    The busiest component sets the base: anything at 100% (a full disk, a
+    pegged CPU) means the server is at 100%. Every other component adds
+    u * (u/100)^3 divided by how many others there are, so it adds more the
+    busier it is: with the usual four components, next to nothing when
+    idle, 2 points at 50%, 8 at 70%, 22 at 90%. The load only goes past 100%
+    (overloaded) when several things are near their limit at once. What
+    each component adds stacks up to the load.
     """
     vals = {k: min(max(v, 0.0), 100.0) for k, v in u.items() if k in LOAD_PARTS and _num(v) is not None}
-    total = sum(vals.values())
-    parts = {k: (v * v / total if total > 0 else 0.0) for k, v in vals.items()}
+    if not vals:
+        return 0.0, {}
+    top = max(vals, key=vals.get)
+    others = max(len(vals) - 1, 1)
+    parts = {k: (v if k == top else v * (v / 100) ** 3 / others) for k, v in vals.items()}
     return sum(parts.values()), parts
 
 

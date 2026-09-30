@@ -414,3 +414,13 @@ td .meter { grid-template-columns: 1fr 52px; }
 .btn-danger:disabled:hover { filter: none; }
 .topbar .btn { white-space: nowrap; }
 @media (max-width: 440px) { .topbar .user { display: none; } }
+
+/* overloaded: past 100% load (status color, always with the ⚠ label) */
+.load-track.is-over { outline: 2px solid var(--critical); outline-offset: 1px; }
+.meter-value.is-over, .tile.is-over .tile-value { color: var(--critical); }
+.tile.is-over { border-color: var(--critical); }
+.chip.is-over b { color: var(--critical); }
+.over-badge { color: var(--critical); font-weight: 600; font-size: 12.5px; margin-left: 6px; }
+.chart .over-zone { fill: var(--critical-bg); }
+.chart .over-label { fill: var(--critical); font-size: 11px; font-weight: 600; }
+.chart .full-line { stroke: var(--critical); stroke-width: 1; stroke-dasharray: 2 3; }
