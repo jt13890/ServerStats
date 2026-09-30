@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
@@ -20,7 +20,7 @@ from .schema import normalize
 from .ssh_poller import AGENT_SCRIPT, SSHPoller, load_or_create_key
 from .store import Store
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 STATIC = Path(__file__).parent / "static"
 INSTALL_SH = AGENT_SCRIPT.parent / "install.sh"
 MAX_INGEST_BYTES = 4 * 1024 * 1024
@@ -146,7 +146,10 @@ async def auth_and_headers(request: Request, call_next):
             status_code=401,
         )
     response = await call_next(request)
-    if path == "/" or path.startswith("/static/"):
+    if path == "/":
+        # Never cache the page: it names the current app.js/style.css versions.
+        response.headers["Cache-Control"] = "no-store"
+    elif path.startswith("/static/"):
         # Revalidate on every load so an update never leaves a stale UI.
         response.headers["Cache-Control"] = "no-cache"
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -491,9 +494,23 @@ async def healthz():
 
 # -- static UI -------------------------------------------------------------
 
+def _index_html() -> str:
+    """index.html with the script and stylesheet URLs tagged with a hash of
+    their contents, so browsers (and any cache in between) pick up a new
+    release instead of running a stale app.js against the new server."""
+    html = (STATIC / "index.html").read_text()
+    for name in ("app.js", "style.css"):
+        digest = hashlib.sha256((STATIC / name).read_bytes()).hexdigest()[:12]
+        html = html.replace(f'"/static/{name}"', f'"/static/{name}?v={digest}"')
+    return html
+
+
+INDEX_HTML = _index_html()
+
+
 @app.get("/")
 async def index():
-    return FileResponse(STATIC / "index.html")
+    return HTMLResponse(INDEX_HTML)
 
 
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
