@@ -20,7 +20,7 @@ from .schema import normalize
 from .ssh_poller import AGENT_SCRIPT, SSHPoller, load_or_create_key
 from .store import Store
 
-VERSION = "1.7.1"
+VERSION = "1.8.0"
 STATIC = Path(__file__).parent / "static"
 INSTALL_SH = AGENT_SCRIPT.parent / "install.sh"
 MAX_INGEST_BYTES = 4 * 1024 * 1024
@@ -253,11 +253,12 @@ async def get_load(request: Request, name: str):
     return request.app.state.store.load_week(host.name)
 
 
-@app.get("/api/hosts/{name}/load/moment")
-async def get_load_moment(request: Request, name: str, t: float):
-    """Top processes, stacks and disks at the busiest moment of the 5 minutes at `t` (null if not recorded)."""
+@app.get("/api/hosts/{name}/moment")
+async def get_moment(request: Request, name: str, t: float, span: float = 300):
+    """Stats averaged over [t, t+span), plus top processes, stacks and disks
+    at the busiest recorded moment in it (null if none was recorded)."""
     host = _host_or_404(request, name)
-    return request.app.state.store.load_moment(host.name, t)
+    return request.app.state.store.moment(host.name, t, span)
 
 
 @app.get("/api/trends")

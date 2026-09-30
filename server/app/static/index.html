@@ -87,6 +87,7 @@
           <button type="button" role="radio" data-hours="4380" aria-label="6 months">6mo</button>
           <button type="button" role="radio" data-hours="8760" aria-label="1 year">1y</button>
         </div>
+        <span class="muted chart-hint">Click any point on a chart to see what was running then</span>
       </div>
       <div class="charts">
         <figure class="card chart-card">
@@ -113,6 +114,15 @@
           <figcaption>Tasks</figcaption>
           <div class="chart" id="chart-tasks"></div>
         </figure>
+      </div>
+
+      <div class="card moment-card" id="moment-card" hidden>
+        <div class="proc-head">
+          <h2>What was happening</h2>
+          <span class="spacer"></span>
+          <button id="moment-close" class="btn btn-quiet" type="button">Close</button>
+        </div>
+        <div id="moment-body" class="moment-body" aria-live="polite"></div>
       </div>
 
       <div class="card" id="peaks-card">
