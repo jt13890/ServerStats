@@ -44,7 +44,7 @@ PEAK_DAYS = 7               # the "1% high" and the load peaks section
 SLOT = 300                  # load is scored per 5-minute slot
 # What was running at the busiest moment of each slot, for explaining peaks.
 # After SNAPSHOT_DAYS only the busiest one of each hour is kept.
-SNAPSHOT_DAYS = PEAK_DAYS + 1
+SNAPSHOT_DAYS = 30
 SNAPSHOT_PROCS = 6          # top processes by CPU, and again by memory
 SNAPSHOT_STACKS = 6
 SNAPSHOT_DISKS = 3

@@ -1065,7 +1065,7 @@ function momentView(m, host) {
   const snap = m.snapshot;
   if (!snap) {
     kids.push(h('p', { class: 'muted moment-note', text: "What was running isn't recorded for this time. ServerStats "
-      + 'keeps the busiest moment of every 5 minutes for 8 days, then of every hour, starting from when the server was updated to record it.' }));
+      + 'keeps the busiest moment of every 5 minutes for 30 days, then of every hour, starting from when the server was updated to record it.' }));
     return kids;
   }
   const ncpu = snap.ncpu || (host && host.cpu && host.cpu.count) || 1;

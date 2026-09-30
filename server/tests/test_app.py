@@ -814,13 +814,16 @@ def test_peak_snapshots_keep_the_busiest_moment(tmp_path):
     assert store2.load_moment("h", t0 + SLOT)["processes"][0]["name"] == "next"
     assert store2.load_moment("h", t0 - SLOT) is None
 
-    # After 8 days only the busiest snapshot of each hour is kept (t0 is on the hour).
+    # For 30 days every 5 minutes is kept; after that only the busiest
+    # snapshot of each hour (t0 is on the hour).
     store2.record("h", data(40, "next-hour"), now=t0 + 3600 + 5)
-    store2.compact({"h"}, now=t0 + 9 * 86400)
+    store2.compact({"h"}, now=t0 + 29 * 86400)
+    assert store2.load_moment("h", t0 + SLOT)["processes"][0]["name"] == "next"
+    store2.compact({"h"}, now=t0 + 31 * 86400)
     assert store2.load_moment("h", t0)["processes"][0]["name"] == "peak"
     assert store2.load_moment("h", t0 + SLOT) is None
     assert store2.load_moment("h", t0 + 3600)["processes"][0]["name"] == "next-hour"
-    store2.compact({"h"}, now=t0 + 30 * 86400)  # idempotent
+    store2.compact({"h"}, now=t0 + 60 * 86400)  # idempotent
     assert store2.load_moment("h", t0)["processes"][0]["name"] == "peak"
 
 
