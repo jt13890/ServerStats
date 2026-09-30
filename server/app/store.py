@@ -44,7 +44,7 @@ PEAK_DAYS = 7               # the "1% high" and the load peaks section
 SLOT = 300                  # load is scored per 5-minute slot
 # What was running at the busiest moment of each slot, for explaining peaks.
 # After SNAPSHOT_DAYS only the busiest one of each hour is kept.
-SNAPSHOT_DAYS = PEAK_DAYS + 1
+SNAPSHOT_DAYS = 30
 SNAPSHOT_PROCS = 6          # top processes by CPU, and again by memory
 SNAPSHOT_STACKS = 6
 SNAPSHOT_DISKS = 3
@@ -545,11 +545,15 @@ class Store:
             "peaks": [{"t": s[0], "load": r1(s[1])} for s in chosen],
         }
 
-    def load_moment(self, host: str, t: float) -> dict | None:
-        """What was running at the busiest moment of the 5-minute slot at `t`."""
+    def load_moment(self, host: str, t: float, span: float = SLOT) -> dict | None:
+        """What was running at the busiest recorded moment within [t, t+span)
+        (for spans under 5 minutes: within the 5 minutes at t)."""
+        first = int(t // SLOT)
+        last = max(first, math.ceil((t + span) / SLOT) - 1)
         with self._lock:
             row = self._db.execute(
-                "SELECT ts, data FROM load_snapshots WHERE host = ? AND slot = ?", (host, int(t // SLOT))
+                """SELECT ts, data FROM load_snapshots WHERE host = ? AND slot >= ? AND slot <= ?
+                   ORDER BY load DESC LIMIT 1""", (host, first, last),
             ).fetchone()
         if row is None:
             return None
@@ -559,6 +563,36 @@ class Store:
         load, parts = load_of(snap.get("values") or {})
         snap.update(load=round(load, 1), parts={k: round(v, 1) for k, v in parts.items()})
         return {"ts": row[0], **snap}
+
+    def moment(self, host: str, t: float, span: float) -> dict:
+        """Everything known about [t, t+span): average stats (from the same
+        tiers the charts use), storage per mount, the load they add up to,
+        and what was running at the busiest recorded moment."""
+        span = min(max(span, 1.0), 400 * DAY)
+        r = lambda v: round(v, 2) if isinstance(v, float) else v
+        with self._lock:
+            union, params = self._union(TIERS, span, host, t, ", ".join(METRICS))
+            row = self._db.execute(
+                f"SELECT COUNT(*), {', '.join(_avg(m) for m in METRICS)} FROM ({union}) WHERE ts < ?",
+                (*params, t + span),
+            ).fetchone()
+            sspan = max(span, STORAGE_SAMPLE_SECONDS)
+            union, params = self._union(STORAGE_TIERS, sspan, host, t - STORAGE_SAMPLE_SECONDS, "mount, used, total")
+            mounts = self._db.execute(
+                f"SELECT mount, AVG(used), AVG(total) FROM ({union}) WHERE ts < ? GROUP BY mount ORDER BY mount",
+                (*params, t + sspan),
+            ).fetchall()
+        stats = dict(zip(METRICS, map(r, row[1:]))) if row[0] else None
+        load = None
+        if stats:
+            value, parts = load_of({k: stats.get(k) for k in LOAD_PARTS})
+            load = {"load": round(value, 1), "parts": {k: round(v, 1) for k, v in parts.items()},
+                    "values": {k: stats.get(k) for k in LOAD_PARTS}}
+        return {
+            "t": t, "span": span, "stats": stats, "load": load,
+            "storage": [{"mount": m, "used": u, "total": tot} for m, u, tot in mounts],
+            "snapshot": self.load_moment(host, t, span),
+        }
 
     def trends(self, hours: float = 1.0, points: int = 60) -> dict:
         """Recent CPU/memory/disk/storage for every host (overview sparklines)."""

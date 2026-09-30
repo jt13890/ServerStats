@@ -430,3 +430,13 @@ td .meter { grid-template-columns: 1fr 52px; }
 .tile.is-full { border-color: var(--critical); }
 .level-badge { font-weight: 600; font-size: 12.5px; margin-left: 6px; }
 .chart .warn-zone { fill: var(--warning-bg); }
+
+/* what was happening at a picked time (history charts and load peaks) */
+.chart-hint { font-size: 12.5px; }
+.moment-body { transition: opacity .2s; }
+.moment-body.loading { opacity: .55; }
+.moment-body .load-track { height: 10px; border-radius: 5px; margin: 10px 0; }
+.moment-stats { margin: 14px 0 4px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.moment-stats .tile { padding: 10px 12px; }
+.moment-stats .tile-value { font-size: 18px; }
+.moment-card { scroll-margin-top: 72px; }

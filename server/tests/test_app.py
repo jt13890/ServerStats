@@ -814,13 +814,16 @@ def test_peak_snapshots_keep_the_busiest_moment(tmp_path):
     assert store2.load_moment("h", t0 + SLOT)["processes"][0]["name"] == "next"
     assert store2.load_moment("h", t0 - SLOT) is None
 
-    # After 8 days only the busiest snapshot of each hour is kept (t0 is on the hour).
+    # For 30 days every 5 minutes is kept; after that only the busiest
+    # snapshot of each hour (t0 is on the hour).
     store2.record("h", data(40, "next-hour"), now=t0 + 3600 + 5)
-    store2.compact({"h"}, now=t0 + 9 * 86400)
+    store2.compact({"h"}, now=t0 + 29 * 86400)
+    assert store2.load_moment("h", t0 + SLOT)["processes"][0]["name"] == "next"
+    store2.compact({"h"}, now=t0 + 31 * 86400)
     assert store2.load_moment("h", t0)["processes"][0]["name"] == "peak"
     assert store2.load_moment("h", t0 + SLOT) is None
     assert store2.load_moment("h", t0 + 3600)["processes"][0]["name"] == "next-hour"
-    store2.compact({"h"}, now=t0 + 30 * 86400)  # idempotent
+    store2.compact({"h"}, now=t0 + 60 * 86400)  # idempotent
     assert store2.load_moment("h", t0)["processes"][0]["name"] == "peak"
 
 
@@ -829,9 +832,12 @@ def test_load_endpoints(client):
     week = client.get("/api/hosts/alpha/load", headers=USER).json()
     assert week["days"] == 7 and len(week["t"]) == 1 and week["high1"]["slots"] == 1
     assert week["peaks"] == [] or week["peaks"][0]["t"] == week["t"][0]
-    snap = client.get(f"/api/hosts/alpha/load/moment?t={week['t'][0]}", headers=USER).json()
-    assert snap["processes"] and "load" in snap
-    assert client.get("/api/hosts/alpha/load/moment?t=1000", headers=USER).json() is None
+    m = client.get(f"/api/hosts/alpha/moment?t={week['t'][0]}&span=300", headers=USER).json()
+    assert m["snapshot"]["processes"] and "load" in m["snapshot"] and m["stats"]["cpu"] is not None
+    m = client.get("/api/hosts/alpha/moment?t=1000&span=300", headers=USER).json()
+    assert m["snapshot"] is None and m["stats"] is None
+    assert client.get("/api/hosts/nope/moment?t=1000", headers=USER).status_code == 404
+    assert client.get("/api/hosts/alpha/moment?t=1000").status_code in (401, 403)
     assert client.get("/api/hosts/nope/load", headers=USER).status_code == 404
     assert client.get("/api/hosts/alpha/load").status_code in (401, 403)
     tr = client.get("/api/trends", headers=USER).json()
@@ -882,3 +888,52 @@ def test_prune(client):
     assert post({"days": 1095}).json()["rows"] == 0
     assert post({"days": 180}).json()["rows"] == 4 * 3  # alpha's 200, beta's 200/400/800
     assert remaining("alpha") == [10] and remaining("beta") == [10]
+
+
+def test_moment_for_any_chart_point(tmp_path):
+    from app.store import Store
+
+    store = Store(tmp_path / "db.sqlite")
+    t0 = (1_800_000_000 // 3600) * 3600  # on the hour
+
+    def data(cpu, mem, disk, top):
+        return {
+            "cpu": {"count": 2, "percent": cpu}, "memory": {"percent": mem, "total": 8e9},
+            "load": [1.5, 1.0, 0.5], "net": {"rx_rate": 1000.0, "tx_rate": 500.0},
+            "disk_io": {"util": disk, "read_rate": 10.0, "write_rate": 20.0, "devices": []},
+            "disks": [{"mount": "/", "percent": 50.0, "used": 5e9, "total": 1e10}],
+            "tasks": {"total": 100, "threads": 400},
+            "processes": [{"pid": 1, "name": top, "user": "u", "cpu": cpu * 2, "mem": mem, "rss": 1, "cmd": top}],
+        }
+
+    # One sample a minute for an hour; a busy spell 20-25 minutes in.
+    for k in range(60):
+        busy = 20 <= k < 25
+        store.record("h", data(90 if busy else 10, 40, 5, "build" if busy else "idle"), now=t0 + k * 60 + 1)
+
+    # A 1-minute point: stats for that minute, what ran in its 5-minute slot.
+    m = store.moment("h", t0 + 21 * 60, 60)
+    assert m["stats"]["cpu"] == 90 and m["stats"]["mem"] == 40 and m["stats"]["load1"] == 1.5
+    assert m["stats"]["rx"] == 1000 and m["stats"]["procs"] == 100
+    assert m["load"]["load"] == pytest.approx(100 * (1 - 0.1 * 0.6 * 0.95), abs=0.1)
+    assert sum(m["load"]["parts"].values()) == pytest.approx(m["load"]["load"], abs=0.2)
+    assert m["snapshot"]["processes"][0]["name"] == "build"
+    assert m["storage"] == [{"mount": "/", "used": 5e9, "total": 1e10}]
+
+    # An hour-long point (e.g. the 30-day chart): averages over the hour, and
+    # the busiest moment anywhere in it.
+    m = store.moment("h", t0, 3600)
+    assert m["stats"]["cpu"] == pytest.approx((5 * 90 + 55 * 10) / 60, abs=0.01)
+    assert m["snapshot"]["processes"][0]["name"] == "build"
+    # A quiet stretch: its own busiest moment.
+    m = store.moment("h", t0 + 40 * 60, 10 * 60)
+    assert m["stats"]["cpu"] == 10 and m["snapshot"]["processes"][0]["name"] == "idle"
+    # Still works once rolled up into the 5-minute and hourly tiers.
+    store.rollup(t0 + 10 * 86400)
+    store.compact({"h"}, t0 + 10 * 86400)
+    m = store.moment("h", t0, 3600)
+    assert m["stats"]["cpu"] == pytest.approx((5 * 90 + 55 * 10) / 60, abs=0.01)
+    assert m["snapshot"]["processes"][0]["name"] == "build"  # the hour's busiest was kept
+    # Nothing recorded.
+    m = store.moment("h", t0 - 7200, 3600)
+    assert m["stats"] is None and m["load"] is None and m["snapshot"] is None

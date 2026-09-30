@@ -345,6 +345,8 @@ function renderOverview() {
   });
 
   function draw() {
+    // A refresh that finishes after navigating away has nothing to draw into.
+    if (!document.body.contains(grid)) return;
     const q = state.hostFilter.trim().toLowerCase();
     $('#empty').hidden = state.hosts.length > 0;
     const n = updatable().length;
@@ -830,7 +832,8 @@ function renderDetail(name) {
       }
       return fmtClock(t, state.range > 24);
     };
-    const common = { x0, x1, minGap, tipTime };
+    const pickAt = (span) => (t) => openMoment(t, span);
+    const common = { x0, x1, minGap, tipTime, pick: chartPick && chartPick.t, onPick: pickAt(history.bucket) };
     const fmtCount = (v) => (v == null ? '—' : (+v.toFixed(v < 10 ? 2 : 0)).toLocaleString());
 
     const usage = [
@@ -848,6 +851,7 @@ function renderDetail(name) {
     lineChart($('#chart-storage'), {
       ...common, title: 'Storage used', yMax: 100, fmt: fmtPct,
       minGap: Math.max(history.bucket, 300) * 3,
+      onPick: pickAt(Math.max(history.bucket, 300)), // storage is sampled every 5 minutes
       series: mounts.map((mount, i) => ({
         label: mount, slot: i + 1,
         points: storage[mount].map((r) => ({ t: r.t, v: r.total ? (100 * r.used) / r.total : 0, extra: `${fmtBytes(r.used)} of ${fmtBytes(r.total)}` })),
@@ -962,78 +966,138 @@ function renderDetail(name) {
     const seq = ++momentSeq;
     const panel = $('#peak-moment');
     panel.classList.add('loading');
-    let snap;
+    let m;
     try {
-      snap = await api(`/api/hosts/${enc}/load/moment?t=${t}`);
+      m = await api(`/api/hosts/${enc}/moment?t=${t}&span=${week.slot}`);
     } finally {
       if (seq === momentSeq) panel.classList.remove('loading');
     }
-    if (seq !== momentSeq || !week) return;
-    drawMoment(t, snap);
+    if (seq !== momentSeq) return;
+    panel.replaceChildren(...momentView(m, host));
   }
 
-  function drawMoment(t, snap) {
-    const i = week.t.indexOf(t);
-    if (i < 0) return;
-    const parts = {}, values = {};
-    for (const [k] of LOAD_PARTS) { parts[k] = week.parts[k][i]; values[k] = week.values[k][i]; }
-    const load = week.load[i];
+  // -- click any point on the history charts: what was happening then --
 
-    const breakdown = h('div', { class: 'moment-parts' },
-      ...LOAD_PARTS.map(([k, name]) => h('div', { class: 'moment-part', 'data-part': k },
-        h('span', { class: 'swatch' }),
-        h('span', { text: name }),
-        h('b', { text: values[k] == null ? '—' : `${fmtPct(values[k])} used` }),
-        h('span', { class: 'muted', text: `${fmtPct(shareOf(parts[k], load))} of the load` }))));
-
-    const kids = [
-      h('div', { class: 'moment-head' },
-        h('h3', { text: `${fmtWhen(t)}–${fmtClock(t + week.slot, false)}` }),
-        h('span', { class: 'muted', text: 'load ' }), h('b', { text: fmtPct(load) }),
-        h('span', { class: 'muted', text: ' (5-minute average)' }), levelBadge(load)),
-      loadTrack(parts, 'Load at this time', load),
-      breakdown,
-    ];
-
-    if (!snap) {
-      kids.push(h('p', { class: 'muted moment-note', text: "What was running isn't recorded for this time. "
-        + 'ServerStats keeps it for 8 days, from when the server was updated to record it.' }));
-    } else {
-      const ncpu = snap.ncpu || (host && host.cpu && host.cpu.count) || 1;
-      const procs = snap.processes || [];
-      const byCpu = procs.slice().sort((a, b) => b.cpu - a.cpu).slice(0, 6).filter((p) => p.cpu > 0);
-      const byMem = procs.slice().sort((a, b) => b.mem - a.mem).slice(0, 6).filter((p) => p.mem > 0);
-      const procRow = (p, pct, value, part, title) => rankRow(part, p.name || String(p.pid), p.user, `${p.cmd || p.name} (PID ${p.pid})\n${title}`, pct, value);
-      const lists = [
-        rankList('Processes by CPU', 'Share of all cores', byCpu.map((p) => procRow(p, p.cpu / ncpu, fmtPct(p.cpu / ncpu), 'cpu',
-          `${p.cpu.toFixed(0)}% of one core`))),
-        rankList('Processes by memory', 'Share of RAM', byMem.map((p) => procRow(p, p.mem, fmtPct(p.mem), 'mem',
-          `${fmtBytes(p.rss)} resident`))),
-      ];
-      if (snap.stacks && snap.stacks.length) {
-        lists.push(
-          rankList('Docker by CPU', 'Share of all cores', snap.stacks.slice().sort((a, b) => b.cpu - a.cpu).filter((x) => x.cpu > 0).map((x) =>
-            rankRow('cpu', x.name, x.stack ? `${x.containers} container${x.containers > 1 ? 's' : ''}` : 'container',
-              `${x.cpu.toFixed(0)}% of one core`, x.cpu / ncpu, fmtPct(x.cpu / ncpu)))),
-          rankList('Docker by memory', 'Share of RAM', snap.stacks.slice().sort((a, b) => b.mem_percent - a.mem_percent).filter((x) => x.mem_percent > 0).map((x) =>
-            rankRow('mem', x.name, fmtBytes(x.mem), `${fmtBytes(x.mem)} used`, x.mem_percent, fmtPct(x.mem_percent)))));
-      }
-      if ((snap.disks || []).length) {
-        lists.push(rankList('Busiest disks', 'Time busy', snap.disks.map((d) => rankRow('disk_util', d.label, `${fmtRate(d.read_rate)} read · ${fmtRate(d.write_rate)} write`,
-          `${d.label}: read ${fmtRate(d.read_rate)}, write ${fmtRate(d.write_rate)}`, d.util, fmtPct(d.util)))));
-      }
-      kids.push(
-        h('p', { class: 'moment-note' }, h('span', { class: 'muted', text: 'At the busiest moment in these 5 minutes, ' }),
-          h('b', { text: fmtClock(snap.ts, false) }), h('span', { class: 'muted', text: `, load was ${fmtPct(snap.load)}:` })),
-        h('div', { class: 'rank-grid' }, ...lists));
+  let chartPick = null; // {t, span}
+  let chartPickSeq = 0;
+  async function openMoment(t, span) {
+    chartPick = { t, span };
+    const card = $('#moment-card');
+    const body = $('#moment-body');
+    // Redrawing replaces the charts; keep keyboard focus where it was.
+    const focused = document.activeElement && document.activeElement.closest && document.activeElement.closest('.chart');
+    drawCharts();
+    if (focused && focused.id) $(`#${focused.id} svg`)?.focus();
+    card.hidden = false;
+    body.classList.add('loading');
+    const seq = ++chartPickSeq;
+    try {
+      const m = await api(`/api/hosts/${enc}/moment?t=${t}&span=${span}`);
+      if (seq !== chartPickSeq) return;
+      body.replaceChildren(...momentView(m, host));
+    } catch (e) {
+      if (seq === chartPickSeq) body.replaceChildren(h('p', { class: 'muted', text: `Couldn't load that time: ${e.message}` }));
+    } finally {
+      if (seq === chartPickSeq) body.classList.remove('loading');
     }
-    $('#peak-moment').replaceChildren(...kids);
+    if (!focused) card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
+  $('#moment-close').addEventListener('click', () => {
+    chartPick = null;
+    ++chartPickSeq;
+    $('#moment-card').hidden = true;
+    drawCharts();
+  });
 
   state.redraw = () => { drawCharts(); drawPeaks(); };
   every(5000, loadHost);
   every(30000, loadHistory);
   every(300000, loadPeaks);
+}
+
+// "5-minute", "42-minute", "3-hour"... for "N average".
+function fmtSpanWord(secs) {
+  if (secs < 60) return `${Math.round(secs)}-second`;
+  if (secs < 3600) return `${Math.round(secs / 60)}-minute`;
+  if (secs < 86400) return `${+(secs / 3600).toFixed(1)}-hour`;
+  return `${+(secs / 86400).toFixed(1)}-day`;
+}
+
+// Everything about one stretch of time (from /api/hosts/{name}/moment):
+// average stats, the load they add up to, and what was running at the
+// busiest recorded moment in it.
+function momentView(m, host) {
+  const when = m.span >= 86400 ? `${fmtWhen(m.t)} – ${fmtWhen(m.t + m.span)}`
+    : m.span >= 60 ? `${fmtWhen(m.t)}–${fmtClock(m.t + m.span, false)}`
+      : new Date(m.t * 1000).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const st = m.stats;
+  if (!st) {
+    return [h('div', { class: 'moment-head' }, h('h3', { text: when })),
+      h('p', { class: 'muted moment-note', text: 'No data was recorded for this time.' })];
+  }
+  const L = m.load;
+  const kids = [
+    h('div', { class: 'moment-head' },
+      h('h3', { text: when }),
+      h('span', { class: 'muted', text: 'load ' }), h('b', { text: fmtPct(L.load) }),
+      h('span', { class: 'muted', text: ` (${fmtSpanWord(m.span)} average)` }), levelBadge(L.load)),
+    loadTrack(L.parts, 'Load at this time', L.load),
+    h('div', { class: 'moment-parts' },
+      ...LOAD_PARTS.map(([k, name]) => h('div', { class: 'moment-part', 'data-part': k },
+        h('span', { class: 'swatch' }),
+        h('span', { text: name }),
+        h('b', { text: L.values[k] == null ? '—' : `${fmtPct(L.values[k])} used` }),
+        h('span', { class: 'muted', text: `${fmtPct(shareOf(L.parts[k], L.load))} of the load` })))),
+  ];
+
+  const n2 = (v) => (v == null ? '—' : (+v.toFixed(2)).toLocaleString());
+  const mounts = (m.storage || []).filter((d) => d.total);
+  const fullest = mounts.reduce((a, d) => (!a || d.used / d.total > a.used / a.total ? d : a), null);
+  kids.push(h('div', { class: 'tiles moment-stats' },
+    tile('CPU', fmtPct(st.cpu), `load ${n2(st.load1)} ${n2(st.load5)} ${n2(st.load15)}`),
+    tile('Memory', fmtPct(st.mem), st.swap == null ? 'no swap' : `swap ${fmtPct(st.swap)}`),
+    tile('Disk I/O busy', fmtPct(st.disk_util), `read ${fmtRate(st.disk_read)} · write ${fmtRate(st.disk_write)}`),
+    tile('Network in', fmtRate(st.rx), `out ${fmtRate(st.tx)}`),
+    tile('Storage (fullest)', fullest ? fmtPct((100 * fullest.used) / fullest.total) : fmtPct(st.storage),
+      fullest ? `${fullest.mount} · ${fmtBytes(fullest.total - fullest.used)} free` : ''),
+    tile('Tasks', st.procs == null ? '—' : fmtNum(Math.round(st.procs)), st.threads == null ? '' : `${fmtNum(Math.round(st.threads))} threads`)));
+
+  const snap = m.snapshot;
+  if (!snap) {
+    kids.push(h('p', { class: 'muted moment-note', text: "What was running isn't recorded for this time. ServerStats "
+      + 'keeps the busiest moment of every 5 minutes for 30 days, then of every hour, starting from when the server was updated to record it.' }));
+    return kids;
+  }
+  const ncpu = snap.ncpu || (host && host.cpu && host.cpu.count) || 1;
+  const procs = snap.processes || [];
+  const byCpu = procs.slice().sort((a, b) => b.cpu - a.cpu).slice(0, 6).filter((p) => p.cpu > 0);
+  const byMem = procs.slice().sort((a, b) => b.mem - a.mem).slice(0, 6).filter((p) => p.mem > 0);
+  const procRow = (p, pct, value, part, title) => rankRow(part, p.name || String(p.pid), p.user, `${p.cmd || p.name} (PID ${p.pid})\n${title}`, pct, value);
+  const lists = [
+    rankList('Processes by CPU', 'Share of all cores', byCpu.map((p) => procRow(p, p.cpu / ncpu, fmtPct(p.cpu / ncpu), 'cpu',
+      `${p.cpu.toFixed(0)}% of one core`))),
+    rankList('Processes by memory', 'Share of RAM', byMem.map((p) => procRow(p, p.mem, fmtPct(p.mem), 'mem',
+      `${fmtBytes(p.rss)} resident`))),
+  ];
+  if (snap.stacks && snap.stacks.length) {
+    lists.push(
+      rankList('Docker by CPU', 'Share of all cores', snap.stacks.slice().sort((a, b) => b.cpu - a.cpu).filter((x) => x.cpu > 0).map((x) =>
+        rankRow('cpu', x.name, x.stack ? `${x.containers} container${x.containers > 1 ? 's' : ''}` : 'container',
+          `${x.cpu.toFixed(0)}% of one core`, x.cpu / ncpu, fmtPct(x.cpu / ncpu)))),
+      rankList('Docker by memory', 'Share of RAM', snap.stacks.slice().sort((a, b) => b.mem_percent - a.mem_percent).filter((x) => x.mem_percent > 0).map((x) =>
+        rankRow('mem', x.name, fmtBytes(x.mem), `${fmtBytes(x.mem)} used`, x.mem_percent, fmtPct(x.mem_percent)))));
+  }
+  if ((snap.disks || []).length) {
+    lists.push(rankList('Busiest disks', 'Time busy', snap.disks.map((d) => rankRow('disk_util', d.label, `${fmtRate(d.read_rate)} read · ${fmtRate(d.write_rate)} write`,
+      `${d.label}: read ${fmtRate(d.read_rate)}, write ${fmtRate(d.write_rate)}`, d.util, fmtPct(d.util)))));
+  }
+  const within = m.span < 300 ? 'in the 5 minutes around this' : m.span <= 300 ? 'in these 5 minutes' : 'recorded in this span';
+  kids.push(
+    h('p', { class: 'moment-note' }, h('span', { class: 'muted', text: `What was running at the busiest moment ${within}, ` }),
+      h('b', { text: m.span >= 86400 ? fmtWhen(snap.ts) : fmtClock(snap.ts, false) }),
+      h('span', { class: 'muted', text: `, when load was ${fmtPct(snap.load)}:` })),
+    h('div', { class: 'rank-grid' }, ...lists));
+  return kids;
 }
 
 function fmtWhen(t) {
@@ -1356,12 +1420,17 @@ function lineChart(container, opts) {
     if (last && last.t >= x0) root.append(svg('circle', { class: `dot c${s.slot}`, cx: X(last.t), cy: Y(last.v), r: 4 }));
   }
 
+  // the picked time (see openMoment)
+  if (opts.pick != null && opts.pick >= x0 && opts.pick <= x1) {
+    root.append(svg('line', { class: 'pick-line', x1: X(opts.pick), x2: X(opts.pick), y1: M.t, y2: M.t + ih }));
+  }
+
   // hover layer: crosshair snaps to the nearest sample time
   const times = allTimes.filter((t) => t >= x0);
   const lookup = visible.map((s) => new Map(s.points.map((p) => [p.t, p])));
   const cross = svg('line', { class: 'crosshair', y1: M.t, y2: M.t + ih, visibility: 'hidden' });
   const dots = visible.map((s) => svg('circle', { class: `dot c${s.slot}`, r: 4, visibility: 'hidden' }));
-  const hit = svg('rect', { x: M.l, y: M.t, width: iw, height: ih, fill: 'transparent' });
+  const hit = svg('rect', { x: M.l, y: M.t, width: iw, height: ih, fill: 'transparent', class: opts.onPick ? 'hit' : null });
   root.append(cross, ...dots, hit);
 
   const tip = $('#tooltip');
@@ -1389,7 +1458,8 @@ function lineChart(container, opts) {
         h('b', { text: p ? fmt(p.v) : '—' }),
         h('span', { text: p && p.extra ? `${s.label} · ${p.extra}` : s.label })));
     });
-    tip.replaceChildren(h('div', { class: 'tt-time', text: opts.tipTime ? opts.tipTime(t) : fmtClock(t, false) }), ...rows);
+    tip.replaceChildren(h('div', { class: 'tt-time', text: opts.tipTime ? opts.tipTime(t) : fmtClock(t, false) }), ...rows,
+      opts.onPick ? h('div', { class: 'tt-hint', text: 'Click to see what was running' }) : null);
     tip.hidden = false;
     const rect = root.getBoundingClientRect();
     if (clientX == null) {
@@ -1423,12 +1493,24 @@ function lineChart(container, opts) {
     show(nearest(x0 + ((x - M.l) / iw) * (x1 - x0)), e.clientX, e.clientY);
   });
   hit.addEventListener('pointerleave', hide);
+  if (opts.onPick) {
+    hit.addEventListener('click', (e) => {
+      const rect = root.getBoundingClientRect();
+      const x = ((e.clientX - rect.left) / rect.width) * W;
+      const i = nearest(x0 + ((x - M.l) / iw) * (x1 - x0));
+      hide();
+      if (times.length) opts.onPick(times[i]);
+    });
+  }
   root.addEventListener('focus', () => show(times.length - 1));
   root.addEventListener('blur', hide);
   root.addEventListener('keydown', (e) => {
     if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
       e.preventDefault();
       show((idx < 0 ? times.length - 1 : idx) + (e.key === 'ArrowLeft' ? -1 : 1));
+    } else if (e.key === 'Enter' && idx >= 0 && opts.onPick) {
+      e.preventDefault();
+      opts.onPick(times[idx]);
     } else if (e.key === 'Escape') {
       hide();
     }
