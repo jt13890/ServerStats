@@ -117,7 +117,7 @@
 
       <div class="card" id="peaks-card">
         <h2>Load peaks <span class="muted">past 7 days</span></h2>
-        <p class="muted peaks-intro">Overall load every 5 minutes, colored by what drove it. The busiest of CPU, memory and disk I/O sets the load, so any of them at 100% means 100%; over 100% means overloaded. Pick one of the busiest times, or click anywhere on the chart, to see what was running then.</p>
+        <p class="muted peaks-intro">Overall load every 5 minutes, colored by what drove it. Load combines CPU, memory and disk I/O (Sandpiper's volume metric) and reads 100% when one of them is maxed out. Pick one of the busiest times, or click anywhere on the chart, to see what was running then.</p>
         <div id="peak-stats" class="tiles peak-stats"></div>
         <div class="chart" id="chart-peaks"></div>
         <div id="peak-chips" class="peak-chips" role="group" aria-label="Busiest times"></div>

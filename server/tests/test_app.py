@@ -1,4 +1,5 @@
 import json
+import zlib
 import math
 
 import pytest
@@ -651,47 +652,50 @@ def test_load_score_weights_busy_resources(tmp_path):
 
     hosts = store.load_scores()["hosts"]
     assert "load" not in hosts["old"]  # nothing in the 3-day window...
-    assert hosts["old"]["high1"]["load"] == pytest.approx(195.1, abs=0.1)  # ...but it counts toward the week's 1% high (overloaded)
+    assert hosts["old"]["high1"]["load"] == pytest.approx(100, abs=0.1)  # ...but it counts toward the week's 1% high
     p = hosts["pegged"]
-    assert p["load"] == pytest.approx(90, abs=0.1)  # the busiest resource, not the plain mean of 37%
+    assert p["load"] == pytest.approx(91.9, abs=0.1)  # 1 - .1*.9*.9, not the plain mean of 37%
     assert set(p["parts"]) == {"cpu", "mem", "disk_util"}
     assert p["parts"]["cpu"] > 10 * p["parts"]["mem"] > 0
     assert sum(p["parts"].values()) == pytest.approx(p["load"], abs=0.2)
     assert p["avg"]["cpu"] == 90 and 23 <= p["hours"] <= 25
     assert hosts["even"]["load"] == pytest.approx(load_of({"cpu": 50, "mem": 50, "disk_util": 50})[0], abs=0.1)
     assert hosts["idle"]["load"] == 0
-    assert hosts["full-disk"]["load"] == pytest.approx(20, abs=0.5)
+    assert hosts["full-disk"]["load"] == pytest.approx(36, abs=0.5)  # 1 - .8*.8*1: storage ignored
 
 
 def test_load_formula():
+    import math
+
     from app.store import load_of
 
     def load(cpu, mem, disk):
         return load_of({"cpu": cpu, "mem": mem, "disk_util": disk})[0]
 
-    # Anything at 100% means the server is at 100%, however idle the rest is.
+    # Sandpiper's volume V = 1/((1-cpu)(1-mem)(1-disk)), as 100 * (1 - 1/V).
+    for u in ((15, 65, 5), (36, 33, 6), (90, 10, 10), (50, 50, 50)):
+        volume = 1 / math.prod(1 - x / 100 for x in u)
+        assert load(*u) == pytest.approx(100 * (1 - 1 / volume))
+    # Anything maxed out means the server is full, however idle the rest is.
     assert load(0, 0, 100) == 100
-    assert load(3, 10, 100) == pytest.approx(100, abs=0.1)
-    assert load(100, 0, 0) == 100
+    assert load(3, 10, 100) == pytest.approx(100)
+    assert load(100, 100, 100) == pytest.approx(100)  # never more
+    # Never less than the busiest resource; higher when several are busy.
+    assert load(90, 10, 10) == pytest.approx(91.9, abs=0.05)
+    assert load(70, 60, 10) > load(70, 10, 10) > 70
+    assert load(0, 0, 0) == 0
     # Storage isn't part of load.
     assert load_of({"cpu": 10, "mem": 10, "disk_util": 10, "storage": 100}) == load_of({"cpu": 10, "mem": 10, "disk_util": 10})
-    # The busiest resource sets the load; others add more the busier they are.
-    assert load(90, 10, 10) == pytest.approx(90, abs=0.1)
-    assert 50 < load(50, 50, 50) < 60
-    assert 90 < load(70, 70, 70) < 100  # busy everywhere, but not overloaded
-    assert load(70, 60, 10) > load(70, 10, 10)
-    # Several resources at their limit at once: over 100% = overloaded.
-    assert load(100, 90, 10) > 120
-    assert load(100, 100, 100) == pytest.approx(200)  # the most it can be
     # Out-of-range and missing values.
     assert load(-5, 150, None) == 100
     assert load_of({}) == (0.0, {})
 
-    # Shares add up to the load, grow with how full each resource is, and a
-    # quieter resource stays visible (15% CPU next to 65% memory: ~13%).
+    # Shares (each resource's factor in V, -ln(1-u)) add up to the load, grow
+    # with how full each resource is, and a quieter one stays visible.
     total, parts = load_of({"cpu": 15, "mem": 65, "disk_util": 5})
     assert sum(parts.values()) == pytest.approx(total)
     assert parts["mem"] > parts["cpu"] > parts["disk_util"] > 0
+    assert parts["cpu"] / total == pytest.approx(math.log(1 / 0.85) / math.log(1 / (0.85 * 0.35 * 0.95)))
     assert 0.1 < parts["cpu"] / total < 0.16
     total, parts = load_of({"cpu": 0, "mem": 0, "disk_util": 100})
     assert parts == {"cpu": 0.0, "mem": 0.0, "disk_util": 100.0}
@@ -777,6 +781,14 @@ def test_peak_snapshots_keep_the_busiest_moment(tmp_path):
     assert snap["stacks"] == [{"name": "web", "stack": True, "containers": 2, "cpu": 75.0, "mem": 2e9,
                                "mem_percent": 25.0, "read_rate": 0.0, "write_rate": 0.0}]
     assert snap["parts"]["cpu"] > snap["parts"]["mem"] and snap["values"]["cpu"] == 95
+    # Moments saved under an older formula are re-scored from their values.
+    blob = zlib.compress(json.dumps({"load": 143.0, "parts": {"storage": 99}, "values": {"cpu": 50, "mem": 50, "storage": 99},
+                                     "processes": []}).encode())
+    store._db.execute("INSERT INTO load_snapshots (host, slot, ts, load, data) VALUES ('h', ?, ?, 143, ?)",
+                      (int(t0 // SLOT) + 50, t0 + 50 * SLOT, blob))
+    store._db.commit()
+    old = store.load_moment("h", t0 + 50 * SLOT)
+    assert old["load"] == 75 and set(old["parts"]) == {"cpu", "mem"}
 
     # A fresh Store (restart) still only replaces the snapshot with a busier moment.
     store2 = Store(tmp_path / "db.sqlite")
