@@ -199,13 +199,16 @@ function meter(label, pct, title, trend, valueText) {
 // past 100% the host is overloaded. Drawn as one bar split into a colored
 // segment per resource, so it's clear what drives it.
 const LOAD_PARTS = [
-  ['cpu', 'CPU', 'CPU'], ['mem', 'Memory', 'memory'], ['disk_util', 'Disk I/O', 'disk I/O'], ['storage', 'Storage', 'storage'],
+  ['cpu', 'CPU', 'CPU'], ['mem', 'Memory', 'memory'], ['disk_util', 'Disk I/O', 'disk I/O'],
 ];
 const OVERLOADED = 100.5; // shows as 101% or more
 const isOver = (load) => load != null && load >= OVERLOADED;
 const overBadge = () => h('span', { class: 'over-badge', text: '⚠ Overloaded' });
-const LOAD_EXPLAINED = 'The busiest resource sets the load, so anything at 100% means 100%. '
-  + 'The others add more the busier they are; over 100% means overloaded (several resources near their limit at once).';
+const LOAD_EXPLAINED = 'The busiest of CPU, memory and disk I/O sets the load, so any of them at 100% means 100%. '
+  + 'The others add more the busier they are; over 100% means overloaded (several near their limit at once). '
+  + "Storage isn't counted. Each resource's share grows the closer it is to full.";
+// Each resource's share of the load, as a percentage of it.
+const shareOf = (part, load) => (load > 0 ? (100 * (part || 0)) / load : 0);
 const topPart = (parts) => LOAD_PARTS.filter(([k]) => parts[k] > 0).sort((a, b) => parts[b[0]] - parts[a[0]])[0];
 
 function loadTrack(parts, label, load) {
@@ -249,7 +252,7 @@ function loadMeter(score, kind) {
         + `${fmtSpan(score.slots / 12)} in all), averaged. Open the host to see what caused it.\n`
       : `Overall load, averaged over the past ${span}. `) + LOAD_EXPLAINED + '\n'
       + (isOver(score.load) ? 'Overloaded.\n' : '')
-      + LOAD_PARTS.map(([k, name]) => `${name}: adds ${fmtPct(score.parts[k])}`
+      + LOAD_PARTS.map(([k, name]) => `${name}: ${fmtPct(shareOf(score.parts[k], score.load))} of it`
         + (score.avg ? ` (average ${fmtPct(score.avg[k])} used)` : '')).join('\n');
   }
   return h('div', { class: 'meter meter-load', title },
@@ -980,7 +983,7 @@ function renderDetail(name) {
         h('span', { class: 'swatch' }),
         h('span', { text: name }),
         h('b', { text: values[k] == null ? '—' : `${fmtPct(values[k])} used` }),
-        h('span', { class: 'muted', text: `adds ${fmtPct(parts[k])}` }))));
+        h('span', { class: 'muted', text: `${fmtPct(shareOf(parts[k], load))} of the load` }))));
 
     const kids = [
       h('div', { class: 'moment-head' },
@@ -1082,11 +1085,11 @@ function loadChart(container, opts) {
   });
   container.append(root);
 
+  let overLabel = null; // drawn over the data, below
   if (top > 100) {
     root.append(svg('rect', { class: 'over-zone', x: M.l, y: Y(top), width: iw, height: Y(100) - Y(top) }));
-    const t = svg('text', { class: 'over-label', x: M.l + 6, y: Y(top) + 13 });
-    t.textContent = '⚠ Overloaded';
-    root.append(t);
+    overLabel = svg('text', { class: 'over-label', x: M.l + 6, y: Y(100) - 6 });
+    overLabel.textContent = '⚠ Overloaded';
   }
   const step = top > 150 ? 50 : 25;
   for (let v = 0; v <= top; v += step) {
@@ -1134,6 +1137,8 @@ function loadChart(container, opts) {
     if (i >= 0) root.append(svg('circle', { class: 'pick-dot', cx: x, cy: Y(week.load[i]), r: 4.5 }));
   }
 
+  if (overLabel) root.append(overLabel);
+
   // hover: crosshair + breakdown; click or Enter picks that time
   const cross = svg('line', { class: 'crosshair', y1: M.t, y2: M.t + ih, visibility: 'hidden' });
   const hit = svg('rect', { x: M.l, y: M.t, width: iw, height: ih, fill: 'transparent', class: 'hit' });
@@ -1154,8 +1159,8 @@ function loadChart(container, opts) {
       h('div', { class: 'tt-row' }, h('span', { class: 'key key-blank' }), h('b', { text: fmtPct(week.load[idx]) }),
         h('span', { text: isOver(week.load[idx]) ? '⚠ Load · overloaded' : 'Load' })),
       ...LOAD_PARTS.map(([k, name]) => h('div', { class: 'tt-row', 'data-part': k },
-        h('span', { class: 'swatch' }), h('b', { text: `+${fmtPct(week.parts[k][idx])}` }),
-        h('span', { text: `${name} · ${fmtPct(week.values[k][idx])} used` }))),
+        h('span', { class: 'swatch' }), h('b', { text: fmtPct(shareOf(week.parts[k][idx], week.load[idx])) }),
+        h('span', { text: `${name}'s share · ${fmtPct(week.values[k][idx])} used` }))),
       h('div', { class: 'tt-hint', text: 'Click to see what was running' }));
     tip.hidden = false;
     const rect = root.getBoundingClientRect();

@@ -37,7 +37,8 @@ METRICS = (
 # stored can't blow up the charts.
 PERCENT_METRICS = {"cpu", "mem", "swap", "disk_util", "storage"}
 # Components of a host's overall load score (see load_of). Over 100 = overloaded.
-LOAD_PARTS = ("cpu", "mem", "disk_util", "storage")
+# Storage isn't part of it: a full disk has its own meter, and it's not load.
+LOAD_PARTS = ("cpu", "mem", "disk_util")
 LOAD_HOURS = RAW_DAYS * 24  # the "Load · 3d" average
 PEAK_DAYS = 7               # the "1% high" and the load peaks section
 SLOT = 300                  # load is scored per 5-minute slot
@@ -95,23 +96,29 @@ def metrics_from_sample(data: dict) -> dict:
 
 
 def load_of(u: dict) -> tuple[float, dict]:
-    """Overall load from component percentages, plus what each one adds.
+    """Overall load from component percentages, and each component's share.
 
-    The busiest component sets the base: anything at 100% (a full disk, a
-    pegged CPU) means the server is at 100%. Every other component adds
-    u * (u/100)^3 divided by how many others there are, so it adds more the
-    busier it is: with the usual four components, next to nothing when
-    idle, 2 points at 50%, 8 at 70%, 22 at 90%. The load only goes past 100%
-    (overloaded) when several things are near their limit at once. What
-    each component adds stacks up to the load.
+    The busiest component (CPU, memory or disk I/O) sets the base: any of
+    them at 100% means the server is at 100%. Each of the other two adds
+    u * (u/100)^3 / 2, so it adds more the busier it is: next to nothing
+    when idle, 3 points at 50%, 12 at 70%, 33 at 90%. The load only goes
+    past 100% (overloaded) when several things are near their limit at once.
+
+    The shares split the load between the components by each one's factor
+    in Sandpiper's "volume", 1/((1-cpu)(1-mem)(1-net)) (Wood et al., NSDI
+    2007), i.e. -ln(1-u). Like queueing delay it grows the closer a
+    resource is to full, yet a quieter one still gets a visible share. The
+    shares add up to the load.
     """
     vals = {k: min(max(v, 0.0), 100.0) for k, v in u.items() if k in LOAD_PARTS and _num(v) is not None}
     if not vals:
         return 0.0, {}
     top = max(vals, key=vals.get)
     others = max(len(vals) - 1, 1)
-    parts = {k: (v if k == top else v * (v / 100) ** 3 / others) for k, v in vals.items()}
-    return sum(parts.values()), parts
+    load = sum(v if k == top else v * (v / 100) ** 3 / others for k, v in vals.items())
+    weight = {k: 0.0 - math.log(1 - min(v, 99.9) / 100) for k, v in vals.items()}  # (0.0 - avoids -0.0)
+    total = sum(weight.values())
+    return load, {k: (load * w / total if total > 0 else 0.0) for k, w in weight.items()}
 
 
 def _group_stacks(containers: list) -> list:
@@ -472,14 +479,8 @@ class Store:
                 (since, mark, *([host] if host else []), mark, *([host] if host else [])),
             ).fetchall()
         out: dict[str, list] = {}
-        last_storage: dict[str, float] = {}
         for h, slot, *vals in rows:
             u = dict(zip(LOAD_PARTS, vals))
-            # Filesystem usage is sampled less often; carry the last value forward.
-            if u["storage"] is None:
-                u["storage"] = last_storage.get(h)
-            else:
-                last_storage[h] = u["storage"]
             if all(v is None for v in u.values()):
                 continue
             load, parts = load_of(u)
