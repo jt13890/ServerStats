@@ -418,7 +418,9 @@ class Store:
     def _union(self, tiers, bucket: float, host: str, since: float, columns: str):
         """SQL + params selecting `columns` for one host from the coarsest tier
         whose resolution fits `bucket`, plus finer tiers for the recent part
-        that hasn't been rolled up yet."""
+        that hasn't been rolled up yet, plus coarser tiers for anything older
+        than that tier still keeps (e.g. zooming into a day long ago: raw
+        samples are gone, the 5-minute or hourly averages are what's left)."""
         usable = [t for t in tiers if t[1] <= bucket] or [tiers[0]]
         parts, params, lo = [], [], since
         for table, _, key in reversed(usable):  # coarsest first
@@ -430,26 +432,44 @@ class Store:
             params += [host, lo] + ([hi] if hi is not None else [])
             if hi is not None:
                 lo = hi
+        # Older than the chosen tier keeps: fill in from the coarser ones.
+        oldest = lambda table: self._db.execute(f"SELECT MIN(ts) FROM {table} WHERE host = ?", (host,)).fetchone()[0]
+        upper = oldest(usable[-1][0])
+        for table, _, _ in tiers[len(usable):]:
+            if upper is not None and upper <= since:
+                break
+            parts.append(f"SELECT ts, {columns} FROM {table} WHERE host = ? AND ts >= ?"
+                         + (" AND ts < ?" if upper is not None else ""))
+            params += [host, since] + ([upper] if upper is not None else [])
+            here = oldest(table)
+            if here is not None:
+                upper = here if upper is None else min(upper, here)
         return " UNION ALL ".join(parts), params
 
-    def history(self, host: str, hours: float, points: int = 240) -> dict:
-        hours = min(max(hours, 0.1), 100 * 365 * 24)
-        now = time.time()
-        since = now - hours * 3600
-        bucket = max(hours * 3600 / points, 1)
+    def history(self, host: str, hours: float, points: int = 240,
+                start: float | None = None, end: float | None = None) -> dict:
+        """About `points` averaged points over the last `hours`, or over
+        [start, end) when given (a zoomed-in chart)."""
+        if start is not None and end is not None:
+            since, until = start, end
+        else:
+            hours = min(max(hours, 0.1), 100 * 365 * 24)
+            until = time.time() + 1
+            since = until - 1 - hours * 3600
+        bucket = max((until - since) / points, 1)
         sbucket = max(bucket, STORAGE_SAMPLE_SECONDS)
         with self._lock:
             union, params = self._union(TIERS, bucket, host, since, ", ".join(METRICS))
             rows = self._db.execute(
                 f"""SELECT CAST(ts / ? AS INTEGER) * ? AS t, {', '.join(_avg(m) for m in METRICS)}
-                    FROM ({union}) GROUP BY 1 ORDER BY 1""",
-                (bucket, bucket, *params),
+                    FROM ({union}) WHERE ts < ? GROUP BY 1 ORDER BY 1""",
+                (bucket, bucket, *params, until),
             ).fetchall()
             union, params = self._union(STORAGE_TIERS, sbucket, host, since - sbucket, "mount, used, total")
             srows = self._db.execute(
                 f"""SELECT CAST(ts / ? AS INTEGER) * ? AS t, mount, AVG(used), AVG(total)
-                    FROM ({union}) GROUP BY 1, 2 ORDER BY 1""",
-                (sbucket, sbucket, *params),
+                    FROM ({union}) WHERE ts < ? GROUP BY 1, 2 ORDER BY 1""",
+                (sbucket, sbucket, *params, until),
             ).fetchall()
         keys = ("t", *METRICS)
         metrics = [{k: (round(v, 2) if isinstance(v, float) else v) for k, v in zip(keys, row)} for row in rows]
@@ -576,6 +596,15 @@ class Store:
                 f"SELECT COUNT(*), {', '.join(_avg(m) for m in METRICS)} FROM ({union}) WHERE ts < ?",
                 (*params, t + span),
             ).fetchone()
+            if not row[0]:
+                # Only coarser averages are left for this time (e.g. 5-minute
+                # rows for a 1-minute point): use the one that covers t.
+                union, params = self._union(TIERS, span, host, t - 3600, ", ".join(METRICS))
+                row = self._db.execute(
+                    f"""SELECT COUNT(*), {', '.join(_avg(m) for m in METRICS)} FROM (
+                            SELECT * FROM ({union}) WHERE ts <= ? ORDER BY ts DESC LIMIT 1)""",
+                    (*params, t),
+                ).fetchone()
             sspan = max(span, STORAGE_SAMPLE_SECONDS)
             union, params = self._union(STORAGE_TIERS, sspan, host, t - STORAGE_SAMPLE_SECONDS, "mount, used, total")
             mounts = self._db.execute(

@@ -440,3 +440,22 @@ td .meter { grid-template-columns: 1fr 52px; }
 .moment-stats .tile { padding: 10px 12px; }
 .moment-stats .tile-value { font-size: 18px; }
 .moment-card { scroll-margin-top: 72px; }
+
+/* live updates paused while a past moment is open */
+.paused-bar {
+  position: sticky; top: 58px; z-index: 4;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 0 0 16px; padding: 8px 12px; font-size: 13px;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .06);
+}
+.paused-label { white-space: nowrap; }
+.pause-icon { display: inline-block; width: 9px; height: 11px; margin-right: 6px; vertical-align: -1px; border-left: 3px solid currentColor; border-right: 3px solid currentColor; }
+.paused-tag { font-size: 12px; font-weight: 500; color: var(--ink-2); margin-left: 6px; }
+
+/* drag across a chart to zoom in */
+.chart svg { touch-action: pan-y; }
+.chart .hit { cursor: crosshair; }
+.chart .brush { fill: var(--accent); fill-opacity: .14; stroke: var(--accent); stroke-width: 1; }
+.zoom-bar { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; }
+.zoom-bar[hidden] { display: none; }

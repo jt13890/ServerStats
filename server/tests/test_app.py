@@ -937,3 +937,60 @@ def test_moment_for_any_chart_point(tmp_path):
     # Nothing recorded.
     m = store.moment("h", t0 - 7200, 3600)
     assert m["stats"] is None and m["load"] is None and m["snapshot"] is None
+
+
+def test_history_for_a_zoomed_window(client):
+    import time as _time
+
+    store = client.app.state.store
+    now = _time.time()
+    # A sample a minute for two hours, CPU = minutes ago.
+    for k in range(120):
+        store.record("alpha", {"cpu": {"percent": float(k)}, "disks": []}, now=now - k * 60)
+    start, end = now - 90 * 60, now - 60 * 60  # 30 minutes, an hour ago
+    h = client.get(f"/api/hosts/alpha/history?start={start}&end={end}", headers=USER).json()
+    assert h["bucket"] == pytest.approx(30 * 60 / 240)
+    ts = [p["t"] for p in h["metrics"]]
+    assert ts and min(ts) >= start - h["bucket"] and max(ts) < end
+    assert all(60 <= p["cpu"] <= 90 for p in h["metrics"])
+    assert len(ts) in (30, 31)
+    # The "last N hours" form still works.
+    assert len(client.get("/api/hosts/alpha/history?hours=1", headers=USER).json()["metrics"]) >= 59
+    for bad in (f"start={start}", f"end={end}", f"start={end}&end={start}", f"start={start}&end={start + 10}",
+                f"start=nan&end={end}", f"start={start}&end=inf"):
+        assert client.get(f"/api/hosts/alpha/history?{bad}", headers=USER).status_code in (400, 422), bad
+
+
+def test_zooming_into_old_history_uses_what_is_left(tmp_path):
+    import time as _time
+
+    from app.store import Store
+
+    store = Store(tmp_path / "db.sqlite")
+    now = _time.time()
+    # A sample a minute for 10 days, CPU = days ago * 10.
+    for k in range(10 * 24 * 60 - 1, -1, -1):
+        t = now - k * 60
+        store.record("h", {"cpu": {"percent": (now - t) / 86400 * 10}, "disks": []}, now=t)
+    store.rollup(now)
+    store.compact({"h"}, now)
+    assert store._db.execute("SELECT MIN(ts) FROM history").fetchone()[0] > now - 4 * 86400  # raw is ~3 days
+
+    # Zoom into 4 hours a week ago: too fine for 5-minute averages by the
+    # usual rule, and the raw samples are gone; the 5-minute tier fills in.
+    start = now - 7 * 86400
+    h = store.history("h", 0, start=start, end=start + 4 * 3600)
+    assert h["bucket"] == 60 and 40 <= len(h["metrics"]) <= 49
+    assert all(68 <= p["cpu"] <= 70.1 for p in h["metrics"])  # 7 days ago, minus up to 4h
+    # A window spanning the raw boundary: 5-minute points before it, raw after.
+    edge = store._db.execute("SELECT MIN(ts) FROM history").fetchone()[0]
+    h = store.history("h", 0, start=edge - 3600, end=edge + 3600)
+    ts = [p["t"] for p in h["metrics"]]
+    before = [t for t in ts if t < edge - 300]
+    after = [t for t in ts if t >= edge]
+    assert 10 <= len(before) <= 13 and len(after) >= 55  # 5-minute vs per-minute
+    assert len(ts) == len(set(ts))
+    # The moment view works there too.
+    for offset in range(0, 300, 60):  # any minute, whether or not a 5-minute row starts in it
+        m = store.moment("h", start + 3600 + offset, 60)
+        assert m["stats"]["cpu"] == pytest.approx(69.6, abs=0.3), offset

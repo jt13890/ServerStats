@@ -74,6 +74,12 @@
         <button id="d-update-btn" class="btn" type="button" hidden></button>
       </div>
       <div id="d-error" class="banner" hidden></div>
+      <div id="d-paused" class="paused-bar" role="status" hidden>
+        <b class="paused-label"><span class="pause-icon" aria-hidden="true"></span>Paused</b>
+        <span id="d-paused-text"></span>
+        <span class="spacer"></span>
+        <button id="d-resume" class="btn" type="button">Back to live</button>
+      </div>
 
       <div id="d-tiles" class="tiles"></div>
 
@@ -87,7 +93,9 @@
           <button type="button" role="radio" data-hours="4380" aria-label="6 months">6mo</button>
           <button type="button" role="radio" data-hours="8760" aria-label="1 year">1y</button>
         </div>
-        <span class="muted chart-hint">Click any point on a chart to see what was running then</span>
+        <span id="zoom-bar" class="zoom-bar" hidden>Zoomed in: <b id="zoom-text"></b>
+          <button id="zoom-reset" class="btn" type="button">Reset zoom</button></span>
+        <span class="muted chart-hint">Click a point to see what was running then, or drag across a chart to zoom in</span>
       </div>
       <div class="charts">
         <figure class="card chart-card">
@@ -184,7 +192,7 @@
 
       <div class="card">
         <div class="proc-head">
-          <h2>Processes <span id="proc-count" class="muted"></span></h2>
+          <h2>Processes <span id="proc-count" class="muted"></span> <span id="proc-paused" class="paused-tag" hidden><span class="pause-icon" aria-hidden="true"></span>paused while viewing history</span></h2>
           <span class="spacer"></span>
           <input id="proc-filter" class="input" type="search" placeholder="Filter by name, command, user or PID" aria-label="Filter processes">
           <label class="check"><input id="proc-pause" type="checkbox"> Pause updates</label>
