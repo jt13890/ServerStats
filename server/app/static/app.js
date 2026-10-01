@@ -442,11 +442,34 @@ function renderDetail(name) {
 
   // range selector
   const rangeBtns = [...document.querySelectorAll('#range button')];
+  // A dragged-out time window on the charts; null = the range buttons' "last N".
+  let zoom = null;
   const markRange = () => rangeBtns.forEach((b) => {
-    b.setAttribute('aria-checked', String(Number(b.dataset.hours) === state.range));
+    b.setAttribute('aria-checked', String(!zoom && Number(b.dataset.hours) === state.range));
   });
+  function zoomTo(a, b) {
+    let [t0, t1] = a < b ? [a, b] : [b, a];
+    if (t1 - t0 < 60) { const mid = (t0 + t1) / 2; t0 = mid - 30; t1 = mid + 30; } // at least a minute
+    t1 = Math.min(t1, serverNow());
+    zoom = { x0: t0, x1: t1 };
+    const sameDay = new Date(t0 * 1000).toDateString() === new Date(t1 * 1000).toDateString();
+    $('#zoom-text').textContent = `${fmtWhen(t0)} – ${sameDay ? fmtClock(t1, false) : fmtWhen(t1)}`;
+    $('#zoom-bar').hidden = false;
+    markRange();
+    loadHistory(true);
+  }
+  function resetZoom() {
+    if (!zoom) return;
+    zoom = null;
+    $('#zoom-bar').hidden = true;
+    markRange();
+    loadHistory(true);
+  }
+  $('#zoom-reset').addEventListener('click', resetZoom);
   markRange();
   rangeBtns.forEach((b) => b.addEventListener('click', () => {
+    zoom = null;
+    $('#zoom-bar').hidden = true;
     state.range = Number(b.dataset.hours);
     savePref('range', state.range);
     markRange();
@@ -528,13 +551,15 @@ function renderDetail(name) {
   let historySeq = 0;
   let historyAt = 0;
   async function loadHistory(force) {
+    // A zoomed-in window is in the past and doesn't change.
+    if (!force && zoom) return;
     // Long ranges are hourly averages; refetching them every 30s buys nothing.
     if (!force && state.range > 24 && Date.now() - historyAt < 300000) return;
     const seq = ++historySeq;
     const charts = document.querySelectorAll('.chart');
     charts.forEach((c) => c.classList.add('loading'));
     try {
-      const data = await api(`/api/hosts/${enc}/history?hours=${state.range}`);
+      const data = await api(`/api/hosts/${enc}/history?` + (zoom ? `start=${zoom.x0}&end=${zoom.x1}` : `hours=${state.range}`));
       if (seq !== historySeq) return; // a newer range was picked meanwhile
       history = data;
       historyAt = Date.now();
@@ -849,8 +874,9 @@ function renderDetail(name) {
 
   function drawCharts() {
     if (!history) return;
-    const x1 = serverNow();
-    const x0 = x1 - state.range * 3600;
+    const x1 = zoom ? zoom.x1 : serverNow();
+    const x0 = zoom ? zoom.x0 : x1 - state.range * 3600;
+    const hours = (x1 - x0) / 3600;
     const m = history.metrics || [];
     // Never break lines for gaps shorter than a host needs to be marked offline.
     const minGap = Math.max(history.bucket * 3, (state.meta ? state.meta.stale_after : 60) * 1.5);
@@ -860,12 +886,15 @@ function renderDetail(name) {
     const tipTime = (t) => {
       const d = new Date(t * 1000);
       if (history.bucket >= 86400) {
-        return d.toLocaleDateString([], { month: 'short', day: 'numeric', year: state.range >= 4380 ? 'numeric' : undefined });
+        return d.toLocaleDateString([], { month: 'short', day: 'numeric', year: hours >= 4380 ? 'numeric' : undefined });
       }
-      return fmtClock(t, state.range > 24);
+      return fmtClock(t, hours > 24 || !!zoom);
     };
     const pickAt = (span) => (t) => openMoment(t, span);
-    const common = { x0, x1, minGap, tipTime, pick: chartPick && chartPick.t, onPick: pickAt(history.bucket) };
+    const common = {
+      x0, x1, minGap, tipTime, pick: chartPick && chartPick.t, onPick: pickAt(history.bucket),
+      onZoom: zoomTo,
+    };
     const fmtCount = (v) => (v == null ? '—' : (+v.toFixed(v < 10 ? 2 : 0)).toLocaleString());
 
     const usage = [
@@ -1342,7 +1371,7 @@ function cadence(times) {
   return steps[(steps.length - 1) >> 1]; // lower median: few samples shouldn't bridge a real gap
 }
 
-const TIME_STEPS = [300, 600, 900, 1800, 3600, 7200, 10800, 14400, 21600, 43200, 86400, 172800, 259200, 604800, 1209600];
+const TIME_STEPS = [60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 14400, 21600, 43200, 86400, 172800, 259200, 604800, 1209600];
 const MIN_TICK_GAP = 76; // px between x-axis labels
 
 // x axis: steps aligned to local time (months for long ranges)
@@ -1526,21 +1555,51 @@ function lineChart(container, opts) {
     return lo > 0 && t - times[lo - 1] < times[lo] - t ? lo - 1 : lo;
   }
 
-  hit.addEventListener('pointermove', (e) => {
+  // Pointer x in chart units, kept inside the plot area; and its time.
+  const chartX = (e) => {
     const rect = root.getBoundingClientRect();
-    const x = ((e.clientX - rect.left) / rect.width) * W;
-    show(nearest(x0 + ((x - M.l) / iw) * (x1 - x0)), e.clientX, e.clientY);
+    return Math.max(M.l, Math.min(M.l + iw, ((e.clientX - rect.left) / rect.width) * W));
+  };
+  const timeAt = (x) => x0 + ((x - M.l) / iw) * (x1 - x0);
+
+  // Drag across the chart to zoom into that span; a plain click picks a point.
+  const brush = svg('rect', { class: 'brush', y: M.t, height: ih, visibility: 'hidden' });
+  root.insertBefore(brush, hit);
+  let dragFrom = null, dragging = false;
+  hit.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    dragFrom = chartX(e);
+    dragging = false;
+    hit.setPointerCapture(e.pointerId);
   });
-  hit.addEventListener('pointerleave', hide);
-  if (opts.onPick) {
-    hit.addEventListener('click', (e) => {
-      const rect = root.getBoundingClientRect();
-      const x = ((e.clientX - rect.left) / rect.width) * W;
-      const i = nearest(x0 + ((x - M.l) / iw) * (x1 - x0));
+  hit.addEventListener('pointermove', (e) => {
+    if (dragFrom != null && opts.onZoom) {
+      const x = chartX(e);
+      if (!dragging && Math.abs(x - dragFrom) < 5) return;
+      dragging = true;
       hide();
-      if (times.length) opts.onPick(times[i]);
-    });
-  }
+      brush.setAttribute('x', Math.min(dragFrom, x));
+      brush.setAttribute('width', Math.abs(x - dragFrom));
+      brush.setAttribute('visibility', 'visible');
+      return;
+    }
+    show(nearest(timeAt(chartX(e))), e.clientX, e.clientY);
+  });
+  hit.addEventListener('pointerup', (e) => {
+    if (dragFrom == null) return;
+    const from = dragFrom, x = chartX(e);
+    dragFrom = null;
+    brush.setAttribute('visibility', 'hidden');
+    hide();
+    if (dragging && opts.onZoom) {
+      dragging = false;
+      opts.onZoom(timeAt(from), timeAt(x));
+    } else if (opts.onPick && times.length) {
+      opts.onPick(times[nearest(timeAt(x))]);
+    }
+  });
+  hit.addEventListener('pointercancel', () => { dragFrom = null; dragging = false; brush.setAttribute('visibility', 'hidden'); });
+  hit.addEventListener('pointerleave', () => { if (dragFrom == null) hide(); });
   root.addEventListener('focus', () => show(times.length - 1));
   root.addEventListener('blur', hide);
   root.addEventListener('keydown', (e) => {

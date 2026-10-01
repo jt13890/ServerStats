@@ -452,3 +452,10 @@ td .meter { grid-template-columns: 1fr 52px; }
 .paused-label { white-space: nowrap; }
 .pause-icon { display: inline-block; width: 9px; height: 11px; margin-right: 6px; vertical-align: -1px; border-left: 3px solid currentColor; border-right: 3px solid currentColor; }
 .paused-tag { font-size: 12px; font-weight: 500; color: var(--ink-2); margin-left: 6px; }
+
+/* drag across a chart to zoom in */
+.chart svg { touch-action: pan-y; }
+.chart .hit { cursor: crosshair; }
+.chart .brush { fill: var(--accent); fill-opacity: .14; stroke: var(--accent); stroke-width: 1; }
+.zoom-bar { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; }
+.zoom-bar[hidden] { display: none; }

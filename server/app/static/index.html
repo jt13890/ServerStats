@@ -93,7 +93,9 @@
           <button type="button" role="radio" data-hours="4380" aria-label="6 months">6mo</button>
           <button type="button" role="radio" data-hours="8760" aria-label="1 year">1y</button>
         </div>
-        <span class="muted chart-hint">Click any point on a chart to see what was running then</span>
+        <span id="zoom-bar" class="zoom-bar" hidden>Zoomed in: <b id="zoom-text"></b>
+          <button id="zoom-reset" class="btn" type="button">Reset zoom</button></span>
+        <span class="muted chart-hint">Click a point to see what was running then, or drag across a chart to zoom in</span>
       </div>
       <div class="charts">
         <figure class="card chart-card">

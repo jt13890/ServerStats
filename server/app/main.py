@@ -20,7 +20,7 @@ from .schema import normalize
 from .ssh_poller import AGENT_SCRIPT, SSHPoller, load_or_create_key
 from .store import Store
 
-VERSION = "1.8.2"
+VERSION = "1.9.0"
 STATIC = Path(__file__).parent / "static"
 INSTALL_SH = AGENT_SCRIPT.parent / "install.sh"
 MAX_INGEST_BYTES = 4 * 1024 * 1024
@@ -241,9 +241,15 @@ async def get_host(request: Request, name: str):
 
 
 @app.get("/api/hosts/{name}/history")
-async def get_history(request: Request, name: str, hours: float = 1.0):
+async def get_history(request: Request, name: str, hours: float = 1.0,
+                      start: float | None = None, end: float | None = None):
+    """The last `hours`, or [start, end) for a zoomed-in chart (at least a minute)."""
     host = _host_or_404(request, name)
-    return request.app.state.store.history(host.name, hours)
+    if (start is None) != (end is None):
+        raise HTTPException(400, "give both start and end, or neither")
+    if start is not None and not (60 <= end - start <= 100 * 365 * 86400):
+        raise HTTPException(400, "end must be between a minute and 100 years after start")
+    return request.app.state.store.history(host.name, hours, start=start, end=end)
 
 
 @app.get("/api/hosts/{name}/load")
