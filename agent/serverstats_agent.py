@@ -16,6 +16,7 @@ Agent settings can come from flags or environment variables:
   SERVERSTATS_URL, SERVERSTATS_TOKEN, SERVERSTATS_INTERVAL,
   SERVERSTATS_CA_FILE, SERVERSTATS_MAX_PROCS
 (or from a KEY=VALUE file given with --env-file).
+On Windows, SERVERSTATS_GPU=1 starts with GPU stats on (the dashboard can toggle them).
 
 Docker containers are reported too when this account can read the Docker
 socket (i.e. is in the docker group); set SERVERSTATS_DOCKER=0 to turn that off.
@@ -105,6 +106,93 @@ def _win_parse_pagefiles(raw, page_size):
     return total * page_size, used * page_size
 
 
+def _win_parse_processes(raw, base, ptr=8):
+    """pid -> counters, from a SystemProcessInformation buffer (NtQuerySystemInformation
+    class 5, the same call Task Manager uses).
+
+    It carries every process's CPU time, working set, thread count, start time,
+    parent and name without opening any of them, so a standard user gets the
+    same numbers as an administrator. `base` is the address the buffer was
+    read into (name pointers point inside it); `ptr` is the pointer size of
+    the reading process.
+    """
+    if ptr == 8:
+        o_name, o_pid, o_ppid, o_ws, fmt = 64, 80, 88, 144, "<Q"
+    else:
+        o_name, o_pid, o_ppid, o_ws, fmt = 60, 68, 72, 104, "<I"
+    procs = {}
+    offset = 0
+    while offset + o_ws + ptr <= len(raw):
+        nxt, threads = struct.unpack_from("<II", raw, offset)
+        create, user, kern = struct.unpack_from("<qqq", raw, offset + 32)  # CreateTime, UserTime, KernelTime
+        nlen = struct.unpack_from("<H", raw, offset + 56)[0]
+        nbuf = struct.unpack_from(fmt, raw, offset + o_name)[0]
+        pid = struct.unpack_from(fmt, raw, offset + o_pid)[0]
+        ppid = struct.unpack_from(fmt, raw, offset + o_ppid)[0]
+        ws = struct.unpack_from(fmt, raw, offset + o_ws)[0]
+        name = ""
+        start = nbuf - base
+        if nlen and start >= 0 and start + nlen <= len(raw):
+            name = raw[start:start + nlen].decode("utf-16-le", "replace")
+        if pid:  # 0 is the System Idle Process: its "CPU" is the idle time
+            procs[pid] = {"name": name, "state": "S", "ppid": ppid, "ticks": user + kern, "threads": threads,
+                          "starttime": create, "started": _filetime_to_unix(create), "rss": ws,
+                          "uid": "", "cmd": ""}
+        if not nxt:
+            break
+        offset += nxt
+    return procs
+
+
+# GPU counters name each instance after the adapter's LUID. Per-process engine
+# instances look like pid_123_luid_0x00000000_0x0000F3A5_phys_0_eng_0_engtype_3D,
+# adapter memory ones like luid_0x00000000_0x0000F3A5_phys_0.
+_GPU_ENGINE = re.compile(r"luid_(0x[0-9a-f]+_0x[0-9a-f]+)_phys_(\d+)_eng_(\d+)_engtype_(.+)$", re.I)
+_GPU_MEM = re.compile(r"luid_(0x[0-9a-f]+_0x[0-9a-f]+)_phys_(\d+)$", re.I)
+
+
+def _gpu_aggregate(engines, dedicated, shared, adapters):
+    """One entry per GPU from the raw counter instances.
+
+    engines / dedicated / shared are lists of (instance name, value);
+    adapters are {"luid", "name", "mem_total"} from DXGI (empty if that
+    failed: the GPUs are then named from the counters).
+
+    Busy is what Task Manager shows: the processes using one engine are added
+    up, and the GPU is as busy as its busiest engine (3D, Compute, VideoEncode...).
+    """
+    busy, ded, shr = {}, {}, {}
+    for name, v in engines:
+        m = _GPU_ENGINE.search(name)
+        if m:
+            engines_of = busy.setdefault(m.group(1).lower(), {})
+            key = (m.group(2), m.group(3), re.sub(r"#\d+$", "", m.group(4)))
+            engines_of[key] = engines_of.get(key, 0.0) + max(v, 0.0)
+    for items, into in ((dedicated, ded), (shared, shr)):
+        for name, v in items:
+            m = _GPU_MEM.search(name)
+            if m:
+                into[m.group(1).lower()] = into.get(m.group(1).lower(), 0.0) + max(v, 0.0)
+    known = [dict(a) for a in adapters]
+    if not known:
+        known = [{"luid": luid, "name": "GPU %d" % i, "mem_total": 0}
+                 for i, luid in enumerate(sorted(set(busy) | set(ded) | set(shr)))]
+    out = []
+    for a in known:
+        luid = a["luid"].lower()
+        top = max(busy.get(luid, {}).items(), key=lambda kv: kv[1], default=None)
+        util = min(top[1], 100.0) if top else 0.0
+        out.append({
+            "name": a["name"],
+            "util": round(util, 1),
+            "engine": top[0][2] if top and util >= 1 else "",  # what is keeping it busy
+            "mem_used": ded.get(luid, 0.0),
+            "mem_total": a.get("mem_total") or None,
+            "shared_used": shr.get(luid),
+        })
+    return out
+
+
 class _LogFile(object):
     """File-like object for stdout/stderr that keeps the log from growing
     forever: at `limit` bytes it moves the log to <path>.1 and starts over.
@@ -153,13 +241,7 @@ if IS_WINDOWS:
     _k32.OpenProcess.restype = _H
     _k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     _k32.CloseHandle.argtypes = [_H]
-    _k32.GetProcessTimes.argtypes = [_H] + [ctypes.POINTER(wintypes.FILETIME)] * 4
-    _k32.K32GetProcessMemoryInfo.argtypes = [_H, ctypes.c_void_p, wintypes.DWORD]
     _k32.QueryFullProcessImageNameW.argtypes = [_H, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
-    _k32.CreateToolhelp32Snapshot.restype = _H
-    _k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-    _k32.Process32FirstW.argtypes = [_H, ctypes.c_void_p]
-    _k32.Process32NextW.argtypes = [_H, ctypes.c_void_p]
     _k32.CreateFileW.restype = _H
     _k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
                                  wintypes.DWORD, wintypes.DWORD, _H]
@@ -185,20 +267,6 @@ if IS_WINDOWS:
                     ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
                     ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
                     ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-
-    class _PROCESSENTRY32W(ctypes.Structure):
-        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
-                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
-                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
-                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
-                    ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
-
-    class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):
-        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
-                    ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
-                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                    ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
 
     class _DISK_PERFORMANCE(ctypes.Structure):
         _fields_ = [("BytesRead", ctypes.c_longlong), ("BytesWritten", ctypes.c_longlong),
@@ -369,54 +437,169 @@ if IS_WINDOWS:
         finally:
             _k32.CloseHandle(tok)
 
-    _win_users = {}  # (pid, start) -> user, so accounts are looked up once per process
+    _win_extra = {}  # (pid, start) -> (user, image path), looked up once per process
+
+    def _win_proc_details(pid):
+        """(user, image path) of a process, blank when this account may not open it
+        (other users' and protected processes, for a standard user)."""
+        h = _k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return "", ""
+        try:
+            path, size = ctypes.create_unicode_buffer(1024), wintypes.DWORD(1024)
+            ok = _k32.QueryFullProcessImageNameW(h, 0, path, _byref(size))
+            return _win_proc_user(h), (path.value if ok else "")
+        finally:
+            _k32.CloseHandle(h)
 
     def _win_proc_snapshot():
-        procs = {}
-        boot = int(time.time() - _win_uptime())
-        snap = _k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
-        if snap in (None, _INVALID_HANDLE):
-            raise OSError("cannot list processes")
+        size = 1 << 20
+        for _ in range(6):
+            buf = ctypes.create_string_buffer(size)
+            need = wintypes.ULONG(0)
+            status = _ntdll.NtQuerySystemInformation(5, buf, size, _byref(need))  # SystemProcessInformation
+            if status & 0xFFFFFFFF == 0xC0000004:  # STATUS_INFO_LENGTH_MISMATCH: grow and retry
+                size = max(need.value + 65536, size * 2)
+                continue
+            if status < 0:
+                raise OSError("cannot list processes (NTSTATUS 0x%08X)" % (status & 0xFFFFFFFF))
+            break
+        else:
+            raise OSError("the process list kept growing")
+        procs = _win_parse_processes(buf.raw[:need.value or size], ctypes.addressof(buf), ctypes.sizeof(ctypes.c_void_p))
         seen = {}
-        try:
-            pe = _PROCESSENTRY32W()
-            pe.dwSize = ctypes.sizeof(pe)
-            ok = _k32.Process32FirstW(snap, _byref(pe))
-            while ok:
-                pid = pe.th32ProcessID
-                if pid:  # 0 is the System Idle Process: its "CPU" is the idle time
-                    p = {"name": pe.szExeFile, "state": "S", "ppid": pe.th32ParentProcessID, "ticks": 0,
-                         "threads": pe.cntThreads, "starttime": 0, "started": boot, "rss": 0,
-                         "uid": "", "cmd": ""}
-                    h = _k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-                    if h:
-                        try:
-                            c, e, k, u = (wintypes.FILETIME() for _ in range(4))
-                            if _k32.GetProcessTimes(h, _byref(c), _byref(e), _byref(k), _byref(u)):
-                                p["ticks"] = _ft(k) + _ft(u)
-                                p["starttime"] = _ft(c)  # raw, also tells a reused PID apart
-                                p["started"] = _filetime_to_unix(_ft(c)) or boot
-                            mem = _PROCESS_MEMORY_COUNTERS()
-                            mem.cb = ctypes.sizeof(mem)
-                            if _k32.K32GetProcessMemoryInfo(h, _byref(mem), mem.cb):
-                                p["rss"] = mem.WorkingSetSize
-                            path, size = ctypes.create_unicode_buffer(1024), wintypes.DWORD(1024)
-                            if _k32.QueryFullProcessImageNameW(h, 0, path, _byref(size)):
-                                p["cmd"] = path.value
-                            key = (pid, p["starttime"])
-                            if key not in _win_users:
-                                _win_users[key] = _win_proc_user(h)
-                            seen[key] = _win_users[key]
-                            p["uid"] = _win_users[key]
-                        finally:
-                            _k32.CloseHandle(h)
-                    procs[pid] = p
-                ok = _k32.Process32NextW(snap, _byref(pe))
-        finally:
-            _k32.CloseHandle(snap)
-        _win_users.clear()
-        _win_users.update(seen)
+        for pid, p in procs.items():
+            key = (pid, p["starttime"])
+            if key not in _win_extra:
+                _win_extra[key] = _win_proc_details(pid)
+            seen[key] = _win_extra[key]
+            p["uid"], p["cmd"] = seen[key]
+        _win_extra.clear()
+        _win_extra.update(seen)
         return procs
+
+    class _GUID(ctypes.Structure):
+        _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16), ("Data3", ctypes.c_uint16),
+                    ("Data4", ctypes.c_ubyte * 8)]
+
+    class _DXGI_ADAPTER_DESC1(ctypes.Structure):
+        _fields_ = [("Description", ctypes.c_wchar * 128), ("VendorId", ctypes.c_uint32),
+                    ("DeviceId", ctypes.c_uint32), ("SubSysId", ctypes.c_uint32), ("Revision", ctypes.c_uint32),
+                    ("DedicatedVideoMemory", ctypes.c_size_t), ("DedicatedSystemMemory", ctypes.c_size_t),
+                    ("SharedSystemMemory", ctypes.c_size_t), ("LuidLow", ctypes.c_uint32),
+                    ("LuidHigh", ctypes.c_int32), ("Flags", ctypes.c_uint32)]
+
+    class _PDH_ITEM(ctypes.Structure):  # PDH_FMT_COUNTERVALUE_ITEM_W with a double value
+        _fields_ = [("szName", ctypes.c_wchar_p), ("CStatus", ctypes.c_uint32), ("value", ctypes.c_double)]
+
+    _pdh = ctypes.WinDLL("pdh")
+    _pdh.PdhOpenQueryW.restype = ctypes.c_long
+    _pdh.PdhOpenQueryW.argtypes = [wintypes.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)]
+    _pdh.PdhAddEnglishCounterW.restype = ctypes.c_long
+    _pdh.PdhAddEnglishCounterW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, ctypes.c_size_t,
+                                           ctypes.POINTER(ctypes.c_void_p)]
+    _pdh.PdhCollectQueryData.restype = ctypes.c_long
+    _pdh.PdhCollectQueryData.argtypes = [ctypes.c_void_p]
+    _pdh.PdhGetFormattedCounterArrayW.restype = ctypes.c_long
+    _pdh.PdhGetFormattedCounterArrayW.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                                                  ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    _pdh.PdhCloseQuery.argtypes = [ctypes.c_void_p]
+
+    _gpu_adapters = []
+    _gpu_adapters_done = []
+
+    def _win_gpu_adapters():
+        """Hardware GPUs from DXGI: [{"luid", "name", "mem_total"}], looked up once.
+
+        DXGI needs no special rights, and its LUIDs are what the performance
+        counters name their instances after. Software adapters (the "Microsoft
+        Basic Render Driver") are left out.
+        """
+        if _gpu_adapters_done:
+            return _gpu_adapters
+        _gpu_adapters_done.append(True)
+        try:
+            import uuid
+            dxgi = ctypes.WinDLL("dxgi")
+            dxgi.CreateDXGIFactory1.restype = ctypes.c_long
+            dxgi.CreateDXGIFactory1.argtypes = [ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)]
+            iid = _GUID.from_buffer_copy(uuid.UUID("770aae78-f26f-4dba-a829-253c83d1b387").bytes_le)  # IDXGIFactory1
+            factory = ctypes.c_void_p()
+            if dxgi.CreateDXGIFactory1(_byref(iid), _byref(factory)) < 0:
+                return _gpu_adapters
+
+            def call(obj, index, argtypes, *args):  # COM method number `index` of `obj`
+                vtable = ctypes.cast(ctypes.cast(obj, ctypes.POINTER(ctypes.c_void_p))[0], ctypes.POINTER(ctypes.c_void_p))
+                return ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)(vtable[index])(obj, *args)
+
+            try:
+                for i in range(16):
+                    adapter = ctypes.c_void_p()
+                    if call(factory.value, 12, [ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)],  # EnumAdapters1
+                            i, _byref(adapter)) < 0:
+                        break
+                    try:
+                        desc = _DXGI_ADAPTER_DESC1()
+                        if call(adapter.value, 10, [ctypes.POINTER(_DXGI_ADAPTER_DESC1)], _byref(desc)) >= 0 \
+                                and not desc.Flags & 2:  # DXGI_ADAPTER_FLAG_SOFTWARE
+                            _gpu_adapters.append({
+                                "luid": "0x%08x_0x%08x" % (desc.LuidHigh & 0xFFFFFFFF, desc.LuidLow),
+                                "name": desc.Description.strip() or "GPU",
+                                "mem_total": desc.DedicatedVideoMemory,
+                            })
+                    finally:
+                        call(adapter.value, 2, [])  # Release
+            finally:
+                call(factory.value, 2, [])
+        except Exception:
+            pass
+        return _gpu_adapters
+
+    class _WinGpuReader(object):
+        """The GPU performance counters (Windows 10 1709+): per-engine busy time and
+        adapter memory, for every vendor, readable without administrator rights."""
+
+        PATHS = (("engine", "\\GPU Engine(*)\\Utilization Percentage"),
+                 ("dedicated", "\\GPU Adapter Memory(*)\\Dedicated Usage"),
+                 ("shared", "\\GPU Adapter Memory(*)\\Shared Usage"))
+
+        def __init__(self):
+            self.adapters = _win_gpu_adapters()
+            self.query = ctypes.c_void_p()
+            status = _pdh.PdhOpenQueryW(None, 0, _byref(self.query))
+            if status != 0:
+                raise OSError("cannot open a performance counter query (PDH 0x%08X)" % (status & 0xFFFFFFFF))
+            self.counters = {}
+            for key, counter_path in self.PATHS:
+                handle = ctypes.c_void_p()
+                status = _pdh.PdhAddEnglishCounterW(self.query, counter_path, 0, _byref(handle))
+                if status != 0:
+                    self.close()
+                    raise OSError("this Windows has no GPU performance counters (it needs Windows 10 1709 or "
+                                  "newer and a WDDM 2.0 driver); PDH 0x%08X" % (status & 0xFFFFFFFF))
+                self.counters[key] = handle
+
+        def collect(self):
+            _pdh.PdhCollectQueryData(self.query)
+
+        def read(self, key):
+            size, count = wintypes.DWORD(0), wintypes.DWORD(0)
+            status = _pdh.PdhGetFormattedCounterArrayW(self.counters[key], 0x200, _byref(size), _byref(count), None)  # PDH_FMT_DOUBLE
+            if status & 0xFFFFFFFF != 0x800007D2:  # PDH_MORE_DATA: anything else means no values yet
+                return []
+            buf = ctypes.create_string_buffer(size.value)
+            if _pdh.PdhGetFormattedCounterArrayW(self.counters[key], 0x200, _byref(size), _byref(count), buf) != 0:
+                return []
+            items = (_PDH_ITEM * count.value).from_buffer(buf)
+            return [(it.szName, it.value) for it in items if it.CStatus in (0, 1) and it.szName]
+
+        def report(self):
+            return _gpu_aggregate(self.read("engine"), self.read("dedicated"), self.read("shared"), self.adapters)
+
+        def close(self):
+            if self.query:
+                _pdh.PdhCloseQuery(self.query)
+                self.query = ctypes.c_void_p()
 
     def _win_os_info():
         try:
@@ -963,7 +1146,9 @@ class _Docker(object):
         return os.environ.get("SERVERSTATS_DOCKER", "1") != "0"
 
     def status(self):
-        """Lets the dashboard offer the right Docker controls for this host."""
+        """Lets the dashboard offer the right Docker controls for this host (none on Windows)."""
+        if IS_WINDOWS:
+            return None
         present = os.path.exists(DOCKER_SOCK)
         helper = os.path.exists(DOCKER_HELPER_SOCK)
         direct = present and os.access(DOCKER_SOCK, os.R_OK | os.W_OK)
@@ -1015,6 +1200,72 @@ class _Docker(object):
 
 
 _DOCKER = _Docker()
+
+
+class _Gpu(object):
+    """GPU stats: Windows only, and off until turned on (install with -Gpu, or use the
+    dashboard). Reading them needs no administrator rights."""
+
+    def __init__(self):
+        self.override = None  # set from the dashboard via the server's replies
+        self._reader = None
+        self._error = None
+        self._retry_at = 0.0
+
+    def enabled(self):
+        if not IS_WINDOWS:
+            return False
+        if self.override is not None:
+            return self.override
+        return os.environ.get("SERVERSTATS_GPU", "0") == "1"
+
+    def status(self):
+        """Lets the dashboard offer the GPU card and toggle: None except on Windows hosts with a GPU."""
+        if not IS_WINDOWS:
+            return None
+        return {"present": bool(_win_gpu_adapters()), "available": True, "enabled": self.enabled()}
+
+    def close(self):
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
+
+    def _fail(self, e):
+        self.close()
+        self._error = str(e) or e.__class__.__name__
+        self._retry_at = time.monotonic() + 300  # try again in five minutes
+
+    def snapshot(self):
+        """Called with every sample: keeps the rate counters ticking, or lets go of them when off."""
+        if not self.enabled():
+            self.close()
+            return
+        try:
+            if self._reader is None:
+                if time.monotonic() < self._retry_at:
+                    return
+                self._reader = _WinGpuReader()
+                self._error = None
+                self._reader.collect()
+                time.sleep(0.5)  # a rate needs two readings
+            self._reader.collect()
+        except Exception as e:
+            self._fail(e)
+
+    def report(self):
+        """None when off, {"error"} when the counters can't be read, else {"adapters"}."""
+        if not self.enabled():
+            return None
+        if self._reader is None:
+            return {"error": self._error or "GPU counters are starting"}
+        try:
+            return {"adapters": self._reader.report()}
+        except Exception as e:
+            self._fail(e)
+            return {"error": self._error}
+
+
+_GPU = _Gpu()
 
 
 def _docker_delta(before, after, elapsed, mem_total):
@@ -1070,6 +1321,7 @@ def _snapshot():
         "net": _net_bytes(),
         "io": _diskstats(),
         "docker": _DOCKER.snapshot(),
+        "gpu": _GPU.snapshot(),
     }
 
 
@@ -1151,6 +1403,8 @@ def collect(sample_seconds=1.0, max_procs=500, prev=None):
         "disk_io": _disk_io(io0, io1, elapsed),
         "docker": _docker_delta(docker0, docker1, elapsed, mem["total"]),
         "docker_ctl": _DOCKER.status(),
+        "gpu": _GPU.report(),
+        "gpu_ctl": _GPU.status(),
         "net": {
             "rx_rate": max(rx1 - rx0, 0) / elapsed,
             "tx_rate": max(tx1 - tx0, 0) / elapsed,
@@ -1350,6 +1604,10 @@ def run_agent(args, argv):
                 if _DOCKER.override != settings["docker"]:
                     print("Docker stats turned %s from the dashboard" % ("on" if settings["docker"] else "off"), flush=True)
                 _DOCKER.override = settings["docker"]
+            if isinstance(settings, dict) and isinstance(settings.get("gpu"), bool):
+                if _GPU.override != settings["gpu"]:
+                    print("GPU stats turned %s from the dashboard" % ("on" if settings["gpu"] else "off"), flush=True)
+                _GPU.override = settings["gpu"]
             if can_update and isinstance(reply.get("update"), dict):
                 try:
                     _apply_update(opener, args.url, reply["update"], argv)

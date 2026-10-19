@@ -162,6 +162,22 @@
         </div>
       </div>
 
+      <div class="card" id="gpu-card" hidden>
+        <div class="proc-head">
+          <h2>GPU <span id="gpu-count" class="muted"></span></h2>
+          <span class="spacer"></span>
+          <button id="gpu-toggle" class="btn" type="button" hidden></button>
+        </div>
+        <p id="gpu-state" class="docker-state" hidden></p>
+        <div id="gpu-error" class="banner" hidden></div>
+        <div class="table-wrap" id="gpu-body">
+          <table class="table" id="gpu-table">
+            <thead><tr><th>GPU</th><th class="meter-col">Busy</th><th class="meter-col">Memory</th><th class="num">Shared memory</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
       <div class="card" id="docker-card" hidden>
         <div class="proc-head">
           <h2>Docker <span id="docker-count" class="muted"></span></h2>
@@ -238,7 +254,7 @@
           <input id="agent-name" class="input" placeholder="hostname" spellcheck="false"></label>
         <p>Run this on the host. It joins with this server's join key and shows up here within seconds, with no config changes or restarts:</p>
         <pre id="agent-install" class="code"></pre>
-        <p><strong>On Windows</strong>, run this in an elevated (Administrator) PowerShell instead. It needs Python 3.6+ installed for all users (<code>winget install Python.Python.3.12 --scope machine</code>):</p>
+        <p><strong>On Windows</strong>, run this in PowerShell instead. No administrator rights needed, but it needs Python 3.6+ (<code>winget install Python.Python.3.12</code>):</p>
         <pre id="agent-install-win" class="code"></pre>
         <p class="muted">Anyone with the join key can add a host, so treat it like a password.
           <button id="rotate-join" class="link" type="button">Make a new join key</button>
@@ -251,7 +267,7 @@
         <pre id="agent-config" class="code"></pre>
         <p><strong>2.</strong> Run this on the host:</p>
         <pre id="agent-install-token" class="code"></pre>
-        <p>On Windows, run this in an elevated PowerShell instead:</p>
+        <p>On Windows, run this in PowerShell instead (no administrator rights needed):</p>
         <pre id="agent-install-win-token" class="code"></pre>
       </div>
     </div>
@@ -267,7 +283,8 @@
       <p class="muted">The host key is trusted on first connect and pinned afterwards. Hosts whose key isn't locked to the collector are refused.</p>
     </div>
 
-    <label class="check dialog-docker"><input id="add-docker" type="checkbox"> Also show Docker containers and compose stacks</label>
+    <label class="check dialog-docker"><input id="add-docker" type="checkbox"> Also show Docker containers and compose stacks <span class="muted">(Linux)</span></label>
+    <label class="check dialog-docker"><input id="add-gpu" type="checkbox"> Also show GPU usage <span class="muted">(Windows; can be turned on or off later from the host's page)</span></label>
     <p id="docker-warning" class="muted" hidden>This lets the collector read the Docker socket (docker group), which is root-equivalent on that host. It only makes fixed, read-only requests.</p>
   </dialog>
 

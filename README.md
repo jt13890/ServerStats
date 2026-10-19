@@ -83,18 +83,22 @@ The agent identifies itself only by its token. A host can't report as another ho
 
 ### Windows hosts
 
-The same agent runs on Windows 10 / Server 2016 and newer. It needs Python 3.6+ installed **for all users** (`winget install Python.Python.3.12 --scope machine`; the Microsoft Store alias doesn't work) and nothing else. In an elevated PowerShell, run the command from **Add host**:
+The same agent runs on Windows 10 / Server 2016 and newer, **without administrator rights**. All it needs is Python 3.6+ (`winget install Python.Python.3.12` works for just your account). In a normal PowerShell, run the command from **Add host**:
 ```powershell
 & ([scriptblock]::Create((irm 'https://stats.example.com/api/agent/install.ps1'))) `
-  -Url 'https://stats.example.com' -Join '<join key>' [-Name 'desktop-1']
+  -Url 'https://stats.example.com' -Join '<join key>' [-Name 'desktop-1'] [-Gpu]
 ```
-The installer puts the agent and its settings in `C:\ProgramData\ServerStats` (only administrators and SYSTEM can change them), and registers a **ServerStats Agent** scheduled task that starts at boot, restarts if it stops, and runs as the unprivileged `LOCAL SERVICE` account. Logs: `C:\ProgramData\ServerStats\logs\agent.log` (rotated at 1 MB). Other options: `-Token` instead of `-Join`, `-Interval 15`, `-CaFile`, `-Python path\to\python.exe`, and `-Uninstall`. If your Python is installed for a single user, or some processes show no details, add `-RunAsSystem`.
+The installer puts the agent and its settings in `%LOCALAPPDATA%\ServerStats` (only you and administrators can read them) and starts it hidden in the background whenever you sign in; it's your own `Run` registry entry, nothing system-wide. Logs: `%LOCALAPPDATA%\ServerStats\logs\agent.log` (rotated at 1 MB). Other options: `-Token` instead of `-Join`, `-Interval 15`, `-CaFile`, `-Python path\to\python.exe`, and `-Uninstall`.
+
+For a machine that should report from boot, before anyone signs in (a Windows server), run the installer from an elevated PowerShell with **`-Service`** instead. That installs a scheduled task that starts at boot, restarts if the agent stops, and runs as the unprivileged `LOCAL SERVICE` account (the agent then lives in `C:\ProgramData\ServerStats`). It needs Python installed for all users, or `-RunAsSystem`. Use one mode or the other on a host.
+
+**GPU.** Turn on GPU stats with `-Gpu`, or with the **Turn on GPU stats** button on the host's page (the same kind of switch as Docker's). You get a card with each GPU's busy percentage (the busiest engine, like Task Manager, and which engine it is: 3D, VideoEncode...) and its memory. It works for NVIDIA, AMD and Intel from the Windows performance counters, which any user can read; it needs Windows 10 1709 or newer and a WDDM 2.0 driver. GPU stats are live only (no history graphs yet), and temperature and power aren't included because Windows doesn't offer them without vendor tools.
 
 What differs from Linux:
-- **Push agent only.** There is no SSH pull mode, and no Docker section.
-- **No load average.** Windows doesn't have one, so the host page leaves it out. The overall load meters still work: they come from CPU, memory and disk I/O.
+- **Push agent only.** There is no SSH pull mode, and no Docker section: the Windows agent never touches Docker.
+- **No load average.** Windows doesn't have one, so the host page leaves it out. The overall Load meters still work: they come from CPU, memory and disk I/O.
 - **Updates:** remote updates are off. To update, rerun the installer (it keeps the host's token).
-- **Processes** show the executable's full path instead of the command line, and a process counts as running if it used CPU since the last report.
+- **Processes** are read the way Task Manager reads them, so a standard user sees CPU and memory for every process. The owner account and the executable's full path (instead of the command line) are only known for processes your account may open, so other users' and protected processes show their name only.
 - **Disks** are the fixed drives (C:, D:, …); network, optical and removable drives are left out. Disk I/O is read from each physical drive, and network totals from the physical adapters.
 
 ### Updating agents
@@ -313,7 +317,7 @@ Layout:
 ```
 agent/serverstats_agent.py   collector + push agent (stdlib only)
 agent/install.sh             installer: systemd or OpenRC agent service, or locked SSH access
-agent/install.ps1            installer for Windows: agent as a scheduled task
+agent/install.ps1            installer for Windows: runs as you from sign-in, or as a boot-time service (-Service)
 server/app/main.py           FastAPI app: UI API, agent ingest, auth gate
 server/app/ssh_poller.py     SSH pull mode (asyncssh): forced-command check, host key pinning
 server/app/store.py          latest samples + tiered SQLite history (raw / 5 min / 1 h)

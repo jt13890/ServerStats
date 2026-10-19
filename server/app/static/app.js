@@ -518,6 +518,7 @@ function renderDetail(name) {
     if (!host) return;
     if (!proc.paused) procData = host.processes || [];
     drawHost();
+    drawGpu();
     drawDocker();
     drawProcs();
   }
@@ -685,6 +686,47 @@ function renderDetail(name) {
   // Stacks the user has expanded to show their containers.
   const expanded = new Set();
 
+  function drawGpu() {
+    const gp = host.gpu;
+    const ctl = host.gpu_ctl; // only Windows agents send this
+    $('#gpu-card').hidden = !gp && !(ctl && ctl.present);
+    if ($('#gpu-card').hidden) return;
+
+    const on = ctl ? ctl.enabled : !!gp;
+    const want = host.gpu_pref != null ? host.gpu_pref : on;
+    const toggle = $('#gpu-toggle');
+    toggle.hidden = !(host.mode === 'agent' && ctl);
+    toggle.textContent = want ? 'Turn off GPU stats' : 'Turn on GPU stats';
+    toggle.dataset.want = String(!want);
+    let stateText = '';
+    if (want !== on) {
+      stateText = `Turning GPU stats ${want ? 'on' : 'off'}; the agent picks this up on its next report.`;
+    } else if (!on) {
+      stateText = 'GPU stats are off for this host. Turn them on to see how busy each GPU is and how much of its memory is in use.';
+    }
+    $('#gpu-state').hidden = !stateText;
+    $('#gpu-state').textContent = stateText;
+
+    const err = $('#gpu-error');
+    err.hidden = !(gp && gp.error);
+    err.textContent = (gp && gp.error) || '';
+    const showData = !!(gp && !gp.error);
+    $('#gpu-body').hidden = !showData;
+    $('#gpu-count').textContent = showData && gp.adapters.length > 1 ? `${gp.adapters.length} GPUs` : '';
+    if (!showData) return;
+    $('#gpu-table tbody').replaceChildren(...(gp.adapters.length ? gp.adapters.map((a) => {
+      const memPct = a.mem_total ? (100 * a.mem_used) / a.mem_total : null;
+      return h('tr', null,
+        h('td', null, h('b', { text: a.name })),
+        h('td', null, meter(null, a.util, `${fmtPct(a.util)} busy` + (a.engine ? ` · mostly ${a.engine}` : ''),
+          null, a.engine ? `${fmtPct(a.util)} · ${a.engine}` : fmtPct(a.util))),
+        h('td', { class: 'mem-cell' }, a.mem_total
+          ? meter(null, memPct, `${fmtBytes(a.mem_used)} of ${fmtBytes(a.mem_total)}`, null, `${fmtBytes(a.mem_used)} · ${fmtPct(memPct)}`)
+          : h('span', { text: fmtBytes(a.mem_used) })),
+        h('td', { class: 'num', text: a.shared_used == null ? '—' : fmtBytes(a.shared_used) }));
+    }) : [h('tr', null, h('td', { colspan: 4, class: 'muted', text: 'No GPU data yet' }))]));
+  }
+
   function drawDocker() {
     const dk = host.docker;
     const ctl = host.docker_ctl; // null for SSH hosts and agents older than 1.4.0
@@ -810,6 +852,20 @@ function renderDetail(name) {
       ? `Disk space is container writable layers plus their volumes (bind mounts not included), measured ${fmtAgo(serverNow() - dk.disk_at)}. CPU share is of all ${ncpu} cores.`
       : 'Disk space per stack is measured by the push agent every 15 minutes; it isn\'t available over SSH.';
   }
+
+  $('#gpu-toggle').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try {
+      await apiPost(`/api/hosts/${enc}/gpu`, { enabled: btn.dataset.want === 'true' });
+      await loadHost();
+    } catch (err) {
+      $('#gpu-state').hidden = false;
+      $('#gpu-state').textContent = `Couldn't change the GPU setting: ${err.message}`;
+    } finally {
+      btn.disabled = false;
+    }
+  });
 
   $('#docker-toggle').addEventListener('click', async (e) => {
     const btn = e.currentTarget;
@@ -1717,12 +1773,13 @@ function setupDialog() {
       $('#agent-install').textContent =
         `${installer} --join ${quote(joinKey)}${name ? ' --name ' + quote(name) : ''}${docker}`;
     }
+    const gpu = $('#add-gpu').checked ? ' -Gpu' : '';
     const winInstaller = `& ([scriptblock]::Create((irm ${psQuote(origin + '/api/agent/install.ps1')}))) -Url ${psQuote(origin)}`;
     if (joinKey) {
       const name = $('#agent-name').value.trim();
-      $('#agent-install-win').textContent = `${winInstaller} -Join ${psQuote(joinKey)}${name ? ' -Name ' + psQuote(name) : ''}`;
+      $('#agent-install-win').textContent = `${winInstaller} -Join ${psQuote(joinKey)}${name ? ' -Name ' + psQuote(name) : ''}${gpu}`;
     }
-    $('#agent-install-win-token').textContent = `${winInstaller} -Token ${token}`;
+    $('#agent-install-win-token').textContent = `${winInstaller} -Token ${token}${gpu}`;
     const aName = $('#agent-name-cfg').value.trim() || 'my-server';
     $('#agent-config').textContent =
       `hosts:\n  - name: ${yamlName(aName)}\n    mode: agent\n    token: ${token}`;
@@ -1752,7 +1809,7 @@ function setupDialog() {
   });
   dialog.querySelector('[data-action="close"]').addEventListener('click', () => dialog.close());
   dialog.addEventListener('click', (e) => { if (e.target === dialog) dialog.close(); });
-  ['#agent-name', '#agent-name-cfg', '#ssh-name', '#ssh-address', '#add-docker'].forEach((id) => $(id).addEventListener('input', update));
+  ['#agent-name', '#agent-name-cfg', '#ssh-name', '#ssh-address', '#add-docker', '#add-gpu'].forEach((id) => $(id).addEventListener('input', update));
   $('#rotate-join').addEventListener('click', async () => {
     if (!confirm('Make a new join key? The current one stops working for new hosts; hosts that already joined are unaffected.')) return;
     try {

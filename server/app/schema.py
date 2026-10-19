@@ -12,6 +12,7 @@ MAX_DISKS = 64
 MAX_DEVICES = 64
 MAX_CONTAINERS = 500
 MAX_VOLUMES = 1000
+MAX_GPUS = 16
 
 
 def _num(v, default=0.0):
@@ -79,6 +80,34 @@ def _docker(v, ncpu=1):
             if isinstance(x, dict)
         ]
     return {"containers": containers, "volumes": volumes, "disk_at": _opt(v.get("disk_at"))}
+
+
+def _gpu(v):
+    """GPU stats from a Windows agent: None when off, {"error"} or {"adapters"}."""
+    if not isinstance(v, dict):
+        return None
+    if v.get("error"):
+        return {"error": _str(v.get("error"), 300)}
+    adapters = []
+    for a in _list(v.get("adapters"))[:MAX_GPUS]:
+        if not isinstance(a, dict):
+            continue
+        adapters.append({
+            "name": _str(a.get("name"), 128) or "GPU",
+            "util": min(max(_num(a.get("util")), 0.0), 100.0),
+            "engine": _str(a.get("engine"), 32),
+            "mem_used": _num(a.get("mem_used")),
+            "mem_total": _opt(a.get("mem_total")),
+            "shared_used": _opt(a.get("shared_used")),
+        })
+    return {"adapters": adapters}
+
+
+def _ctl(v):
+    """What an agent can do about an optional section (Docker, GPU), so the dashboard can offer the toggle."""
+    if not isinstance(v, dict):
+        return None
+    return {k: v.get(k) is True for k in ("present", "available", "enabled")}
 
 
 def _pct(v, top=100.0):
@@ -169,7 +198,8 @@ def normalize(d: dict, max_procs: int) -> dict:
         "tasks": {k: _int(tasks.get(k)) for k in ("total", "running", "sleeping", "zombie", "threads")},
         "docker": _docker(d.get("docker"), ncpu),
         # What the agent can do about Docker, so the dashboard can offer the toggle.
-        "docker_ctl": {k: _dict(d.get("docker_ctl")).get(k) is True for k in ("present", "available", "enabled")}
-        if isinstance(d.get("docker_ctl"), dict) else None,
+        "docker_ctl": _ctl(d.get("docker_ctl")),
+        "gpu": _gpu(d.get("gpu")),
+        "gpu_ctl": _ctl(d.get("gpu_ctl")),
         "processes": processes,
     }

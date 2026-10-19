@@ -1083,6 +1083,18 @@ def test_collect_with_windows_backends(monkeypatch):
         }
 
     monkeypatch.setattr(a, "_win_proc_snapshot", procs, raising=False)
+
+    class FakeGpu:  # the real one needs the Windows performance counters
+        def snapshot(self):
+            return None
+
+        def report(self):
+            return {"adapters": [{"name": "RTX", "util": 12.5, "engine": "3D", "mem_used": 1, "mem_total": 2, "shared_used": 3}]}
+
+        def status(self):
+            return {"present": True, "available": True, "enabled": True}
+
+    monkeypatch.setattr(a, "_GPU", FakeGpu())
     s = a.collect(0.01, 50)[0]
     assert s["platform"] == "windows" and s["os"] == "Windows 11 Pro 24H2" and s["load"] == [] and s["uptime"] == 12345.0
     by_pid = {p["pid"]: p for p in s["processes"]}
@@ -1090,10 +1102,125 @@ def test_collect_with_windows_backends(monkeypatch):
     assert by_pid[100]["state"] == "R" and by_pid[4]["state"] == "S"
     assert by_pid[4]["cmd"] == "System"  # no path (access denied): falls back to the name
     assert by_pid[100]["started"] == 1700000000
-    assert s["tasks"]["running"] == 1 and s["docker"] is None
+    assert s["tasks"]["running"] == 1 and s["docker"] is None and s["docker_ctl"] is None  # no Docker on Windows
+    assert s["gpu"]["adapters"][0]["util"] == 12.5 and s["gpu_ctl"]["enabled"] is True
     assert s["disk_io"]["devices"][0]["label"] == "Disk 0"
     assert s["disks"][0]["mount"] == "C:\\"
     # What the server gets from a Windows agent is accepted as it is.
     from app.schema import normalize
     assert normalize(s, 100)["platform"] == "windows"
     assert a.updates_enabled() is False
+
+
+# -- Windows: no-admin process list, GPU ----------------------------------------------
+
+def _process_entry(pid, ppid, threads, create, user, kernel, ws, name, base, name_at, nxt, ptr=8):
+    """One SYSTEM_PROCESS_INFORMATION entry as NtQuerySystemInformation lays it out."""
+    import struct
+    o = (64, 80, 88, 144, "<Q", 152) if ptr == 8 else (60, 68, 72, 104, "<I", 112)
+    buf = bytearray(o[5])
+    struct.pack_into("<II", buf, 0, nxt, threads)
+    struct.pack_into("<qqq", buf, 32, create, user, kernel)
+    raw = name.encode("utf-16-le")
+    struct.pack_into("<HH", buf, 56, len(raw), len(raw))
+    struct.pack_into(o[4], buf, o[0], base + name_at if raw else 0)
+    struct.pack_into(o[4], buf, o[1], pid)
+    struct.pack_into(o[4], buf, o[2], ppid)
+    struct.pack_into(o[4], buf, o[3], ws)
+    return bytes(buf), raw
+
+
+def test_win_parse_processes():
+    from agent_collector import _win_parse_processes
+
+    for ptr in (8, 4):
+        size = 152 if ptr == 8 else 112
+        base = 0x7FF000000000 if ptr == 8 else 0x10000000
+        names = ["", "System", "chrome.exe"]
+        # Entries first, then the names they point at, like the real buffer.
+        names_at = size * 3
+        offsets, pos = [], names_at
+        for n in names:
+            offsets.append(pos)
+            pos += len(n.encode("utf-16-le"))
+        entries = [
+            _process_entry(0, 0, 8, 0, 0, 999999, 8192, names[0], base, offsets[0], size, ptr),
+            _process_entry(4, 0, 200, 133000000000000000, 5, 10, 4096, names[1], base, offsets[1], size, ptr),
+            _process_entry(1234, 4, 31, 133000000000000000 + 10000000, 100, 50, 123456, names[2], base, offsets[2], 0, ptr),
+        ]
+        raw = b"".join(e[0] for e in entries) + b"".join(e[1] for e in entries)
+        procs = _win_parse_processes(raw, base, ptr)
+        assert sorted(procs) == [4, 1234]  # the idle process is left out
+        assert procs[4]["name"] == "System" and procs[4]["threads"] == 200 and procs[4]["ticks"] == 15
+        chrome = procs[1234]
+        assert chrome["name"] == "chrome.exe" and chrome["ppid"] == 4 and chrome["rss"] == 123456
+        assert chrome["ticks"] == 150 and chrome["starttime"] == 133000000000000000 + 10000000
+        assert chrome["started"] == int((133000000000000000 + 10000000 - 116444736000000000) / 10000000)
+
+
+def test_gpu_aggregate():
+    from agent_collector import _gpu_aggregate
+
+    luid_a, luid_b = "0x00000000_0x0000f3a5", "0x00000000_0x00010a2b"
+    adapters = [{"luid": luid_a, "name": "NVIDIA GeForce RTX 4070", "mem_total": 12 * 1024 ** 3},
+                {"luid": luid_b, "name": "Intel(R) UHD Graphics", "mem_total": 0}]
+    engines = [
+        # Two processes on the same 3D engine add up; another engine type is separate.
+        ("pid_10_luid_0x00000000_0x0000F3A5_phys_0_eng_0_engtype_3D", 30.0),
+        ("pid_11_luid_0x00000000_0x0000F3A5_phys_0_eng_0_engtype_3D", 25.0),
+        ("pid_11_luid_0x00000000_0x0000F3A5_phys_0_eng_3_engtype_VideoEncode", 40.0),
+        ("pid_12_luid_0x00000000_0x00010A2B_phys_0_eng_0_engtype_3D", 0.2),
+        ("junk", 99.0),
+    ]
+    dedicated = [("luid_0x00000000_0x0000F3A5_phys_0", 2.0 * 1024 ** 3)]
+    shared = [("luid_0x00000000_0x0000F3A5_phys_0", 100.0), ("luid_0x00000000_0x00010A2B_phys_0", 500.0)]
+    out = _gpu_aggregate(engines, dedicated, shared, adapters)
+    assert out[0] == {"name": "NVIDIA GeForce RTX 4070", "util": 55.0, "engine": "3D", "mem_used": 2.0 * 1024 ** 3,
+                      "mem_total": 12 * 1024 ** 3, "shared_used": 100.0}
+    assert out[1]["util"] == 0.2 and out[1]["engine"] == "" and out[1]["mem_total"] is None and out[1]["shared_used"] == 500.0
+    # Utilisation is capped, and without DXGI the GPUs are named from the counters.
+    capped = _gpu_aggregate([("pid_1_luid_0x0_0x1_phys_0_eng_0_engtype_3D", 80.0),
+                             ("pid_2_luid_0x0_0x1_phys_0_eng_0_engtype_3D", 80.0)], [], [], [])
+    assert capped == [{"name": "GPU 0", "util": 100.0, "engine": "3D", "mem_used": 0.0, "mem_total": None, "shared_used": None}]
+    assert _gpu_aggregate([], [], [], []) == []
+
+
+def test_gpu_toggle_and_settings(client):
+    ctl = {"present": True, "available": True, "enabled": False}
+    gpu = {"adapters": [{"name": "RTX", "util": 150, "engine": "3D", "mem_used": 5, "mem_total": 10, "shared_used": None}]}
+    ingest(client, TOKEN_A, sample(platform="windows", gpu_ctl=ctl, gpu=gpu, docker_ctl=None))
+    h = client.get("/api/hosts/alpha", headers=USER).json()
+    assert h["gpu_ctl"] == ctl and h["gpu_pref"] is None and h["docker_ctl"] is None
+    assert h["gpu"]["adapters"][0]["util"] == 100.0  # clamped
+    assert "settings" not in ingest(client, TOKEN_A, sample()).json()
+
+    assert client.post("/api/hosts/alpha/gpu", json={"enabled": True}, headers=USER).status_code == 403
+    assert client.post("/api/hosts/alpha/gpu", json={"enabled": "yes"}, headers=ACTION).status_code == 400
+    assert client.post("/api/hosts/alpha/gpu", json={"enabled": True}, headers=ACTION).status_code == 200
+    assert ingest(client, TOKEN_A, sample()).json()["settings"] == {"gpu": True}
+    # Docker and GPU choices are kept apart, and both reach the agent.
+    assert client.post("/api/hosts/alpha/docker", json={"enabled": False}, headers=ACTION).status_code == 200
+    assert ingest(client, TOKEN_A, sample()).json()["settings"] == {"docker": False, "gpu": True}
+    h = client.get("/api/hosts/alpha", headers=USER).json()
+    assert h["gpu_pref"] is True and h["docker_pref"] is False
+
+    ingest(client, TOKEN_B, sample(gpu={"error": "no counters"}, gpu_ctl="nonsense"))
+    h = client.get("/api/hosts/beta", headers=USER).json()
+    assert h["gpu"] == {"error": "no counters"} and h["gpu_ctl"] is None
+
+
+def test_host_prefs_table_gains_gpu_column(tmp_path):
+    import sqlite3
+    from app.store import Store
+
+    db = tmp_path / "old.db"
+    old = sqlite3.connect(db)
+    old.executescript("CREATE TABLE host_prefs (name TEXT PRIMARY KEY, docker INTEGER);"
+                      "INSERT INTO host_prefs VALUES ('alpha', 1);")
+    old.commit()
+    old.close()
+    store = Store(db)
+    assert store.docker_pref("alpha") is True and store.gpu_pref("alpha") is None
+    store.set_gpu_pref("alpha", True)
+    store.set_docker_pref("alpha", False)  # must not wipe the GPU choice
+    assert store.gpu_pref("alpha") is True and store.docker_pref("alpha") is False
