@@ -647,7 +647,8 @@ function renderDetail(name) {
     const net = host.net || {};
     const tasks = host.tasks || {};
     tiles.replaceChildren(
-      tile('CPU', fmtPct(host.cpu.percent), `${host.cpu.count} cores · load ${(host.load || []).map((l) => l.toFixed(2)).join(' ')}`),
+      tile('CPU', fmtPct(host.cpu.percent), `${host.cpu.count} cores`
+        + (host.platform === 'windows' ? '' : ` · load ${(host.load || []).map((l) => l.toFixed(2)).join(' ')}`)),
       tile('Memory', fmtPct(mem.percent),
         `${fmtBytes(mem.used)} of ${fmtBytes(mem.total)}` + (mem.swap_total ? ` · swap ${fmtBytes(mem.swap_used)}` : '')),
       tile('Disk I/O busy', fmtPct(dio.util), `read ${fmtRate(dio.read_rate)} · write ${fmtRate(dio.write_rate)}`),
@@ -1122,7 +1123,7 @@ function momentView(m, host) {
   const mounts = (m.storage || []).filter((d) => d.total);
   const fullest = mounts.reduce((a, d) => (!a || d.used / d.total > a.used / a.total ? d : a), null);
   kids.push(h('div', { class: 'tiles moment-stats' },
-    tile('CPU', fmtPct(st.cpu), `load ${n2(st.load1)} ${n2(st.load5)} ${n2(st.load15)}`),
+    tile('CPU', fmtPct(st.cpu), host && host.platform === 'windows' ? '' : `load ${n2(st.load1)} ${n2(st.load5)} ${n2(st.load15)}`),
     tile('Memory', fmtPct(st.mem), st.swap == null ? 'no swap' : `swap ${fmtPct(st.swap)}`),
     tile('Disk I/O busy', fmtPct(st.disk_util), `read ${fmtRate(st.disk_read)} · write ${fmtRate(st.disk_write)}`),
     tile('Network in', fmtRate(st.rx), `out ${fmtRate(st.tx)}`),
@@ -1701,6 +1702,7 @@ function setupDialog() {
   let token = '';
 
   const quote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  const psQuote = (s) => `'${String(s).replace(/'/g, "''")}'`; // PowerShell single quotes
   const yamlName = (s) => (/^[A-Za-z0-9._-]+$/.test(s) ? s : JSON.stringify(s));
 
   function update() {
@@ -1715,6 +1717,12 @@ function setupDialog() {
       $('#agent-install').textContent =
         `${installer} --join ${quote(joinKey)}${name ? ' --name ' + quote(name) : ''}${docker}`;
     }
+    const winInstaller = `& ([scriptblock]::Create((irm ${psQuote(origin + '/api/agent/install.ps1')}))) -Url ${psQuote(origin)}`;
+    if (joinKey) {
+      const name = $('#agent-name').value.trim();
+      $('#agent-install-win').textContent = `${winInstaller} -Join ${psQuote(joinKey)}${name ? ' -Name ' + psQuote(name) : ''}`;
+    }
+    $('#agent-install-win-token').textContent = `${winInstaller} -Token ${token}`;
     const aName = $('#agent-name-cfg').value.trim() || 'my-server';
     $('#agent-config').textContent =
       `hosts:\n  - name: ${yamlName(aName)}\n    mode: agent\n    token: ${token}`;

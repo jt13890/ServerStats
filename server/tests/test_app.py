@@ -994,3 +994,106 @@ def test_zooming_into_old_history_uses_what_is_left(tmp_path):
     for offset in range(0, 300, 60):  # any minute, whether or not a 5-minute row starts in it
         m = store.moment("h", start + 3600 + offset, 60)
         assert m["stats"]["cpu"] == pytest.approx(69.6, abs=0.3), offset
+
+
+# -- Windows hosts -----------------------------------------------------------------
+
+def test_windows_installer_is_served_without_sso(client):
+    r = client.get("/api/agent/install.ps1")
+    assert r.status_code == 200
+    assert "Register-ScheduledTask" in r.text and "serverstats_agent.py" in r.text
+
+
+def test_windows_sample_is_accepted(client):
+    win = sample(
+        platform="windows", os="Windows 11 Pro 24H2", kernel="10.0.26100", arch="AMD64", load=[],
+        disks=[{"mount": "C:\\", "device": "C:", "fs": "ntfs", "total": 1000, "used": 400, "free": 600, "percent": 40.0}],
+        disk_io={"read_rate": 1, "write_rate": 2, "util": 3, "devices": [
+            {"name": "PhysicalDrive0", "label": "Disk 0", "virtual": False, "read_rate": 1, "write_rate": 2, "util": 3}]},
+        processes=[{"pid": 4, "ppid": 0, "name": "System", "state": "S", "user": "SYSTEM", "cpu": 0.0, "mem": 0.1,
+                    "rss": 1000, "threads": 200, "started": 1700000000, "cmd": "System"}],
+    )
+    assert ingest(client, TOKEN_A, win).status_code == 200
+    h = client.get("/api/hosts/alpha", headers=USER).json()
+    assert h["platform"] == "windows" and h["os"] == "Windows 11 Pro 24H2"
+    assert h["load"] == [0.0, 0.0, 0.0]
+    assert h["disks"][0]["mount"] == "C:\\"
+    assert h["processes"][0]["user"] == "SYSTEM"
+    # Anything but "windows" is treated as Linux, so the field can't be abused.
+    ingest(client, TOKEN_B, sample(platform="<b>"))
+    assert client.get("/api/hosts/beta", headers=USER).json()["platform"] == "linux"
+    assert sample()["platform"] == "linux"
+
+
+def test_windows_helpers():
+    import struct
+    from agent_collector import _filetime_to_unix, _win_os_name, _win_parse_pagefiles
+
+    assert _filetime_to_unix(116444736000000000 + 10000000 * 1700000000) == 1700000000
+    assert _filetime_to_unix(0) == 0
+    # Windows 11 still calls itself Windows 10 in the registry.
+    assert _win_os_name("Windows 10 Pro", "26100", "24H2") == "Windows 11 Pro 24H2"
+    assert _win_os_name("Windows 10 Pro", "19045", "22H2") == "Windows 10 Pro 22H2"
+    assert _win_os_name("Windows Server 2022 Standard", "20348") == "Windows Server 2022 Standard"
+    assert _win_os_name("", "junk") == "Windows"
+    # Two page files: NextEntryOffset, TotalSize, TotalInUse, PeakUsage, then the name.
+    raw = struct.pack("<IIII", 28, 1000, 250, 300) + b"\0" * 12 + struct.pack("<IIII", 0, 500, 5, 5)
+    assert _win_parse_pagefiles(raw, 4096) == (1500 * 4096, 255 * 4096)
+    assert _win_parse_pagefiles(b"", 4096) == (0, 0)
+
+
+def test_agent_log_file_is_rotated(tmp_path):
+    from agent_collector import _LogFile
+
+    log = _LogFile(str(tmp_path / "agent.log"), limit=100)
+    for i in range(30):
+        log.write("line %d\n" % i)
+    assert (tmp_path / "agent.log.1").exists()
+    assert 0 < (tmp_path / "agent.log").stat().st_size <= 100 + 20
+    assert "line 29" in (tmp_path / "agent.log").read_text()
+
+
+def test_collect_with_windows_backends(monkeypatch):
+    """The Windows code paths in collect(), with the Win32 calls stubbed out."""
+    import agent_collector as a
+
+    calls = {"n": 0}
+
+    def tick():
+        calls["n"] += 1
+        return calls["n"]
+
+    monkeypatch.setattr(a, "IS_WINDOWS", True)
+    monkeypatch.setattr(a, "_win_cpu_times", lambda: ({"cpu0": (100 * tick(), 100 * tick(), 0)}, 1700000000), raising=False)
+    monkeypatch.setattr(a, "_win_diskstats", lambda: {"PhysicalDrive0": (1000 * tick(), 500 * tick(), 10 * tick())}, raising=False)
+    monkeypatch.setattr(a, "_win_net_bytes", lambda: (1000 * tick(), 2000 * tick()), raising=False)
+    monkeypatch.setattr(a, "_win_uptime", lambda: 12345.0, raising=False)
+    monkeypatch.setattr(a, "_win_os_info", lambda: "Windows 11 Pro 24H2", raising=False)
+    monkeypatch.setattr(a, "_win_meminfo", lambda: {"total": 8, "available": 4, "used": 4, "percent": 50.0,
+                                                    "swap_total": 0, "swap_used": 0}, raising=False)
+    monkeypatch.setattr(a, "_win_disks", lambda: [{"mount": "C:\\", "device": "C:", "fs": "ntfs", "total": 10, "used": 4,
+                                                   "free": 6, "percent": 40.0}], raising=False)
+
+    def procs():
+        n = tick()
+        proc = {"state": "S", "ppid": 0, "threads": 4, "starttime": 5, "started": 1700000000}
+        return {
+            4: dict(proc, name="System", ticks=100, rss=1000, uid="SYSTEM", cmd=""),
+            100: dict(proc, name="app.exe", ticks=100 + n * 5000000, rss=2000, uid="alice", cmd="C:\\x\\app.exe"),
+        }
+
+    monkeypatch.setattr(a, "_win_proc_snapshot", procs, raising=False)
+    s = a.collect(0.01, 50)[0]
+    assert s["platform"] == "windows" and s["os"] == "Windows 11 Pro 24H2" and s["load"] == [] and s["uptime"] == 12345.0
+    by_pid = {p["pid"]: p for p in s["processes"]}
+    assert by_pid[100]["user"] == "alice" and by_pid[100]["cmd"] == "C:\\x\\app.exe"
+    assert by_pid[100]["state"] == "R" and by_pid[4]["state"] == "S"
+    assert by_pid[4]["cmd"] == "System"  # no path (access denied): falls back to the name
+    assert by_pid[100]["started"] == 1700000000
+    assert s["tasks"]["running"] == 1 and s["docker"] is None
+    assert s["disk_io"]["devices"][0]["label"] == "Disk 0"
+    assert s["disks"][0]["mount"] == "C:\\"
+    # What the server gets from a Windows agent is accepted as it is.
+    from app.schema import normalize
+    assert normalize(s, 100)["platform"] == "windows"
+    assert a.updates_enabled() is False

@@ -1,6 +1,6 @@
 # ServerStats
 
-A small, self-hosted dashboard for the Linux machines you run. It tracks:
+A small, self-hosted dashboard for the Linux and Windows machines you run. It tracks:
 
 - **CPU**: total utilization, per-core count, load average
 - **RAM**: used/available memory and swap
@@ -17,7 +17,7 @@ History is kept forever, and the charts go from the last hour out to a full year
 
 ## How hosts are monitored: agent or SSH
 
-Both modes run the same collector (`agent/serverstats_agent.py`). It uses only the Python standard library, needs Python 3.6+, and reads everything from `/proc`. You can mix both modes in one fleet.
+Both modes run the same collector (`agent/serverstats_agent.py`). It uses only the Python standard library, needs Python 3.6+, and reads everything from `/proc` (or, on Windows, from the Win32 APIs through `ctypes`). You can mix both modes in one fleet. Windows hosts use the push agent only; see [Windows hosts](#windows-hosts).
 
 | | **Push agent** (recommended) | **SSH pull** |
 |---|---|---|
@@ -81,6 +81,22 @@ Alternatively, list the host in `config/config.yaml` yourself (`name`, `mode: ag
 
 The agent identifies itself only by its token. A host can't report as another host.
 
+### Windows hosts
+
+The same agent runs on Windows 10 / Server 2016 and newer. It needs Python 3.6+ installed **for all users** (`winget install Python.Python.3.12 --scope machine`; the Microsoft Store alias doesn't work) and nothing else. In an elevated PowerShell, run the command from **Add host**:
+```powershell
+& ([scriptblock]::Create((irm 'https://stats.example.com/api/agent/install.ps1'))) `
+  -Url 'https://stats.example.com' -Join '<join key>' [-Name 'desktop-1']
+```
+The installer puts the agent and its settings in `C:\ProgramData\ServerStats` (only administrators and SYSTEM can change them), and registers a **ServerStats Agent** scheduled task that starts at boot, restarts if it stops, and runs as the unprivileged `LOCAL SERVICE` account. Logs: `C:\ProgramData\ServerStats\logs\agent.log` (rotated at 1 MB). Other options: `-Token` instead of `-Join`, `-Interval 15`, `-CaFile`, `-Python path\to\python.exe`, and `-Uninstall`. If your Python is installed for a single user, or some processes show no details, add `-RunAsSystem`.
+
+What differs from Linux:
+- **Push agent only.** There is no SSH pull mode, and no Docker section.
+- **No load average.** Windows doesn't have one, so the host page leaves it out. The overall load meters still work: they come from CPU, memory and disk I/O.
+- **Updates:** remote updates are off. To update, rerun the installer (it keeps the host's token).
+- **Processes** show the executable's full path instead of the command line, and a process counts as running if it used CPU since the last report.
+- **Disks** are the fixed drives (C:, D:, …); network, optical and removable drives are left out. Disk I/O is read from each physical drive, and network totals from the physical adapters.
+
 ### Updating agents
 
 When the server has a newer agent than a host is running, the host's page shows **Update agent**, and the overview shows **Update agents (N)** for all of them. Updating the server (`git pull` plus `docker compose up -d --build`) is what makes a new agent version available.
@@ -130,14 +146,15 @@ On hosts with Docker, the host's page has a **Docker** section. Turn it on with 
 
 ## Putting it behind Authentik
 
-The UI and its API sit behind Authentik. These five exact paths **must bypass** Authentik, because agents authenticate with their own per-host tokens or the join key:
+The UI and its API sit behind Authentik. These six exact paths **must bypass** Authentik, because agents authenticate with their own per-host tokens or the join key:
 
 | Path | Purpose |
 |---|---|
 | `/api/ingest` | agents POST their stats here (bearer token required) |
 | `/api/enroll` | new agents join here (join key required) |
 | `/api/agent/serverstats_agent.py` | agent download, used by the installer |
-| `/api/agent/install.sh` | installer download |
+| `/api/agent/install.sh` | installer download (Linux) |
+| `/api/agent/install.ps1` | installer download (Windows) |
 | `/healthz` | health check |
 
 If your agents can reach ServerStats on your LAN, you can also point them at an internal address instead. Nothing else changes.
@@ -153,6 +170,7 @@ If your agents can reach ServerStats on your LAN, you can also point them at an 
      ^/api/enroll$
      ^/api/agent/serverstats_agent\.py$
      ^/api/agent/install\.sh$
+     ^/api/agent/install\.ps1$
      ^/healthz$
      ```
 2. **Applications → Create**: name it ServerStats, select the provider, and optionally restrict it to a group via *Policy / Group bindings*.
@@ -295,6 +313,7 @@ Layout:
 ```
 agent/serverstats_agent.py   collector + push agent (stdlib only)
 agent/install.sh             installer: systemd or OpenRC agent service, or locked SSH access
+agent/install.ps1            installer for Windows: agent as a scheduled task
 server/app/main.py           FastAPI app: UI API, agent ingest, auth gate
 server/app/ssh_poller.py     SSH pull mode (asyncssh): forced-command check, host key pinning
 server/app/store.py          latest samples + tiered SQLite history (raw / 5 min / 1 h)

@@ -232,12 +232,14 @@
     </div>
 
     <div data-panel="agent">
-      <p>The agent is a single Python file with no dependencies. It pushes stats to this server over HTTPS, so hosts need no inbound ports. Works with systemd and OpenRC.</p>
+      <p>The agent is a single Python file with no dependencies. It pushes stats to this server over HTTPS, so hosts need no inbound ports. Works with systemd, OpenRC and Windows.</p>
       <div id="join-flow">
         <label class="field">Name on the dashboard <span class="muted">(optional, defaults to the host's hostname)</span>
           <input id="agent-name" class="input" placeholder="hostname" spellcheck="false"></label>
         <p>Run this on the host. It joins with this server's join key and shows up here within seconds, with no config changes or restarts:</p>
         <pre id="agent-install" class="code"></pre>
+        <p><strong>On Windows</strong>, run this in an elevated (Administrator) PowerShell instead. It needs Python 3.6+ installed for all users (<code>winget install Python.Python.3.12 --scope machine</code>):</p>
+        <pre id="agent-install-win" class="code"></pre>
         <p class="muted">Anyone with the join key can add a host, so treat it like a password.
           <button id="rotate-join" class="link" type="button">Make a new join key</button>
           (hosts that already joined keep working).</p>
@@ -249,6 +251,8 @@
         <pre id="agent-config" class="code"></pre>
         <p><strong>2.</strong> Run this on the host:</p>
         <pre id="agent-install-token" class="code"></pre>
+        <p>On Windows, run this in an elevated PowerShell instead:</p>
+        <pre id="agent-install-win-token" class="code"></pre>
       </div>
     </div>
 

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """ServerStats agent / collector.
 
-Reads host and per-process statistics straight from /proc. Standard library
-only, Python 3.6+, so it runs on pretty much any Linux box.
+Reads host and per-process statistics straight from /proc (or, on Windows,
+from the Win32 APIs through ctypes). Standard library only, Python 3.6+, so it
+runs on pretty much any Linux box or Windows machine. Windows hosts use agent
+mode only (see install.ps1).
 
 Modes:
   --once       Collect a single sample and print it as JSON to stdout.
@@ -25,20 +27,28 @@ import http.client
 import json
 import os
 import platform
-import pwd
 import re
 import socket
 import ssl
+import struct
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.4.1"
+IS_WINDOWS = sys.platform == "win32"
+if not IS_WINDOWS:
+    import pwd
 
-CLK_TCK = os.sysconf("SC_CLK_TCK")
-PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+VERSION = "1.5.0"
+
+if IS_WINDOWS:
+    CLK_TCK = 10000000  # Windows process times are 100 ns FILETIME ticks
+    PAGE_SIZE = 4096
+else:
+    CLK_TCK = os.sysconf("SC_CLK_TCK")
+    PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 
 # Filesystems worth reporting. Network filesystems are deliberately left out:
 # statvfs() on a dead NFS/CIFS mount can hang the collector.
@@ -46,6 +56,380 @@ REAL_FS = {
     "ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "vfat", "exfat",
     "ntfs", "ntfs3", "jfs", "reiserfs", "bcachefs",
 }
+
+
+# -- Windows ---------------------------------------------------------------------
+#
+# Windows hosts use the same agent, with the same standard library only: the
+# numbers come straight from Win32 APIs through ctypes instead of /proc.
+# Agent (push) mode only: there is no SSH pull mode for Windows, no Docker
+# section, and no remote updates (rerun install.ps1 to update).
+
+_EPOCH_DIFF = 116444736000000000  # 100 ns ticks between 1601-01-01 and 1970-01-01
+
+
+def _filetime_to_unix(ticks):
+    """A Windows FILETIME (100 ns ticks since 1601) as Unix seconds."""
+    return int((ticks - _EPOCH_DIFF) / 10000000) if ticks else 0
+
+
+def _win_os_name(product, build, display=""):
+    """'Windows 11 Pro 24H2' from the registry values.
+
+    ProductName still says "Windows 10" on Windows 11 (Microsoft never
+    changed it); builds from 22000 on are Windows 11.
+    """
+    name = product or "Windows"
+    try:
+        if int(build) >= 22000:
+            name = name.replace("Windows 10", "Windows 11")
+    except (TypeError, ValueError):
+        pass
+    return ("%s %s" % (name, display)).strip() if display else name
+
+
+def _win_parse_pagefiles(raw, page_size):
+    """(total, used) bytes from NtQuerySystemInformation(SystemPageFileInformation).
+
+    The buffer is a chain of entries, each starting NextEntryOffset,
+    TotalSize, TotalInUse (all 32-bit, sizes in pages).
+    """
+    total = used = offset = 0
+    while offset + 12 <= len(raw):
+        nxt, size, inuse = struct.unpack_from("<III", raw, offset)
+        total += size
+        used += inuse
+        if not nxt:
+            break
+        offset += nxt
+    return total * page_size, used * page_size
+
+
+class _LogFile(object):
+    """File-like object for stdout/stderr that keeps the log from growing
+    forever: at `limit` bytes it moves the log to <path>.1 and starts over.
+    Windows services have no journal, so the installer points the agent here."""
+
+    def __init__(self, path, limit=1024 * 1024):
+        self.path = path
+        self.limit = limit
+
+    def write(self, text):
+        try:
+            if os.path.getsize(self.path) > self.limit:
+                os.replace(self.path, self.path + ".1")
+        except OSError:
+            pass
+        try:
+            with open(self.path, "a", encoding="utf-8", errors="replace") as f:
+                f.write(text)
+        except OSError:
+            pass
+        return len(text)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+if IS_WINDOWS:
+    import ctypes
+    import winreg
+    from ctypes import wintypes
+
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _ntdll = ctypes.WinDLL("ntdll")
+    _iphlp = ctypes.WinDLL("iphlpapi")
+    _advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+
+    _INVALID_HANDLE = ctypes.c_void_p(-1).value
+    _H = wintypes.HANDLE
+    _byref = ctypes.byref
+
+    _k32.SetErrorMode.argtypes = [wintypes.UINT]
+    _k32.GetTickCount64.restype = ctypes.c_ulonglong
+    _k32.OpenProcess.restype = _H
+    _k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _k32.CloseHandle.argtypes = [_H]
+    _k32.GetProcessTimes.argtypes = [_H] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    _k32.K32GetProcessMemoryInfo.argtypes = [_H, ctypes.c_void_p, wintypes.DWORD]
+    _k32.QueryFullProcessImageNameW.argtypes = [_H, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    _k32.CreateToolhelp32Snapshot.restype = _H
+    _k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    _k32.Process32FirstW.argtypes = [_H, ctypes.c_void_p]
+    _k32.Process32NextW.argtypes = [_H, ctypes.c_void_p]
+    _k32.CreateFileW.restype = _H
+    _k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                 wintypes.DWORD, wintypes.DWORD, _H]
+    _k32.DeviceIoControl.argtypes = [_H, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
+                                     wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    _advapi.OpenProcessToken.argtypes = [_H, wintypes.DWORD, ctypes.POINTER(_H)]
+    _advapi.GetTokenInformation.argtypes = [_H, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                            ctypes.POINTER(wintypes.DWORD)]
+    _advapi.GetLengthSid.argtypes = [ctypes.c_void_p]
+    _advapi.LookupAccountSidW.argtypes = [wintypes.LPCWSTR, ctypes.c_void_p, wintypes.LPWSTR,
+                                          ctypes.POINTER(wintypes.DWORD), wintypes.LPWSTR,
+                                          ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD)]
+    _ntdll.NtQuerySystemInformation.restype = ctypes.c_long
+    _ntdll.NtQuerySystemInformation.argtypes = [ctypes.c_int, ctypes.c_void_p, wintypes.ULONG,
+                                                ctypes.POINTER(wintypes.ULONG)]
+
+    # Never pop up "no disk in drive" style dialogs from a service.
+    _k32.SetErrorMode(0x0001 | 0x8000)
+
+    class _MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+    class _PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+    class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+
+    class _DISK_PERFORMANCE(ctypes.Structure):
+        _fields_ = [("BytesRead", ctypes.c_longlong), ("BytesWritten", ctypes.c_longlong),
+                    ("ReadTime", ctypes.c_longlong), ("WriteTime", ctypes.c_longlong),
+                    ("IdleTime", ctypes.c_longlong), ("ReadCount", wintypes.DWORD),
+                    ("WriteCount", wintypes.DWORD), ("QueueDepth", wintypes.DWORD),
+                    ("SplitCount", wintypes.DWORD), ("QueryTime", ctypes.c_longlong),
+                    ("StorageDeviceNumber", wintypes.DWORD), ("StorageManagerName", ctypes.c_wchar * 8)]
+
+    class _MIB_IF_ROW2(ctypes.Structure):
+        _fields_ = [("InterfaceLuid", ctypes.c_ulonglong), ("InterfaceIndex", wintypes.ULONG),
+                    ("InterfaceGuid", ctypes.c_ubyte * 16), ("Alias", ctypes.c_wchar * 257),
+                    ("Description", ctypes.c_wchar * 257), ("PhysicalAddressLength", wintypes.ULONG),
+                    ("PhysicalAddress", ctypes.c_ubyte * 32), ("PermanentPhysicalAddress", ctypes.c_ubyte * 32),
+                    ("Mtu", wintypes.ULONG), ("Type", wintypes.ULONG), ("TunnelType", wintypes.ULONG),
+                    ("MediaType", wintypes.ULONG), ("PhysicalMediumType", wintypes.ULONG),
+                    ("AccessType", wintypes.ULONG), ("DirectionType", wintypes.ULONG),
+                    ("InterfaceAndOperStatusFlags", ctypes.c_ubyte), ("OperStatus", wintypes.ULONG),
+                    ("AdminStatus", wintypes.ULONG), ("MediaConnectState", wintypes.ULONG),
+                    ("NetworkGuid", ctypes.c_ubyte * 16), ("ConnectionType", wintypes.ULONG),
+                    ("TransmitLinkSpeed", ctypes.c_ulonglong), ("ReceiveLinkSpeed", ctypes.c_ulonglong),
+                    ("InOctets", ctypes.c_ulonglong), ("InUcastPkts", ctypes.c_ulonglong),
+                    ("InNUcastPkts", ctypes.c_ulonglong), ("InDiscards", ctypes.c_ulonglong),
+                    ("InErrors", ctypes.c_ulonglong), ("InUnknownProtos", ctypes.c_ulonglong),
+                    ("InUcastOctets", ctypes.c_ulonglong), ("InMulticastOctets", ctypes.c_ulonglong),
+                    ("InBroadcastOctets", ctypes.c_ulonglong), ("OutOctets", ctypes.c_ulonglong),
+                    ("OutUcastPkts", ctypes.c_ulonglong), ("OutNUcastPkts", ctypes.c_ulonglong),
+                    ("OutDiscards", ctypes.c_ulonglong), ("OutErrors", ctypes.c_ulonglong),
+                    ("OutUcastOctets", ctypes.c_ulonglong), ("OutMulticastOctets", ctypes.c_ulonglong),
+                    ("OutBroadcastOctets", ctypes.c_ulonglong), ("OutQLen", ctypes.c_ulonglong)]
+
+    class _MIB_IF_TABLE2(ctypes.Structure):
+        _fields_ = [("NumEntries", wintypes.ULONG), ("Table", _MIB_IF_ROW2 * 1)]
+
+    def _ft(ft):
+        return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+    def _win_uptime():
+        return _k32.GetTickCount64() / 1000.0
+
+    def _win_cpu_times():
+        """One aggregate "cpu0" of (busy, idle, iowait) in 100 ns ticks."""
+        idle, kern, user = wintypes.FILETIME(), wintypes.FILETIME(), wintypes.FILETIME()
+        if not _k32.GetSystemTimes(_byref(idle), _byref(kern), _byref(user)):
+            raise OSError("GetSystemTimes failed")
+        i, k, u = _ft(idle), _ft(kern), _ft(user)
+        # Kernel time includes the idle time.
+        return {"cpu0": (max(k - i, 0) + u, i, 0)}, int(time.time() - _win_uptime())
+
+    def _win_meminfo():
+        st = _MEMORYSTATUSEX()
+        st.dwLength = ctypes.sizeof(st)
+        if not _k32.GlobalMemoryStatusEx(_byref(st)):
+            raise OSError("GlobalMemoryStatusEx failed")
+        total, avail = st.ullTotalPhys, st.ullAvailPhys
+        swap_total = swap_used = 0
+        size = 4096
+        for _ in range(4):
+            buf = ctypes.create_string_buffer(size)
+            need = wintypes.ULONG(0)
+            status = _ntdll.NtQuerySystemInformation(0x12, buf, size, _byref(need))  # SystemPageFileInformation
+            if status & 0xFFFFFFFF == 0xC0000004:  # STATUS_INFO_LENGTH_MISMATCH: grow and retry
+                size = max(need.value, size * 2)
+                continue
+            if status >= 0:
+                swap_total, swap_used = _win_parse_pagefiles(buf.raw[:max(need.value, 12)], PAGE_SIZE)
+            break
+        return {
+            "total": total,
+            "available": avail,
+            "used": total - avail,
+            "percent": round(100.0 * (total - avail) / total, 1) if total else 0.0,
+            "swap_total": swap_total,
+            "swap_used": min(swap_used, swap_total),
+        }
+
+    def _win_disks():
+        disks = []
+        buf = ctypes.create_unicode_buffer(1024)
+        n = _k32.GetLogicalDriveStringsW(1024, buf)
+        if not n or n > 1024:
+            return disks
+        for root in buf[:n].split("\0"):
+            if not root or _k32.GetDriveTypeW(root) != 3:  # fixed disks only: no optical, network or removable
+                continue
+            avail, total, free = ctypes.c_ulonglong(), ctypes.c_ulonglong(), ctypes.c_ulonglong()
+            if not _k32.GetDiskFreeSpaceExW(root, _byref(avail), _byref(total), _byref(free)) or not total.value:
+                continue  # e.g. a locked BitLocker volume
+            fs = ctypes.create_unicode_buffer(64)
+            if not _k32.GetVolumeInformationW(root, None, 0, None, None, None, fs, 64):
+                fs.value = ""
+            used = total.value - free.value
+            disks.append({
+                "mount": root,
+                "device": root.rstrip("\\"),
+                "fs": fs.value.lower(),
+                "total": total.value,
+                "used": used,
+                "free": avail.value,
+                "percent": round(100.0 * used / (used + avail.value), 1) if used + avail.value else 0.0,
+            })
+        return disks
+
+    def _win_diskstats():
+        """PhysicalDriveN -> (bytes read, bytes written, ms spent busy), cumulative.
+
+        Busy time is the time the drive wasn't idle, like Task Manager's "Active
+        time": the wall clock minus the drive's cumulative idle time.
+        """
+        out = {}
+        for n in range(16):
+            h = _k32.CreateFileW("\\\\.\\PhysicalDrive%d" % n, 0, 3, None, 3, 0, None)
+            if h in (None, _INVALID_HANDLE):
+                continue
+            try:
+                perf = _DISK_PERFORMANCE()
+                got = wintypes.DWORD(0)
+                if _k32.DeviceIoControl(h, 0x70020, None, 0, _byref(perf), ctypes.sizeof(perf), _byref(got), None):
+                    out["PhysicalDrive%d" % n] = (
+                        perf.BytesRead, perf.BytesWritten, max(perf.QueryTime - perf.IdleTime, 0) // 10000)
+            finally:
+                _k32.CloseHandle(h)
+        return out
+
+    def _win_net_bytes():
+        table = ctypes.c_void_p()
+        if _iphlp.GetIfTable2(_byref(table)) != 0 or not table.value:
+            return 0, 0
+        try:
+            hdr = _MIB_IF_TABLE2.from_address(table.value)
+            first = table.value + _MIB_IF_TABLE2.Table.offset
+            rows = (_MIB_IF_ROW2 * hdr.NumEntries).from_address(first)
+            ours, everything = [0, 0], [0, 0]
+            for r in rows:
+                if r.Type == 24:  # software loopback
+                    continue
+                everything[0] += r.InOctets
+                everything[1] += r.OutOctets
+                if r.InterfaceAndOperStatusFlags & 1:  # a real adapter: virtual switches and tunnels just
+                    ours[0] += r.InOctets              # carry traffic that also crosses one
+                    ours[1] += r.OutOctets
+            return tuple(ours) if any(ours) else tuple(everything)
+        finally:
+            _iphlp.FreeMibTable(table)
+
+    _win_sid_names = {}
+
+    def _win_proc_user(handle):
+        tok = _H()
+        if not _advapi.OpenProcessToken(handle, 0x0008, _byref(tok)):  # TOKEN_QUERY
+            return ""
+        try:
+            need = wintypes.DWORD(0)
+            _advapi.GetTokenInformation(tok, 1, None, 0, _byref(need))  # TokenUser
+            if not need.value:
+                return ""
+            buf = ctypes.create_string_buffer(need.value)
+            if not _advapi.GetTokenInformation(tok, 1, buf, need.value, _byref(need)):
+                return ""
+            sid = ctypes.c_void_p.from_buffer(buf).value  # TOKEN_USER starts with the SID pointer
+            key = ctypes.string_at(sid, _advapi.GetLengthSid(sid))
+            if key not in _win_sid_names:
+                name, dom = ctypes.create_unicode_buffer(256), ctypes.create_unicode_buffer(256)
+                nlen, dlen, use = wintypes.DWORD(256), wintypes.DWORD(256), wintypes.DWORD(0)
+                ok = _advapi.LookupAccountSidW(None, sid, name, _byref(nlen), dom, _byref(dlen), _byref(use))
+                _win_sid_names[key] = name.value if ok else ""
+            return _win_sid_names[key]
+        finally:
+            _k32.CloseHandle(tok)
+
+    _win_users = {}  # (pid, start) -> user, so accounts are looked up once per process
+
+    def _win_proc_snapshot():
+        procs = {}
+        boot = int(time.time() - _win_uptime())
+        snap = _k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+        if snap in (None, _INVALID_HANDLE):
+            raise OSError("cannot list processes")
+        seen = {}
+        try:
+            pe = _PROCESSENTRY32W()
+            pe.dwSize = ctypes.sizeof(pe)
+            ok = _k32.Process32FirstW(snap, _byref(pe))
+            while ok:
+                pid = pe.th32ProcessID
+                if pid:  # 0 is the System Idle Process: its "CPU" is the idle time
+                    p = {"name": pe.szExeFile, "state": "S", "ppid": pe.th32ParentProcessID, "ticks": 0,
+                         "threads": pe.cntThreads, "starttime": 0, "started": boot, "rss": 0,
+                         "uid": "", "cmd": ""}
+                    h = _k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+                    if h:
+                        try:
+                            c, e, k, u = (wintypes.FILETIME() for _ in range(4))
+                            if _k32.GetProcessTimes(h, _byref(c), _byref(e), _byref(k), _byref(u)):
+                                p["ticks"] = _ft(k) + _ft(u)
+                                p["starttime"] = _ft(c)  # raw, also tells a reused PID apart
+                                p["started"] = _filetime_to_unix(_ft(c)) or boot
+                            mem = _PROCESS_MEMORY_COUNTERS()
+                            mem.cb = ctypes.sizeof(mem)
+                            if _k32.K32GetProcessMemoryInfo(h, _byref(mem), mem.cb):
+                                p["rss"] = mem.WorkingSetSize
+                            path, size = ctypes.create_unicode_buffer(1024), wintypes.DWORD(1024)
+                            if _k32.QueryFullProcessImageNameW(h, 0, path, _byref(size)):
+                                p["cmd"] = path.value
+                            key = (pid, p["starttime"])
+                            if key not in _win_users:
+                                _win_users[key] = _win_proc_user(h)
+                            seen[key] = _win_users[key]
+                            p["uid"] = _win_users[key]
+                        finally:
+                            _k32.CloseHandle(h)
+                    procs[pid] = p
+                ok = _k32.Process32NextW(snap, _byref(pe))
+        finally:
+            _k32.CloseHandle(snap)
+        _win_users.clear()
+        _win_users.update(seen)
+        return procs
+
+    def _win_os_info():
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as k:
+                def val(name):
+                    try:
+                        return str(winreg.QueryValueEx(k, name)[0])
+                    except OSError:
+                        return ""
+                return _win_os_name(val("ProductName"), val("CurrentBuildNumber"),
+                                    val("DisplayVersion") or val("ReleaseId"))
+        except OSError:
+            return "Windows"
 
 
 def _read(path):
@@ -61,6 +445,8 @@ def _cpu_times():
     those cores from the summary, so its counters can jump backwards between
     two readings.
     """
+    if IS_WINDOWS:
+        return _win_cpu_times()
     cpus = {}
     btime = 0
     for line in _read("/proc/stat").splitlines():
@@ -94,6 +480,8 @@ def _cpu_percent(before, after):
 
 
 def _net_bytes(path="/proc/net/dev"):
+    if IS_WINDOWS:
+        return _win_net_bytes()
     rx = tx = 0
     try:
         lines = _read(path).splitlines()[2:]
@@ -117,6 +505,8 @@ SKIP_BLOCK = ("loop", "ram", "zram", "fd", "sr", "nbd")
 
 def _diskstats():
     """Map whole block device -> (bytes read, bytes written, ms spent doing I/O)."""
+    if IS_WINDOWS:
+        return _win_diskstats()
     try:
         whole = set(os.listdir("/sys/block"))
     except OSError:
@@ -140,6 +530,8 @@ def _diskstats():
 
 def _block_label(name):
     """Human name for device-mapper / md devices (e.g. dm-0 -> vg-root)."""
+    if IS_WINDOWS:
+        return name.replace("PhysicalDrive", "Disk ")
     try:
         return _read("/sys/block/%s/dm/name" % name).strip() or name
     except OSError:
@@ -173,6 +565,8 @@ def _disk_io(before, after, elapsed):
 
 def _proc_snapshot():
     """Map pid -> raw per-process counters from /proc/<pid>/stat."""
+    if IS_WINDOWS:
+        return _win_proc_snapshot()
     procs = {}
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -214,6 +608,8 @@ def _cmdline(pid, fallback):
 
 
 def _meminfo():
+    if IS_WINDOWS:
+        return _win_meminfo()
     info = {}
     for line in _read("/proc/meminfo").splitlines():
         key, _, val = line.partition(":")
@@ -235,6 +631,8 @@ def _meminfo():
 
 
 def _disks():
+    if IS_WINDOWS:
+        return _win_disks()
     disks, seen = [], set()
     try:
         mounts = _read("/proc/mounts").splitlines()
@@ -269,7 +667,22 @@ def _disks():
     return disks
 
 
+def _uptime():
+    return _win_uptime() if IS_WINDOWS else float(_read("/proc/uptime").split()[0])
+
+
+def _loadavg():
+    """Load averages, or none on Windows, which has no such thing."""
+    return () if IS_WINDOWS else os.getloadavg()
+
+
+def _kernel():
+    return platform.version() if IS_WINDOWS else platform.release()
+
+
 def _os_name():
+    if IS_WINDOWS:
+        return _win_os_info()
     try:
         for line in _read("/etc/os-release").splitlines():
             if line.startswith("PRETTY_NAME="):
@@ -283,6 +696,8 @@ _user_cache = {}
 
 
 def _user(uid):
+    if isinstance(uid, str):  # Windows reports account names, not numeric ids
+        return uid
     if uid not in _user_cache:
         try:
             _user_cache[uid] = pwd.getpwuid(uid).pw_name
@@ -541,6 +956,8 @@ class _Docker(object):
         self.direct = _DockerReader()
 
     def enabled(self):
+        if IS_WINDOWS:
+            return False
         if self.override is not None:
             return self.override
         return os.environ.get("SERVERSTATS_DOCKER", "1") != "0"
@@ -684,15 +1101,18 @@ def collect(sample_seconds=1.0, max_procs=500, prev=None):
     states = {}
     threads = 0
     for pid, p in procs1.items():
-        states[p["state"]] = states.get(p["state"], 0) + 1
-        threads += p["threads"]
         prev = procs0.get(pid)
         dticks = p["ticks"] - prev["ticks"] if prev and prev["starttime"] == p["starttime"] else 0
+        state = p["state"]
+        if IS_WINDOWS:  # no per-process state there: "running" = used CPU since the last report
+            state = "R" if dticks > 0 else "S"
+        states[state] = states.get(state, 0) + 1
+        threads += p["threads"]
         processes.append({
             "pid": pid,
             "ppid": p["ppid"],
             "name": p["name"],
-            "state": p["state"],
+            "state": state,
             "uid": p["uid"],
             # top-style: 100% == one full core
             # Against the clock, like top (100% == one full core); independent
@@ -701,7 +1121,7 @@ def collect(sample_seconds=1.0, max_procs=500, prev=None):
             "rss": p["rss"],
             "mem": round(100.0 * p["rss"] / mem["total"], 1) if mem["total"] else 0.0,
             "threads": p["threads"],
-            "started": int(btime + p["starttime"] / CLK_TCK),
+            "started": p.get("started") or int(btime + p["starttime"] / CLK_TCK),
         })
 
     processes.sort(key=lambda p: (p["cpu"], p["rss"]), reverse=True)
@@ -709,17 +1129,18 @@ def collect(sample_seconds=1.0, max_procs=500, prev=None):
         processes = processes[:max_procs]
     for p in processes:
         p["user"] = _user(p.pop("uid"))
-        p["cmd"] = _cmdline(p["pid"], p["name"])
+        p["cmd"] = procs1[p["pid"]].get("cmd") or (p["name"] if IS_WINDOWS else _cmdline(p["pid"], p["name"]))
 
-    load = os.getloadavg()
+    load = _loadavg()
     return {
         "agent_version": VERSION,
         "collected_at": time.time(),
         "hostname": socket.gethostname(),
+        "platform": "windows" if IS_WINDOWS else "linux",
         "os": _os_name(),
-        "kernel": platform.release(),
+        "kernel": _kernel(),
         "arch": platform.machine(),
-        "uptime": float(_read("/proc/uptime").split()[0]),
+        "uptime": _uptime(),
         "cpu": {
             "count": ncpu,
             "percent": _cpu_percent(cpu0, cpu1),
@@ -807,6 +1228,8 @@ def _state_dir():
 
 
 def updates_enabled():
+    if IS_WINDOWS:  # os.exec* doesn't replace a process there; rerun install.ps1 to update
+        return False
     d = _state_dir()
     return os.environ.get("SERVERSTATS_UPDATES", "1") != "0" and bool(d) and os.access(d, os.W_OK)
 
@@ -1018,6 +1441,8 @@ def main():
     ap.add_argument("--sample", type=float, default=1.0, help="CPU sampling window in seconds")
     ap.add_argument("--max-procs", type=int, default=int(env("SERVERSTATS_MAX_PROCS", "500")), help="report at most N processes (0 = all)")
     ap.add_argument("--ca-file", default=env("SERVERSTATS_CA_FILE"), help="custom CA bundle for self-signed setups")
+    ap.add_argument("--log-file", default=env("SERVERSTATS_LOG_FILE"),
+                    help="agent mode: write output to this file (rotated at 1 MB) instead of stdout/stderr")
     ap.add_argument("--version", action="version", version=VERSION)
     args = ap.parse_args()
 
@@ -1032,6 +1457,8 @@ def main():
         json.dump(collect(args.sample, args.max_procs)[0], sys.stdout, separators=(",", ":"))
         sys.stdout.write("\n")
         return
+    if args.log_file:
+        sys.stdout = sys.stderr = _LogFile(args.log_file)
     maybe_run_updated_copy(sys.argv[1:])
     try:
         run_agent(args, sys.argv[1:])

@@ -148,6 +148,8 @@ def normalize(d: dict, max_procs: int) -> dict:
         "interval": min(max(interval, 1.0), 3600.0) if interval is not None else None,
         "collected_at": _num(d.get("collected_at"), None),
         "hostname": _str(d.get("hostname"), 253),
+        # Windows has no load average, so the UI leaves it out there.
+        "platform": "windows" if d.get("platform") == "windows" else "linux",
         "os": _str(d.get("os")),
         "kernel": _str(d.get("kernel")),
         "arch": _str(d.get("arch"), 32),

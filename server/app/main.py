@@ -20,9 +20,10 @@ from .schema import normalize
 from .ssh_poller import AGENT_SCRIPT, SSHPoller, load_or_create_key
 from .store import Store
 
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 STATIC = Path(__file__).parent / "static"
 INSTALL_SH = AGENT_SCRIPT.parent / "install.sh"
+INSTALL_PS1 = AGENT_SCRIPT.parent / "install.ps1"
 MAX_INGEST_BYTES = 4 * 1024 * 1024
 
 # The agent this server hands out: agents update to it when you ask them to.
@@ -84,6 +85,7 @@ PUBLIC_PATHS = frozenset({
     "/api/enroll",
     "/api/agent/serverstats_agent.py",
     "/api/agent/install.sh",
+    "/api/agent/install.ps1",
     "/healthz",
 })
 
@@ -492,6 +494,11 @@ async def agent_script():
 @app.get("/api/agent/install.sh")
 async def agent_installer():
     return FileResponse(INSTALL_SH, media_type="text/x-shellscript", filename="install.sh")
+
+
+@app.get("/api/agent/install.ps1")
+async def agent_installer_windows():
+    return FileResponse(INSTALL_PS1, media_type="text/plain; charset=utf-8", filename="install.ps1")
 
 
 @app.get("/healthz")
