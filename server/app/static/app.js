@@ -64,6 +64,14 @@ const hottest = (temps) => {
   const cpu = (temps || []).filter((t) => t.kind === 'cpu');
   return (cpu.length ? cpu : temps || []).reduce((a, t) => (!a || t.temp > a.temp ? t : a), null);
 };
+// How worrying a sensor's reading is: against its own limit when it has one, else the usual comfort range.
+const tempLevel = (t) => {
+  const limit = t.crit != null ? t.crit : t.high;
+  if (limit != null) return t.temp >= limit ? 'full' : t.temp >= limit - 10 ? 'warning' : '';
+  return t.temp >= 90 ? 'full' : t.temp >= 80 ? 'warning' : '';
+};
+// Names the way people sort them: TTS2 before TTS10.
+const byName = (a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
 const fmtRate = (n) => (n == null || !isFinite(n) ? '—' : fmtBytes(n) + '/s');
 function fmtPct(n) {
   if (n == null || !isFinite(n)) return '—';
@@ -181,8 +189,10 @@ function setStatus(elm, status) {
 
 // `trend` (optional): [{t, v}] percentages to draw as a sparkline above the bar.
 // `valueText` (optional): replaces the percentage shown next to the bar.
-function meter(label, pct, title, trend, valueText) {
-  const fill = h('div', { class: 'meter-fill', 'data-level': level(pct || 0) });
+// `opts` (optional): `fmt` formats the trend's range in the tooltip (default: percent),
+// `level` overrides the bar's color level (normal / warning / critical).
+function meter(label, pct, title, trend, valueText, opts = {}) {
+  const fill = h('div', { class: 'meter-fill', 'data-level': opts.level || level(pct || 0) });
   fill.style.width = Math.max(0, Math.min(100, pct || 0)) + '%';
   const track = h('div', {
     class: 'meter-track', role: 'meter', 'aria-valuemin': 0, 'aria-valuemax': 100,
@@ -191,7 +201,8 @@ function meter(label, pct, title, trend, valueText) {
   let middle = track;
   if (trend) {
     const vals = trend.map((p) => p.v);
-    if (vals.length) title += ` · last hour ${fmtPct(Math.min(...vals))}–${fmtPct(Math.max(...vals))}`;
+    const fmt = opts.fmt || fmtPct;
+    if (vals.length) title += ` · last hour ${fmt(Math.min(...vals))}–${fmt(Math.max(...vals))}`;
     middle = h('div', { class: 'meter-viz' }, sparkline(trend), track);
   }
   return h('div', { class: 'meter', title },
@@ -359,7 +370,7 @@ function renderOverview() {
     updateBtn.hidden = n === 0;
     updateBtn.textContent = `Update agents (${n})`;
     const seen = new Set();
-    state.hosts.forEach((host, i) => {
+    [...state.hosts].sort((a, b) => byName(a.name, b.name)).forEach((host, i) => {
       let card = cards.get(host.name);
       if (!card) {
         card = $('#tpl-card').content.firstElementChild.cloneNode(true);
@@ -382,7 +393,7 @@ function renderOverview() {
     if (!tr) return { load: trends && trends.load && trends.load.hosts[name] };
     const series = (key) => tr.t.map((t, i) => ({ t, v: tr[key][i] })).filter((p) => p.v != null);
     return {
-      cpu: series('cpu'), mem: series('mem'), disk: series('disk_util'), storage: series('storage'),
+      cpu: series('cpu'), mem: series('mem'), disk: series('disk_util'), storage: series('storage'), temp: series('temp'),
       load: trends.load && trends.load.hosts[name],
     };
   }
@@ -402,6 +413,7 @@ function updateCard(card, host, trend = {}) {
   if (host.cpu) {
     const disk = fullestDisk(host);
     const mem = host.memory || {};
+    const hot = hottest(host.temps);
     const keyed = (part, m) => { m.dataset.part = part; return m; };
     meters.push(
       h('div', { class: 'load-block' },
@@ -415,6 +427,11 @@ function updateCard(card, host, trend = {}) {
       keyed('storage', meter('Storage', disk ? disk.percent : null,
         disk ? `Fullest filesystem: ${disk.mount} (${fmtBytes(disk.used)} of ${fmtBytes(disk.total)})` : 'No filesystems',
         trend.storage || [])),
+      // Not part of the load: its own row, only for hosts that have sensors. The bar and
+      // sparkline use a fixed 0-100 °C scale, so hosts compare like the percentages do.
+      ...(hot ? [keyed('temp', meter('Temp', hot.temp,
+        `Hottest ${hot.kind === 'cpu' ? 'CPU ' : ''}sensor: ${hot.name}`, trend.temp || [], fmtTemp(hot.temp),
+        { fmt: fmtTemp, level: { full: 'critical', warning: 'warning' }[tempLevel(hot)] }))] : []),
     );
   }
   $('.meters', card).replaceChildren(...meters);
@@ -705,10 +722,7 @@ function renderDetail(name) {
     const order = Object.keys(TEMP_KINDS);
     const sorted = temps.slice().sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind) || a.name.localeCompare(b.name));
     $('#temp-table tbody').replaceChildren(...sorted.map((t) => {
-      // Against the sensor's own limit when it has one, else the usual comfort range.
-      const limit = t.crit != null ? t.crit : t.high;
-      const level = limit != null ? (t.temp >= limit ? 'full' : t.temp >= limit - 10 ? 'warning' : '')
-        : (t.temp >= 90 ? 'full' : t.temp >= 80 ? 'warning' : '');
+      const level = tempLevel(t);
       const limits = [t.high != null ? fmtTemp(t.high) : null, t.crit != null ? fmtTemp(t.crit) : null].filter(Boolean);
       return h('tr', null,
         h('td', null, h('b', { text: t.name }), h('small', { class: 'muted', text: ` ${TEMP_KINDS[t.kind]}` })),
@@ -1761,7 +1775,7 @@ function setupPrune() {
       })));
     }
     const current = hostSel.value;
-    const names = (state.hosts || []).map((x) => x.name).sort((a, b) => a.localeCompare(b));
+    const names = (state.hosts || []).map((x) => x.name).sort(byName);
     hostSel.replaceChildren(h('option', { value: '', text: 'All hosts' }), ...names.map((n) => h('option', { value: n, text: n })));
     hostSel.value = names.includes(current) ? current : '';
     if (days == null) days = 365;

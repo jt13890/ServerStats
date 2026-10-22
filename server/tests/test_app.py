@@ -215,7 +215,17 @@ def test_trends_endpoint(client):
     ingest(client, TOKEN_A, sample())
     tr = client.get("/api/trends", headers=USER).json()
     assert set(tr["hosts"]) == {"alpha"}
-    assert {"t", "cpu", "mem", "disk_util", "storage"} <= tr["hosts"]["alpha"].keys()
+    assert {"t", "cpu", "mem", "disk_util", "storage", "temp"} <= tr["hosts"]["alpha"].keys()
+
+
+def test_trends_carry_temperature(client):
+    temps = [{"name": "Package id 0", "chip": "coretemp", "kind": "cpu", "temp": 61.5},
+             {"name": "Samsung SSD", "chip": "nvme", "kind": "disk", "temp": 70.0}]
+    ingest(client, TOKEN_A, sample(temps=temps))
+    ingest(client, TOKEN_B, sample(temps=[]))
+    tr = client.get("/api/trends", headers=USER).json()["hosts"]
+    assert tr["alpha"]["temp"] == [61.5]  # the hottest CPU sensor, not the hotter drive
+    assert tr["beta"]["temp"] == [None]  # a host with no sensors has nothing to draw
 
 
 def test_old_retention_settings_are_ignored(tmp_path, caplog):
