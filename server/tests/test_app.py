@@ -1602,6 +1602,7 @@ def test_agent_buffers_while_the_server_is_away(monkeypatch, tmp_path, capsys, h
     assert out["backfill"] == sorted(out["backfill"]) and out["backfill"]
     assert not (tmp_path / "spool" / "backlog.jsonl").exists()  # emptied
     log = capsys.readouterr()
+    assert "buffering up to" in log.out and "no buffering" not in log.out  # the startup line
     assert "buffering reports until the server is back" in log.out
     assert "reporting recovered" in log.out and "sent" in log.out and "buffered report(s)" in log.out
     # it kept measuring every interval while away, and tried the server less and less often

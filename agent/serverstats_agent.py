@@ -2000,7 +2000,7 @@ def run_agent(args, argv):
         print("found %d buffered report(s) from before" % len(backlog), flush=True)
     print("serverstats-agent %s reporting to %s every %ss (remote updates %s, %s)"
           % (VERSION, args.url, interval, "on" if can_update else "off",
-             "buffering up to %d reports while the server is away" % backlog.limit if backlog else "no buffering"),
+             "buffering up to %d reports while the server is away" % backlog.limit if backlog is not None else "no buffering"),
           flush=True)
     while True:
         started = time.monotonic()
