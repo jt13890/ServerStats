@@ -1095,6 +1095,9 @@ def test_collect_with_windows_backends(monkeypatch):
             return {"present": True, "available": True, "enabled": True}
 
     monkeypatch.setattr(a, "_GPU", FakeGpu())
+    monkeypatch.setattr(a, "_win_temps", lambda: [
+        {"name": "ACPI thermal zone TZ00", "chip": "acpi", "kind": "board", "temp": 48.0, "high": None, "crit": None},
+        {"name": "RTX", "chip": "nvidia", "kind": "gpu", "temp": 61.0, "high": None, "crit": None}], raising=False)
     s = a.collect(0.01, 50)[0]
     assert s["platform"] == "windows" and s["os"] == "Windows 11 Pro 24H2" and s["load"] == [] and s["uptime"] == 12345.0
     by_pid = {p["pid"]: p for p in s["processes"]}
@@ -1104,6 +1107,8 @@ def test_collect_with_windows_backends(monkeypatch):
     assert by_pid[100]["started"] == 1700000000
     assert s["tasks"]["running"] == 1 and s["docker"] is None and s["docker_ctl"] is None  # no Docker on Windows
     assert s["gpu"]["adapters"][0]["util"] == 12.5 and s["gpu_ctl"]["enabled"] is True
+    assert [t["name"] for t in s["temps"]] == ["ACPI thermal zone TZ00", "RTX"]
+    assert s["gpu"]["adapters"][0]["temp"] == 61.0  # the NVIDIA reading is shown on the GPU too
     assert s["disk_io"]["devices"][0]["label"] == "Disk 0"
     assert s["disks"][0]["mount"] == "C:\\"
     # What the server gets from a Windows agent is accepted as it is.
@@ -1224,3 +1229,115 @@ def test_host_prefs_table_gains_gpu_column(tmp_path):
     store.set_gpu_pref("alpha", True)
     store.set_docker_pref("alpha", False)  # must not wipe the GPU choice
     assert store.gpu_pref("alpha") is True and store.docker_pref("alpha") is False
+
+
+# -- Temperatures -----------------------------------------------------------------------
+
+def _sysfs(root, files):
+    for rel, text in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+
+
+def test_hwmon_temps(tmp_path):
+    from agent_collector import _hwmon_temps
+
+    _sysfs(tmp_path, {
+        "hwmon0/name": "coretemp\n",
+        "hwmon0/temp1_input": "42000\n", "hwmon0/temp1_label": "Package id 0\n",
+        "hwmon0/temp1_max": "100000\n", "hwmon0/temp1_crit": "100000\n",
+        "hwmon0/temp2_input": "40000\n", "hwmon0/temp2_label": "Core 0\n",
+        "hwmon0/temp3_input": "45500\n", "hwmon0/temp3_label": "Core 1\n",
+        "hwmon1/name": "nvme\n", "hwmon1/device/model": "Samsung SSD 970   EVO\n",
+        "hwmon1/temp1_input": "38000\n", "hwmon1/temp1_label": "Composite\n", "hwmon1/temp1_crit": "85000\n",
+        "hwmon1/temp2_input": "41000\n", "hwmon1/temp2_label": "Sensor 1\n",
+        "hwmon2/name": "thinkpad\n",
+        "hwmon2/temp1_input": "40000\n", "hwmon2/temp2_input": "0\n",  # nothing attached: left out
+        "hwmon3/name": "acpitz_0\n", "hwmon3/temp1_input": "30000\n",
+        "hwmon4/name": "BAT0\n",  # no temperature at all
+        "hwmon5/name": "amdgpu\n", "hwmon5/temp1_input": "61000\n", "hwmon5/temp1_label": "edge\n",
+        "hwmon6/name": "broken\n", "hwmon6/temp1_input": "n/a\n", "hwmon6/temp2_input": "200000\n",
+        "hwmon10/name": "iwlwifi_1_3\n", "hwmon10/temp1_input": "33000\n",
+    })
+    by = {(t["chip"], t["name"]): t for t in _hwmon_temps(str(tmp_path))}
+    assert by[("coretemp", "Package id 0")] == {"chip": "coretemp", "kind": "cpu", "temp": 42.0, "high": 100.0,
+                                                "crit": 100.0, "name": "Package id 0"}
+    assert by[("coretemp", "Cores (hottest of 2)")]["temp"] == 45.5  # cores folded into one row
+    assert not any("Core 0" in t["name"] for t in by.values())
+    assert by[("nvme", "Samsung SSD 970 EVO")]["kind"] == "disk" and by[("nvme", "Samsung SSD 970 EVO")]["crit"] == 85.0
+    assert by[("nvme", "Samsung SSD 970 EVO \u00b7 Sensor 1")]["temp"] == 41.0
+    assert by[("thinkpad", "thinkpad temp1")]["temp"] == 40.0 and ("thinkpad", "thinkpad temp2") not in by
+    assert by[("acpitz_0", "acpitz_0")]["kind"] == "board"
+    assert by[("amdgpu", "edge")]["kind"] == "gpu"
+    assert by[("iwlwifi_1_3", "iwlwifi_1_3")]["kind"] == "other"
+    assert not any(t["chip"] in ("BAT0", "broken") for t in by.values())  # no sensor, unreadable, absurd
+    assert _hwmon_temps(str(tmp_path / "missing")) == []
+
+
+def test_thermal_zone_fallback(tmp_path):
+    from agent_collector import _thermal_zone_temps
+
+    _sysfs(tmp_path, {"thermal_zone0/type": "cpu-thermal\n", "thermal_zone0/temp": "55123\n",
+                      "thermal_zone1/type": "gpu-thermal\n", "thermal_zone1/temp": "-274000\n",
+                      "cooling_device0/type": "Processor\n"})
+    zones = _thermal_zone_temps(str(tmp_path))
+    assert zones == [{"name": "cpu-thermal", "chip": "thermal", "kind": "cpu", "temp": 55.1, "high": None, "crit": None}]
+
+
+def test_windows_temperature_helpers():
+    from agent_collector import _gpu_attach_temps, _win_zone_sensors
+
+    zones = _win_zone_sensors([("\\_TZ.TZ00", 3231.5), ("\\_TZ.THRM", 0.0), ("TZ01", 9999.0)])
+    assert zones == [{"name": "ACPI thermal zone TZ00", "chip": "acpi", "kind": "board", "temp": 50.0,
+                      "high": None, "crit": None}]  # a zone at 0 K or absurdly hot isn't a reading
+
+    gpus = [{"name": "Intel(R) UHD Graphics"}, {"name": "NVIDIA GeForce RTX 4070"}, {"name": "NVIDIA GeForce RTX 4070"}]
+    _gpu_attach_temps(gpus, [("NVIDIA GeForce RTX 4070", 61.0), ("nvidia geforce rtx 4070", 70.0)])
+    assert [g["temp"] for g in gpus] == [None, 61.0, 70.0]
+    odd = [{"name": "NVIDIA RTX A2000 Laptop GPU"}]  # DXGI and NVML don't always spell the name the same
+    _gpu_attach_temps(odd, [("NVIDIA RTX A2000 Laptop GPU 4GB", 55.0)])
+    assert odd[0]["temp"] == 55.0
+
+
+def test_temperatures_in_sample(client):
+    temps = [
+        {"name": "Package id 0", "chip": "coretemp", "kind": "cpu", "temp": 61.5, "high": 100, "crit": 100},
+        {"name": "Samsung SSD", "chip": "nvme", "kind": "disk", "temp": 44},
+        {"name": "Strange", "chip": "x", "kind": "nonsense", "temp": 30},
+        {"name": "On fire", "kind": "cpu", "temp": 500},  # not a believable reading
+        "junk", {"name": "no reading"},
+    ]
+    ingest(client, TOKEN_A, sample(temps=temps))
+    h = client.get("/api/hosts/alpha", headers=USER).json()
+    assert [t["name"] for t in h["temps"]] == ["Package id 0", "Samsung SSD", "Strange"]
+    assert h["temps"][0] == {"name": "Package id 0", "chip": "coretemp", "kind": "cpu", "temp": 61.5,
+                             "high": 100.0, "crit": 100.0}
+    assert h["temps"][1]["high"] is None and h["temps"][2]["kind"] == "other"
+    ingest(client, TOKEN_B, sample(temps="nonsense", gpu={"adapters": [{"name": "RTX", "temp": 999}]}))
+    h = client.get("/api/hosts/beta", headers=USER).json()
+    assert h["temps"] == [] and h["gpu"]["adapters"][0]["temp"] is None
+
+
+def test_temperature_history(tmp_path):
+    import sqlite3
+    from app.store import Store, hottest_temp, metrics_from_sample
+
+    cpu, disk = {"kind": "cpu", "temp": 60.0}, {"kind": "disk", "temp": 70.0}
+    assert hottest_temp({"temps": [disk, cpu]}) == 60.0  # a CPU sensor is the one worth charting
+    assert hottest_temp({"temps": [disk, {"kind": "board", "temp": 50.0}]}) == 70.0
+    assert hottest_temp({"temps": []}) is None and hottest_temp({}) is None
+    assert metrics_from_sample({"temps": [cpu]})["temp"] == 60.0
+
+    # A database from before temperatures: the history tables and both roll-ups gain the column.
+    db = tmp_path / "old.db"
+    old = sqlite3.connect(db)
+    for table in ("history", "history_5m", "history_1h"):
+        old.execute(f"CREATE TABLE {table} (host TEXT NOT NULL, ts REAL NOT NULL, cpu REAL)")
+    old.commit()
+    old.close()
+    store = Store(db)
+    for table in ("history", "history_5m", "history_1h"):
+        assert "temp" in {r[1] for r in store._db.execute(f"PRAGMA table_info({table})")}
+    store.record("alpha", {"temps": [cpu]}, now=1000.0)
+    assert store._db.execute("SELECT temp FROM history").fetchone() == (60.0,)

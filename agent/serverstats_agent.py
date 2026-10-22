@@ -193,6 +193,165 @@ def _gpu_aggregate(engines, dedicated, shared, adapters):
     return out
 
 
+# -- Temperatures ---------------------------------------------------------------------
+#
+# Every sensor is {"name", "chip", "kind", "temp", "high", "crit"} in degrees C, with
+# kind one of cpu / gpu / disk / board / other. Linux reads sysfs (hwmon, the files
+# lm-sensors reads too), which anyone can read. Windows has no sensor access for a
+# standard user beyond the ACPI thermal zones and, for NVIDIA GPUs, NVML (see _win_temps).
+
+_TEMP_KINDS = (
+    ("cpu", {"coretemp", "k10temp", "zenpower", "cpu_thermal", "cpu-thermal", "x86_pkg_temp", "bcm2835_thermal",
+             "soc_thermal", "cputemp", "scpi_sensors", "armada_thermal", "sun8i_thermal", "rockchip_thermal"}, ()),
+    ("gpu", {"amdgpu", "radeon", "nouveau", "nvidia", "i915", "xe"}, ()),
+    ("disk", {"nvme", "drivetemp"}, ()),
+    ("board", {"acpitz", "thinkpad", "dell_smm", "applesmc", "cros_ec"},
+     ("pch_", "nct", "it87", "w83", "asus", "lm7", "f71", "sch5", "ite_")),
+)
+
+
+def _temp_kind(chip, label=""):
+    c = chip.lower()
+    base = re.sub(r"(_\d+)+$", "", c)  # hwmon numbers duplicate chips: acpitz_0, iwlwifi_1_3
+    for kind, names, prefixes in _TEMP_KINDS:
+        if c in names or base in names or (prefixes and c.startswith(prefixes)):
+            return kind
+    if label.lower().startswith(("core ", "package", "tctl", "tdie", "tccd", "cpu")):
+        return "cpu"
+    return "other"
+
+
+def _millideg(path):
+    """A sysfs temperature file (thousandths of a degree) as degrees C; None if unreadable or absurd."""
+    try:
+        t = int(_read(path).strip()) / 1000.0
+    except (OSError, ValueError):
+        return None
+    return round(t, 1) if -40 < t < 150 else None
+
+
+def _threshold(path):
+    t = _millideg(path)
+    return t if t and t > 0 else None
+
+
+def _hwmon_temps(root="/sys/class/hwmon"):
+    """Sensors from /sys/class/hwmon: CPUs, NVMe and SATA drives, GPUs, boards, Wi-Fi...
+
+    A CPU's individual cores are folded into one "hottest core" entry so a
+    64-core machine doesn't list 64 rows.
+    """
+    sensors = []
+    try:
+        dirs = sorted(os.listdir(root), key=lambda d: (len(d), d))
+    except OSError:
+        return sensors
+    for d in dirs:
+        base = os.path.join(root, d)
+        try:
+            chip = _read(os.path.join(base, "name")).strip() or d
+            files = os.listdir(base)
+        except OSError:
+            continue
+        nums = sorted(int(m.group(1)) for m in (re.match(r"temp(\d+)_input$", f) for f in files) if m)
+        if not nums:
+            continue
+        model = ""
+        if _temp_kind(chip) == "disk":  # which drive: NVMe and SATA expose their model next to the sensor
+            try:
+                model = " ".join(_read(os.path.join(base, "device", "model")).split())
+            except OSError:
+                pass
+        cores = []
+        for n in nums:
+            t = _millideg(os.path.join(base, "temp%d_input" % n))
+            if not t:  # unreadable, or 0: how boards (ThinkPads, say) report a sensor with nothing attached
+                continue
+            try:
+                label = _read(os.path.join(base, "temp%d_label" % n)).strip()
+            except OSError:
+                label = ""
+            sensor = {"chip": chip, "kind": _temp_kind(chip, label), "temp": t,
+                      "high": _threshold(os.path.join(base, "temp%d_max" % n)),
+                      "crit": _threshold(os.path.join(base, "temp%d_crit" % n))}
+            if model:
+                sensor["name"] = model if label in ("", "Composite") else "%s \u00b7 %s" % (model, label)
+            else:
+                sensor["name"] = label or (chip if len(nums) == 1 else "%s temp%d" % (chip, n))
+            if sensor["kind"] == "cpu" and re.match(r"core \d+$", label.lower()):
+                cores.append(sensor)
+            else:
+                sensors.append(sensor)
+        if cores:
+            hottest = max(cores, key=lambda c: c["temp"])
+            hottest["name"] = "Cores (hottest of %d)" % len(cores) if len(cores) > 1 else hottest["name"]
+            sensors.append(hottest)
+    return sensors
+
+
+def _thermal_zone_temps(root="/sys/class/thermal"):
+    """Fallback for boards without hwmon sensors (most single-board computers have a CPU zone)."""
+    sensors = []
+    try:
+        dirs = sorted(os.listdir(root), key=lambda d: (len(d), d))
+    except OSError:
+        return sensors
+    for d in dirs:
+        if not d.startswith("thermal_zone"):
+            continue
+        t = _millideg(os.path.join(root, d, "temp"))
+        if not t:
+            continue
+        try:
+            kind_name = _read(os.path.join(root, d, "type")).strip() or d
+        except OSError:
+            kind_name = d
+        sensors.append({"name": kind_name, "chip": "thermal", "kind": _temp_kind(kind_name), "temp": t,
+                        "high": None, "crit": None})
+    return sensors
+
+
+def _win_zone_sensors(items):
+    """ACPI thermal zones from (instance, tenths of a kelvin) counter values."""
+    sensors = []
+    for name, tenths in items:
+        t = round(tenths / 10.0 - 273.15, 1)
+        if not -40 < t < 150:
+            continue
+        zone = name.lstrip("\\")
+        if zone.upper().startswith("_TZ."):
+            zone = zone[4:]
+        sensors.append({"name": "ACPI thermal zone " + zone, "chip": "acpi", "kind": "board", "temp": t,
+                        "high": None, "crit": None})
+    return sensors
+
+
+def _gpu_attach_temps(adapters, temps):
+    """Give each GPU its temperature, from (name, degrees C) pairs: matched by name,
+    then NVIDIA GPUs in order. Adapters without one get None."""
+    left = list(temps)
+    for a in adapters:
+        for i, (name, t) in enumerate(left):
+            if name.strip().lower() == a["name"].strip().lower():
+                a["temp"] = t
+                del left[i]
+                break
+    for a in adapters:
+        if "temp" not in a and left and "nvidia" in a["name"].lower():
+            a["temp"] = left.pop(0)[1]
+    for a in adapters:
+        a.setdefault("temp", None)
+
+
+def _temps():
+    """The host's temperature sensors; never raises, empty when it has none (VMs, containers)."""
+    try:
+        sensors = _win_temps() if IS_WINDOWS else (_hwmon_temps() or _thermal_zone_temps())
+    except Exception:
+        return []
+    return sensors[:64]
+
+
 class _LogFile(object):
     """File-like object for stdout/stderr that keeps the log from growing
     forever: at `limit` bytes it moves the log to <path>.1 and starts over.
@@ -555,6 +714,18 @@ if IS_WINDOWS:
             pass
         return _gpu_adapters
 
+    def _pdh_array(handle):
+        """[(instance name, value)] of a wildcard counter, as doubles; [] when it has no values yet."""
+        size, count = wintypes.DWORD(0), wintypes.DWORD(0)
+        status = _pdh.PdhGetFormattedCounterArrayW(handle, 0x200, _byref(size), _byref(count), None)  # PDH_FMT_DOUBLE
+        if status & 0xFFFFFFFF != 0x800007D2:  # PDH_MORE_DATA: anything else means no values yet
+            return []
+        buf = ctypes.create_string_buffer(size.value)
+        if _pdh.PdhGetFormattedCounterArrayW(handle, 0x200, _byref(size), _byref(count), buf) != 0:
+            return []
+        items = (_PDH_ITEM * count.value).from_buffer(buf)
+        return [(it.szName, it.value) for it in items if it.CStatus in (0, 1) and it.szName]
+
     class _WinGpuReader(object):
         """The GPU performance counters (Windows 10 1709+): per-engine busy time and
         adapter memory, for every vendor, readable without administrator rights."""
@@ -583,15 +754,7 @@ if IS_WINDOWS:
             _pdh.PdhCollectQueryData(self.query)
 
         def read(self, key):
-            size, count = wintypes.DWORD(0), wintypes.DWORD(0)
-            status = _pdh.PdhGetFormattedCounterArrayW(self.counters[key], 0x200, _byref(size), _byref(count), None)  # PDH_FMT_DOUBLE
-            if status & 0xFFFFFFFF != 0x800007D2:  # PDH_MORE_DATA: anything else means no values yet
-                return []
-            buf = ctypes.create_string_buffer(size.value)
-            if _pdh.PdhGetFormattedCounterArrayW(self.counters[key], 0x200, _byref(size), _byref(count), buf) != 0:
-                return []
-            items = (_PDH_ITEM * count.value).from_buffer(buf)
-            return [(it.szName, it.value) for it in items if it.CStatus in (0, 1) and it.szName]
+            return _pdh_array(self.counters[key])
 
         def report(self):
             return _gpu_aggregate(self.read("engine"), self.read("dedicated"), self.read("shared"), self.adapters)
@@ -600,6 +763,78 @@ if IS_WINDOWS:
             if self.query:
                 _pdh.PdhCloseQuery(self.query)
                 self.query = ctypes.c_void_p()
+
+    _thermal = {"reader": None, "failed": False}
+
+    def _win_thermal_zones():
+        """ACPI thermal zones from the "Thermal Zone Information" counters (readable by any user).
+
+        These are what the firmware chooses to expose: on laptops usually a real
+        CPU-area temperature, on many desktops a fixed or unrelated value, and on
+        VMs nothing. CPU package and core temperatures need a kernel driver, so
+        they aren't available without administrator rights.
+        """
+        if _thermal["failed"]:
+            return []
+        try:
+            if _thermal["reader"] is None:
+                query, handle = ctypes.c_void_p(), ctypes.c_void_p()
+                if _pdh.PdhOpenQueryW(None, 0, _byref(query)) != 0:
+                    raise OSError("no performance counters")
+                if _pdh.PdhAddEnglishCounterW(query, "\\Thermal Zone Information(*)\\High Precision Temperature",
+                                              0, _byref(handle)) != 0:
+                    _pdh.PdhCloseQuery(query)
+                    raise OSError("no thermal zone counters")
+                _thermal["reader"] = (query, handle)
+            query, handle = _thermal["reader"]
+            _pdh.PdhCollectQueryData(query)
+            return _win_zone_sensors(_pdh_array(handle))
+        except Exception:
+            _thermal["failed"] = True  # this Windows doesn't have them: don't ask again
+            return []
+
+    _nvml = {"tried": False, "lib": None, "devices": []}
+
+    def _win_nvidia_temps():
+        """[(name, degrees C)] for NVIDIA GPUs, through NVML (nvml.dll ships with the driver; no
+        administrator rights needed). Nothing on machines without an NVIDIA driver."""
+        st = _nvml
+        if not st["tried"]:
+            st["tried"] = True
+            lib = None
+            for candidate in ("nvml.dll", os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                                                       "NVIDIA Corporation", "NVSMI", "nvml.dll")):
+                try:
+                    lib = ctypes.WinDLL(candidate)
+                    break
+                except OSError:
+                    continue
+            try:
+                if lib is not None and lib.nvmlInit_v2() == 0:
+                    count = ctypes.c_uint(0)
+                    lib.nvmlDeviceGetCount_v2(_byref(count))
+                    for i in range(min(count.value, 16)):
+                        dev = ctypes.c_void_p()
+                        if lib.nvmlDeviceGetHandleByIndex_v2(i, _byref(dev)) != 0:
+                            continue
+                        name = ctypes.create_string_buffer(96)
+                        lib.nvmlDeviceGetName(dev, name, 96)
+                        st["devices"].append((dev, name.value.decode("utf-8", "replace")))
+                    st["lib"] = lib
+            except Exception:
+                st["devices"] = []
+        out = []
+        for dev, name in st["devices"]:
+            t = ctypes.c_uint(0)
+            if st["lib"].nvmlDeviceGetTemperature(dev, 0, _byref(t)) == 0:  # NVML_TEMPERATURE_GPU
+                out.append((name, float(t.value)))
+        return out
+
+    def _win_temps():
+        sensors = _win_thermal_zones()
+        for name, t in _win_nvidia_temps():
+            sensors.append({"name": name, "chip": "nvidia", "kind": "gpu", "temp": t, "high": None, "crit": None})
+        return sensors
 
     def _win_os_info():
         try:
@@ -1384,6 +1619,10 @@ def collect(sample_seconds=1.0, max_procs=500, prev=None):
         p["cmd"] = procs1[p["pid"]].get("cmd") or (p["name"] if IS_WINDOWS else _cmdline(p["pid"], p["name"]))
 
     load = _loadavg()
+    temps = _temps()
+    gpu = _GPU.report()
+    if gpu and gpu.get("adapters"):
+        _gpu_attach_temps(gpu["adapters"], [(t["name"], t["temp"]) for t in temps if t["chip"] == "nvidia"])
     return {
         "agent_version": VERSION,
         "collected_at": time.time(),
@@ -1403,8 +1642,9 @@ def collect(sample_seconds=1.0, max_procs=500, prev=None):
         "disk_io": _disk_io(io0, io1, elapsed),
         "docker": _docker_delta(docker0, docker1, elapsed, mem["total"]),
         "docker_ctl": _DOCKER.status(),
-        "gpu": _GPU.report(),
+        "gpu": gpu,
         "gpu_ctl": _GPU.status(),
+        "temps": temps,
         "net": {
             "rx_rate": max(rx1 - rx0, 0) / elapsed,
             "tx_rate": max(tx1 - tx0, 0) / elapsed,

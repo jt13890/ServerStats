@@ -13,6 +13,8 @@ MAX_DEVICES = 64
 MAX_CONTAINERS = 500
 MAX_VOLUMES = 1000
 MAX_GPUS = 16
+MAX_TEMPS = 64
+TEMP_KINDS = {"cpu", "gpu", "disk", "board", "other"}
 
 
 def _num(v, default=0.0):
@@ -99,8 +101,32 @@ def _gpu(v):
             "mem_used": _num(a.get("mem_used")),
             "mem_total": _opt(a.get("mem_total")),
             "shared_used": _opt(a.get("shared_used")),
+            "temp": _temp(a.get("temp")),
         })
     return {"adapters": adapters}
+
+
+def _temp(v):
+    """A temperature in degrees C, or None when it's missing or not a believable reading."""
+    t = _opt(v)
+    return t if t is not None and -100 < t < 300 else None
+
+
+def _temps(v):
+    """Sensors from the agent: CPU, GPU, drive and board temperatures."""
+    out = []
+    for t in _list(v)[:MAX_TEMPS]:
+        if not isinstance(t, dict) or _temp(t.get("temp")) is None:
+            continue
+        out.append({
+            "name": _str(t.get("name"), 64) or "sensor",
+            "chip": _str(t.get("chip"), 32),
+            "kind": t.get("kind") if t.get("kind") in TEMP_KINDS else "other",
+            "temp": _temp(t.get("temp")),
+            "high": _temp(t.get("high")),
+            "crit": _temp(t.get("crit")),
+        })
+    return out
 
 
 def _ctl(v):
@@ -199,6 +225,7 @@ def normalize(d: dict, max_procs: int) -> dict:
         "docker": _docker(d.get("docker"), ncpu),
         # What the agent can do about Docker, so the dashboard can offer the toggle.
         "docker_ctl": _ctl(d.get("docker_ctl")),
+        "temps": _temps(d.get("temps")),
         "gpu": _gpu(d.get("gpu")),
         "gpu_ctl": _ctl(d.get("gpu_ctl")),
         "processes": processes,

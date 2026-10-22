@@ -122,6 +122,10 @@
           <figcaption>Tasks</figcaption>
           <div class="chart" id="chart-tasks"></div>
         </figure>
+        <figure class="card chart-card" id="chart-temp-card" hidden>
+          <figcaption>Temperature</figcaption>
+          <div class="chart" id="chart-temp"></div>
+        </figure>
       </div>
 
       <div class="card moment-card" id="moment-card" hidden>
@@ -162,6 +166,18 @@
         </div>
       </div>
 
+      <div class="card" id="temp-card" hidden>
+        <div class="proc-head">
+          <h2>Temperatures <span id="temp-count" class="muted"></span></h2>
+        </div>
+        <div class="table-wrap">
+          <table class="table" id="temp-table">
+            <thead><tr><th>Sensor</th><th>Source</th><th class="num">Temperature</th><th class="num">High / critical</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
       <div class="card" id="gpu-card" hidden>
         <div class="proc-head">
           <h2>GPU <span id="gpu-count" class="muted"></span></h2>
@@ -172,7 +188,7 @@
         <div id="gpu-error" class="banner" hidden></div>
         <div class="table-wrap" id="gpu-body">
           <table class="table" id="gpu-table">
-            <thead><tr><th>GPU</th><th class="meter-col">Busy</th><th class="meter-col">Memory</th><th class="num">Shared memory</th></tr></thead>
+            <thead><tr><th>GPU</th><th class="meter-col">Busy</th><th class="meter-col">Memory</th><th class="num">Temp</th><th class="num">Shared memory</th></tr></thead>
             <tbody></tbody>
           </table>
         </div>
