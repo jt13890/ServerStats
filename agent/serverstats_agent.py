@@ -23,6 +23,7 @@ socket (i.e. is in the docker group); set SERVERSTATS_DOCKER=0 to turn that off.
 """
 
 import argparse
+import collections
 import hashlib
 import http.client
 import json
@@ -42,7 +43,7 @@ IS_WINDOWS = sys.platform == "win32"
 if not IS_WINDOWS:
     import pwd
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 if IS_WINDOWS:
     CLK_TCK = 10000000  # Windows process times are 100 ns FILETIME ticks
@@ -1814,6 +1815,172 @@ def _apply_update(opener, url, update, argv):
     os.execve(sys.executable, [sys.executable, entry] + list(argv), env)
 
 
+# -- keeping reports while the server is away ---------------------------------
+#
+# When the server can't be reached the agent keeps measuring and stores a slim
+# copy of each report (only what the history charts use: no processes, Docker
+# or GPU data). Once a live report gets through again it sends the saved ones,
+# oldest first, in chunks. It only does this if the server says it understands
+# them ("backfill" in its reply to a normal report), so an older server is
+# never sent something it would mistake for a live report.
+
+BUFFER_MAX_HOURS = 48
+BUFFER_MAX_ITEMS = 20000
+BACKFILL_CHUNK = 500
+
+
+def _slim(sample):
+    """What the history charts need from a report, and nothing else."""
+    dio, tasks = sample.get("disk_io") or {}, sample.get("tasks") or {}
+    temps = [t for t in sample.get("temps") or []
+             if isinstance(t, dict) and isinstance(t.get("temp"), (int, float))]
+    pool = [t for t in temps if t.get("kind") == "cpu"] or temps  # the sensor the charts use
+    return {
+        "collected_at": sample.get("collected_at"),
+        "interval": sample.get("interval"),
+        "cpu": sample.get("cpu"),
+        "memory": sample.get("memory"),
+        "load": sample.get("load"),
+        "net": sample.get("net"),
+        "disk_io": {k: dio.get(k) for k in ("read_rate", "write_rate", "util")},
+        "tasks": {k: tasks.get(k) for k in ("total", "threads")},
+        "disks": [{k: d.get(k) for k in ("mount", "device", "fs", "total", "used", "free", "percent")}
+                  for d in sample.get("disks") or [] if isinstance(d, dict)],
+        "temps": [max(pool, key=lambda t: t["temp"])] if pool else [],
+    }
+
+
+class _Backlog(object):
+    """A bounded queue of slim reports (oldest dropped when full), mirrored to a
+    JSON-lines file readable only by this user so a restart doesn't lose it.
+    Without a usable file it simply lives in memory."""
+
+    def __init__(self, limit, path=None):
+        self.limit = max(int(limit), 1)
+        self.path = path
+        self.items = collections.deque()
+        self._lines = 0  # lines in the file, which may run a little ahead of the queue
+        if path:
+            self._load()
+
+    def __len__(self):
+        return len(self.items)
+
+    def _load(self):
+        try:
+            with open(self.path, "r") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(item, dict):
+                self.items.append(item)
+        while len(self.items) > self.limit:
+            self.items.popleft()
+        if len(self.items) != len(lines):  # junk or surplus lines: clean the file
+            self._rewrite()
+        else:
+            self._lines = len(lines)
+
+    def _rewrite(self):
+        if not self.path:
+            return
+        try:
+            if not self.items:
+                self._lines = 0
+                if os.path.exists(self.path):
+                    os.remove(self.path)
+                return
+            tmp = self.path + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                for item in self.items:
+                    f.write(json.dumps(item, separators=(",", ":")) + "\n")
+            os.replace(tmp, self.path)
+            self._lines = len(self.items)
+        except OSError as e:
+            print("cannot save buffered reports to %s: %s (keeping them in memory)" % (self.path, e),
+                  file=sys.stderr, flush=True)
+            self.path = None
+
+    def add(self, item):
+        self.items.append(item)
+        while len(self.items) > self.limit:
+            self.items.popleft()
+        if not self.path:
+            return
+        if self._lines >= self.limit + max(self.limit // 4, 10):
+            self._rewrite()  # the file has grown well past the queue: trim it
+            return
+        try:
+            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a") as f:
+                f.write(json.dumps(item, separators=(",", ":")) + "\n")
+            self._lines += 1
+        except OSError as e:
+            print("cannot save buffered reports to %s: %s (keeping them in memory)" % (self.path, e),
+                  file=sys.stderr, flush=True)
+            self.path = None
+
+    def peek(self, n):
+        return list(self.items)[:n]
+
+    def drop(self, n):
+        for _ in range(min(n, len(self.items))):
+            self.items.popleft()
+        self._rewrite()
+
+    def clear(self):
+        self.items.clear()
+        self._rewrite()
+
+
+def _make_backlog(hours, interval):
+    """The backlog for `hours` of reports (capped; 0 turns buffering off -> None)."""
+    hours = min(max(hours, 0.0), BUFFER_MAX_HOURS)
+    if hours <= 0:
+        return None
+    limit = max(int(min(hours * 3600.0 / interval, BUFFER_MAX_ITEMS)), 1)
+    d = os.environ.get("SERVERSTATS_SPOOL_DIR") or _state_dir()
+    return _Backlog(limit, os.path.join(d, "backlog.jsonl") if d else None)
+
+
+def _transient(code):
+    """HTTP answers that mean "the server is away", not "this report is refused"."""
+    return code in (408, 425, 429) or code >= 500
+
+
+def _retry_delay(failures, interval):
+    """While buffering, how long to leave the server alone after a failed attempt
+    (the agent still measures every interval). Same pacing as the old longer waits."""
+    return 0.0 if failures < 3 else max(min(interval * failures, 300.0) - interval, 0.0)
+
+
+def _flush_backlog(opener, args, backlog, takes):
+    """Send one chunk of saved reports. Refused (4xx) -> dropped; not ready -> kept for next time."""
+    chunk = backlog.peek(max(min(takes, BACKFILL_CHUNK), 1))
+    if not chunk:
+        return
+    try:
+        reply = _post(opener, args.url, args.token, {"backfill": chunk, "sent_at": time.time()})
+    except urllib.error.HTTPError as e:
+        if _transient(e.code):
+            print("server not ready for buffered reports (HTTP %d); will retry" % e.code, file=sys.stderr, flush=True)
+        else:
+            print("server refused buffered reports (HTTP %d); dropping %d" % (e.code, len(chunk)), file=sys.stderr, flush=True)
+            backlog.drop(len(chunk))
+        return
+    except Exception as e:
+        print("sending buffered reports failed: %s; will retry" % e, file=sys.stderr, flush=True)
+        return
+    backlog.drop(len(chunk))
+    print("sent %d buffered report(s), %d left" % (len(chunk), len(backlog)), flush=True)
+
+
 def run_agent(args, argv):
     if not args.url or not args.token:
         sys.exit("agent mode needs --url and --token (or SERVERSTATS_URL / SERVERSTATS_TOKEN)")
@@ -1824,45 +1991,78 @@ def run_agent(args, argv):
     failures = 0
     snapshot = None
     can_update = updates_enabled()
-    print("serverstats-agent %s reporting to %s every %ss (remote updates %s)"
-          % (VERSION, args.url, interval, "on" if can_update else "off"), flush=True)
+    backlog = _make_backlog(getattr(args, "buffer_hours", 0.0), interval)
+    takes = None          # reports per chunk the server accepts; None = not heard yet, 0 = it doesn't
+    rejected = False      # the last answer was a refusal (bad token, login redirect...), not "away"
+    next_attempt = 0.0    # while buffering: don't try the server again before this
+    announced = False
+    if backlog is not None and len(backlog):
+        print("found %d buffered report(s) from before" % len(backlog), flush=True)
+    print("serverstats-agent %s reporting to %s every %ss (remote updates %s, %s)"
+          % (VERSION, args.url, interval, "on" if can_update else "off",
+             "buffering up to %d reports while the server is away" % backlog.limit if backlog else "no buffering"),
+          flush=True)
     while True:
         started = time.monotonic()
+        sample_data = None
         try:
             sample_data, snapshot = collect(sample, args.max_procs, snapshot)
             sample_data["interval"] = interval  # lets the server judge staleness
             sample_data["updates"] = can_update
             if can_update:
                 sample_data["update_failed"] = failed_update_version()
-            reply = _post(opener, args.url, args.token, sample_data)
-            if failures:
-                print("reporting recovered after %d failure(s)" % failures, flush=True)
-            failures = 0
-            _mark_update_healthy()
-            settings = reply.get("settings")
-            if isinstance(settings, dict) and isinstance(settings.get("docker"), bool):
-                if _DOCKER.override != settings["docker"]:
-                    print("Docker stats turned %s from the dashboard" % ("on" if settings["docker"] else "off"), flush=True)
-                _DOCKER.override = settings["docker"]
-            if isinstance(settings, dict) and isinstance(settings.get("gpu"), bool):
-                if _GPU.override != settings["gpu"]:
-                    print("GPU stats turned %s from the dashboard" % ("on" if settings["gpu"] else "off"), flush=True)
-                _GPU.override = settings["gpu"]
-            if can_update and isinstance(reply.get("update"), dict):
-                try:
-                    _apply_update(opener, args.url, reply["update"], argv)
-                except Exception as e:
-                    print("update failed: %s" % e, file=sys.stderr, flush=True)
+            if backlog is not None and failures >= 3 and not rejected and takes != 0 and started < next_attempt:
+                backlog.add(_slim(sample_data))  # still waiting before the next try
+                sample_data = None
+            else:
+                reply = _post(opener, args.url, args.token, sample_data)
+                sample_data = None  # delivered
+                if failures:
+                    print("reporting recovered after %d failure(s)" % failures, flush=True)
+                failures, rejected, announced = 0, False, False
+                _mark_update_healthy()
+                takes = reply.get("backfill") if isinstance(reply.get("backfill"), int) \
+                    and not isinstance(reply.get("backfill"), bool) else 0
+                if backlog is not None:
+                    if takes <= 0:
+                        backlog.clear()  # an older server: it can't use them
+                    elif len(backlog):
+                        _flush_backlog(opener, args, backlog, takes)
+                settings = reply.get("settings")
+                if isinstance(settings, dict) and isinstance(settings.get("docker"), bool):
+                    if _DOCKER.override != settings["docker"]:
+                        print("Docker stats turned %s from the dashboard" % ("on" if settings["docker"] else "off"), flush=True)
+                    _DOCKER.override = settings["docker"]
+                if isinstance(settings, dict) and isinstance(settings.get("gpu"), bool):
+                    if _GPU.override != settings["gpu"]:
+                        print("GPU stats turned %s from the dashboard" % ("on" if settings["gpu"] else "off"), flush=True)
+                    _GPU.override = settings["gpu"]
+                if can_update and isinstance(reply.get("update"), dict):
+                    try:
+                        _apply_update(opener, args.url, reply["update"], argv)
+                    except Exception as e:
+                        print("update failed: %s" % e, file=sys.stderr, flush=True)
         except urllib.error.HTTPError as e:
             failures += 1
+            rejected = not _transient(e.code)
             print("server rejected report: HTTP %d %s" % (e.code, e.reason), file=sys.stderr, flush=True)
             if e.code in (401, 403):
                 print("check the token and that /api/ingest bypasses the auth proxy", file=sys.stderr, flush=True)
         except Exception as e:  # network errors, DNS, TLS...
             failures += 1
+            rejected = False
             print("report failed: %s" % e, file=sys.stderr, flush=True)
-        # Back off gently while the server is unreachable (max 5 minutes).
-        wait = interval if failures < 3 else min(interval * failures, 300)
+        if sample_data is not None and backlog is not None and not rejected and takes != 0:
+            # An attempt to reach the server just failed: keep this report, try again later.
+            if not announced:
+                print("buffering reports until the server is back", flush=True)
+                announced = True
+            backlog.add(_slim(sample_data))
+            next_attempt = time.monotonic() + _retry_delay(failures, interval)
+        buffering = backlog is not None and failures and not rejected and takes != 0
+        # Without buffering: back off gently while the server is unreachable (max 5 minutes).
+        # With it we keep measuring every interval and just try the server less often.
+        wait = interval if buffering or failures < 3 else min(interval * failures, 300)
         time.sleep(max(wait - (time.monotonic() - started), 0.5))
 
 
@@ -1938,6 +2138,8 @@ def main():
     ap.add_argument("--interval", type=float, default=float(env("SERVERSTATS_INTERVAL", "15")), help="seconds between reports")
     ap.add_argument("--sample", type=float, default=1.0, help="CPU sampling window in seconds")
     ap.add_argument("--max-procs", type=int, default=int(env("SERVERSTATS_MAX_PROCS", "500")), help="report at most N processes (0 = all)")
+    ap.add_argument("--buffer-hours", type=float, default=float(env("SERVERSTATS_BUFFER_HOURS", "24")),
+                    help="keep this many hours of reports while the server is away, up to 48 (0 = don't)")
     ap.add_argument("--ca-file", default=env("SERVERSTATS_CA_FILE"), help="custom CA bundle for self-signed setups")
     ap.add_argument("--log-file", default=env("SERVERSTATS_LOG_FILE"),
                     help="agent mode: write output to this file (rotated at 1 MB) instead of stdout/stderr")
