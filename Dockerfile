@@ -10,7 +10,7 @@ COPY server/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server/app ./app
-COPY agent/serverstats_agent.py agent/install.sh ./agent/
+COPY agent/serverstats_agent.py agent/install.sh agent/install.ps1 ./agent/
 COPY server/entrypoint.sh /usr/local/bin/serverstats-entrypoint
 
 # The app runs as this user; the entrypoint starts as root only to fix the

@@ -12,6 +12,9 @@ MAX_DISKS = 64
 MAX_DEVICES = 64
 MAX_CONTAINERS = 500
 MAX_VOLUMES = 1000
+MAX_GPUS = 16
+MAX_TEMPS = 64
+TEMP_KINDS = {"cpu", "gpu", "disk", "board", "other"}
 
 
 def _num(v, default=0.0):
@@ -81,6 +84,58 @@ def _docker(v, ncpu=1):
     return {"containers": containers, "volumes": volumes, "disk_at": _opt(v.get("disk_at"))}
 
 
+def _gpu(v):
+    """GPU stats from a Windows agent: None when off, {"error"} or {"adapters"}."""
+    if not isinstance(v, dict):
+        return None
+    if v.get("error"):
+        return {"error": _str(v.get("error"), 300)}
+    adapters = []
+    for a in _list(v.get("adapters"))[:MAX_GPUS]:
+        if not isinstance(a, dict):
+            continue
+        adapters.append({
+            "name": _str(a.get("name"), 128) or "GPU",
+            "util": min(max(_num(a.get("util")), 0.0), 100.0),
+            "engine": _str(a.get("engine"), 32),
+            "mem_used": _num(a.get("mem_used")),
+            "mem_total": _opt(a.get("mem_total")),
+            "shared_used": _opt(a.get("shared_used")),
+            "temp": _temp(a.get("temp")),
+        })
+    return {"adapters": adapters}
+
+
+def _temp(v):
+    """A temperature in degrees C, or None when it's missing or not a believable reading."""
+    t = _opt(v)
+    return t if t is not None and -100 < t < 300 else None
+
+
+def _temps(v):
+    """Sensors from the agent: CPU, GPU, drive and board temperatures."""
+    out = []
+    for t in _list(v)[:MAX_TEMPS]:
+        if not isinstance(t, dict) or _temp(t.get("temp")) is None:
+            continue
+        out.append({
+            "name": _str(t.get("name"), 64) or "sensor",
+            "chip": _str(t.get("chip"), 32),
+            "kind": t.get("kind") if t.get("kind") in TEMP_KINDS else "other",
+            "temp": _temp(t.get("temp")),
+            "high": _temp(t.get("high")),
+            "crit": _temp(t.get("crit")),
+        })
+    return out
+
+
+def _ctl(v):
+    """What an agent can do about an optional section (Docker, GPU), so the dashboard can offer the toggle."""
+    if not isinstance(v, dict):
+        return None
+    return {k: v.get(k) is True for k in ("present", "available", "enabled")}
+
+
 def _pct(v, top=100.0):
     """A percentage clamped to 0..top (older agents could report absurd CPU%)."""
     return min(max(_num(v), 0.0), top)
@@ -148,6 +203,8 @@ def normalize(d: dict, max_procs: int) -> dict:
         "interval": min(max(interval, 1.0), 3600.0) if interval is not None else None,
         "collected_at": _num(d.get("collected_at"), None),
         "hostname": _str(d.get("hostname"), 253),
+        # Windows has no load average, so the UI leaves it out there.
+        "platform": "windows" if d.get("platform") == "windows" else "linux",
         "os": _str(d.get("os")),
         "kernel": _str(d.get("kernel")),
         "arch": _str(d.get("arch"), 32),
@@ -167,7 +224,9 @@ def normalize(d: dict, max_procs: int) -> dict:
         "tasks": {k: _int(tasks.get(k)) for k in ("total", "running", "sleeping", "zombie", "threads")},
         "docker": _docker(d.get("docker"), ncpu),
         # What the agent can do about Docker, so the dashboard can offer the toggle.
-        "docker_ctl": {k: _dict(d.get("docker_ctl")).get(k) is True for k in ("present", "available", "enabled")}
-        if isinstance(d.get("docker_ctl"), dict) else None,
+        "docker_ctl": _ctl(d.get("docker_ctl")),
+        "temps": _temps(d.get("temps")),
+        "gpu": _gpu(d.get("gpu")),
+        "gpu_ctl": _ctl(d.get("gpu_ctl")),
         "processes": processes,
     }

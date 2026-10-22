@@ -58,6 +58,12 @@ function fmtBytes(n) {
   while (Math.abs(n) >= 1024 && i < UNITS.length - 1) { n /= 1024; i++; }
   return (i === 0 || n >= 100 ? Math.round(n) : n.toFixed(1)) + ' ' + UNITS[i];
 }
+const fmtTemp = (n) => (n == null || !isFinite(n) ? '—' : `${(+n).toFixed(1)} °C`);
+// The sensor worth a headline: the hottest CPU one, else the hottest of any.
+const hottest = (temps) => {
+  const cpu = (temps || []).filter((t) => t.kind === 'cpu');
+  return (cpu.length ? cpu : temps || []).reduce((a, t) => (!a || t.temp > a.temp ? t : a), null);
+};
 const fmtRate = (n) => (n == null || !isFinite(n) ? '—' : fmtBytes(n) + '/s');
 function fmtPct(n) {
   if (n == null || !isFinite(n)) return '—';
@@ -518,6 +524,8 @@ function renderDetail(name) {
     if (!host) return;
     if (!proc.paused) procData = host.processes || [];
     drawHost();
+    drawTemps();
+    drawGpu();
     drawDocker();
     drawProcs();
   }
@@ -646,13 +654,16 @@ function renderDetail(name) {
     const disk = fullestDisk(host);
     const net = host.net || {};
     const tasks = host.tasks || {};
+    const hot = hottest(host.temps);
     tiles.replaceChildren(
-      tile('CPU', fmtPct(host.cpu.percent), `${host.cpu.count} cores · load ${(host.load || []).map((l) => l.toFixed(2)).join(' ')}`),
+      tile('CPU', fmtPct(host.cpu.percent), `${host.cpu.count} cores`
+        + (host.platform === 'windows' ? '' : ` · load ${(host.load || []).map((l) => l.toFixed(2)).join(' ')}`)),
       tile('Memory', fmtPct(mem.percent),
         `${fmtBytes(mem.used)} of ${fmtBytes(mem.total)}` + (mem.swap_total ? ` · swap ${fmtBytes(mem.swap_used)}` : '')),
       tile('Disk I/O busy', fmtPct(dio.util), `read ${fmtRate(dio.read_rate)} · write ${fmtRate(dio.write_rate)}`),
       tile('Storage (fullest)', disk ? fmtPct(disk.percent) : '—',
         disk ? `${disk.mount} · ${fmtBytes(disk.free ?? disk.total - disk.used)} free` : 'no filesystems'),
+      ...(hot ? [tile('Temperature', fmtTemp(hot.temp), hot.name)] : []),
       tile('Network in', fmtRate(net.rx_rate), `out ${fmtRate(net.tx_rate)}`),
       tile('Tasks', fmtNum(tasks.total),
         `${fmtNum(tasks.running)} running · ${fmtNum(tasks.threads)} threads` + (tasks.zombie ? ` · ${tasks.zombie} zombie` : '')),
@@ -683,6 +694,71 @@ function renderDetail(name) {
 
   // Stacks the user has expanded to show their containers.
   const expanded = new Set();
+
+  const TEMP_KINDS = { cpu: 'CPU', gpu: 'GPU', disk: 'Drives', board: 'Board', other: 'Other' };
+
+  function drawTemps() {
+    const temps = host.temps || [];
+    $('#temp-card').hidden = !temps.length;
+    if (!temps.length) return;
+    $('#temp-count').textContent = temps.length > 1 ? `${temps.length} sensors` : '';
+    const order = Object.keys(TEMP_KINDS);
+    const sorted = temps.slice().sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind) || a.name.localeCompare(b.name));
+    $('#temp-table tbody').replaceChildren(...sorted.map((t) => {
+      // Against the sensor's own limit when it has one, else the usual comfort range.
+      const limit = t.crit != null ? t.crit : t.high;
+      const level = limit != null ? (t.temp >= limit ? 'full' : t.temp >= limit - 10 ? 'warning' : '')
+        : (t.temp >= 90 ? 'full' : t.temp >= 80 ? 'warning' : '');
+      const limits = [t.high != null ? fmtTemp(t.high) : null, t.crit != null ? fmtTemp(t.crit) : null].filter(Boolean);
+      return h('tr', null,
+        h('td', null, h('b', { text: t.name }), h('small', { class: 'muted', text: ` ${TEMP_KINDS[t.kind]}` })),
+        h('td', { class: 'muted', text: t.chip || '—' }),
+        h('td', { class: 'num' }, h('span', { class: 'meter-value' + (level ? ` is-${level}` : ''), text: fmtTemp(t.temp) })),
+        h('td', { class: 'num muted', text: limits.length ? limits.join(' / ') : '—' }));
+    }));
+  }
+
+  function drawGpu() {
+    const gp = host.gpu;
+    const ctl = host.gpu_ctl; // only Windows agents send this
+    $('#gpu-card').hidden = !gp && !(ctl && ctl.present);
+    if ($('#gpu-card').hidden) return;
+
+    const on = ctl ? ctl.enabled : !!gp;
+    const want = host.gpu_pref != null ? host.gpu_pref : on;
+    const toggle = $('#gpu-toggle');
+    toggle.hidden = !(host.mode === 'agent' && ctl);
+    toggle.textContent = want ? 'Turn off GPU stats' : 'Turn on GPU stats';
+    toggle.dataset.want = String(!want);
+    let stateText = '';
+    if (want !== on) {
+      stateText = `Turning GPU stats ${want ? 'on' : 'off'}; the agent picks this up on its next report.`;
+    } else if (!on) {
+      stateText = 'GPU stats are off for this host. Turn them on to see how busy each GPU is and how much of its memory is in use.';
+    }
+    $('#gpu-state').hidden = !stateText;
+    $('#gpu-state').textContent = stateText;
+
+    const err = $('#gpu-error');
+    err.hidden = !(gp && gp.error);
+    err.textContent = (gp && gp.error) || '';
+    const showData = !!(gp && !gp.error);
+    $('#gpu-body').hidden = !showData;
+    $('#gpu-count').textContent = showData && gp.adapters.length > 1 ? `${gp.adapters.length} GPUs` : '';
+    if (!showData) return;
+    $('#gpu-table tbody').replaceChildren(...(gp.adapters.length ? gp.adapters.map((a) => {
+      const memPct = a.mem_total ? (100 * a.mem_used) / a.mem_total : null;
+      return h('tr', null,
+        h('td', null, h('b', { text: a.name })),
+        h('td', null, meter(null, a.util, `${fmtPct(a.util)} busy` + (a.engine ? ` · mostly ${a.engine}` : ''),
+          null, a.engine ? `${fmtPct(a.util)} · ${a.engine}` : fmtPct(a.util))),
+        h('td', { class: 'mem-cell' }, a.mem_total
+          ? meter(null, memPct, `${fmtBytes(a.mem_used)} of ${fmtBytes(a.mem_total)}`, null, `${fmtBytes(a.mem_used)} · ${fmtPct(memPct)}`)
+          : h('span', { text: fmtBytes(a.mem_used) })),
+        h('td', { class: 'num', text: fmtTemp(a.temp) }),
+        h('td', { class: 'num', text: a.shared_used == null ? '—' : fmtBytes(a.shared_used) }));
+    }) : [h('tr', null, h('td', { colspan: 5, class: 'muted', text: 'No GPU data yet' }))]));
+  }
 
   function drawDocker() {
     const dk = host.docker;
@@ -809,6 +885,20 @@ function renderDetail(name) {
       ? `Disk space is container writable layers plus their volumes (bind mounts not included), measured ${fmtAgo(serverNow() - dk.disk_at)}. CPU share is of all ${ncpu} cores.`
       : 'Disk space per stack is measured by the push agent every 15 minutes; it isn\'t available over SSH.';
   }
+
+  $('#gpu-toggle').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try {
+      await apiPost(`/api/hosts/${enc}/gpu`, { enabled: btn.dataset.want === 'true' });
+      await loadHost();
+    } catch (err) {
+      $('#gpu-state').hidden = false;
+      $('#gpu-state').textContent = `Couldn't change the GPU setting: ${err.message}`;
+    } finally {
+      btn.disabled = false;
+    }
+  });
 
   $('#docker-toggle').addEventListener('click', async (e) => {
     const btn = e.currentTarget;
@@ -944,6 +1034,15 @@ function renderDetail(name) {
         { label: '15 min', slot: 3, points: pick('load15') },
       ],
     });
+
+    const temp = pick('temp');
+    $('#chart-temp-card').hidden = !temp.length;
+    if (temp.length) {
+      lineChart($('#chart-temp'), {
+        ...common, title: 'Temperature', count: true, fmt: fmtTemp,
+        series: [{ label: 'Hottest sensor', slot: 1, points: temp }],
+      });
+    }
 
     lineChart($('#chart-tasks'), {
       ...common, title: 'Tasks', count: true, fmt: fmtCount,
@@ -1122,9 +1221,10 @@ function momentView(m, host) {
   const mounts = (m.storage || []).filter((d) => d.total);
   const fullest = mounts.reduce((a, d) => (!a || d.used / d.total > a.used / a.total ? d : a), null);
   kids.push(h('div', { class: 'tiles moment-stats' },
-    tile('CPU', fmtPct(st.cpu), `load ${n2(st.load1)} ${n2(st.load5)} ${n2(st.load15)}`),
+    tile('CPU', fmtPct(st.cpu), host && host.platform === 'windows' ? '' : `load ${n2(st.load1)} ${n2(st.load5)} ${n2(st.load15)}`),
     tile('Memory', fmtPct(st.mem), st.swap == null ? 'no swap' : `swap ${fmtPct(st.swap)}`),
     tile('Disk I/O busy', fmtPct(st.disk_util), `read ${fmtRate(st.disk_read)} · write ${fmtRate(st.disk_write)}`),
+    ...(st.temp != null ? [tile('Temperature', fmtTemp(st.temp), 'hottest sensor')] : []),
     tile('Network in', fmtRate(st.rx), `out ${fmtRate(st.tx)}`),
     tile('Storage (fullest)', fullest ? fmtPct((100 * fullest.used) / fullest.total) : fmtPct(st.storage),
       fullest ? `${fullest.mount} · ${fmtBytes(fullest.total - fullest.used)} free` : ''),
@@ -1701,6 +1801,7 @@ function setupDialog() {
   let token = '';
 
   const quote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  const psQuote = (s) => `'${String(s).replace(/'/g, "''")}'`; // PowerShell single quotes
   const yamlName = (s) => (/^[A-Za-z0-9._-]+$/.test(s) ? s : JSON.stringify(s));
 
   function update() {
@@ -1715,6 +1816,13 @@ function setupDialog() {
       $('#agent-install').textContent =
         `${installer} --join ${quote(joinKey)}${name ? ' --name ' + quote(name) : ''}${docker}`;
     }
+    const gpu = $('#add-gpu').checked ? ' -Gpu' : '';
+    const winInstaller = `& ([scriptblock]::Create((irm ${psQuote(origin + '/api/agent/install.ps1')}))) -Url ${psQuote(origin)}`;
+    if (joinKey) {
+      const name = $('#agent-name').value.trim();
+      $('#agent-install-win').textContent = `${winInstaller} -Join ${psQuote(joinKey)}${name ? ' -Name ' + psQuote(name) : ''}${gpu}`;
+    }
+    $('#agent-install-win-token').textContent = `${winInstaller} -Token ${token}${gpu}`;
     const aName = $('#agent-name-cfg').value.trim() || 'my-server';
     $('#agent-config').textContent =
       `hosts:\n  - name: ${yamlName(aName)}\n    mode: agent\n    token: ${token}`;
@@ -1744,7 +1852,7 @@ function setupDialog() {
   });
   dialog.querySelector('[data-action="close"]').addEventListener('click', () => dialog.close());
   dialog.addEventListener('click', (e) => { if (e.target === dialog) dialog.close(); });
-  ['#agent-name', '#agent-name-cfg', '#ssh-name', '#ssh-address', '#add-docker'].forEach((id) => $(id).addEventListener('input', update));
+  ['#agent-name', '#agent-name-cfg', '#ssh-name', '#ssh-address', '#add-docker', '#add-gpu'].forEach((id) => $(id).addEventListener('input', update));
   $('#rotate-join').addEventListener('click', async () => {
     if (!confirm('Make a new join key? The current one stops working for new hosts; hosts that already joined are unaffected.')) return;
     try {

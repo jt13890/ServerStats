@@ -994,3 +994,350 @@ def test_zooming_into_old_history_uses_what_is_left(tmp_path):
     for offset in range(0, 300, 60):  # any minute, whether or not a 5-minute row starts in it
         m = store.moment("h", start + 3600 + offset, 60)
         assert m["stats"]["cpu"] == pytest.approx(69.6, abs=0.3), offset
+
+
+# -- Windows hosts -----------------------------------------------------------------
+
+def test_windows_installer_is_served_without_sso(client):
+    r = client.get("/api/agent/install.ps1")
+    assert r.status_code == 200
+    assert "Register-ScheduledTask" in r.text and "serverstats_agent.py" in r.text
+
+
+def test_windows_sample_is_accepted(client):
+    win = sample(
+        platform="windows", os="Windows 11 Pro 24H2", kernel="10.0.26100", arch="AMD64", load=[],
+        disks=[{"mount": "C:\\", "device": "C:", "fs": "ntfs", "total": 1000, "used": 400, "free": 600, "percent": 40.0}],
+        disk_io={"read_rate": 1, "write_rate": 2, "util": 3, "devices": [
+            {"name": "PhysicalDrive0", "label": "Disk 0", "virtual": False, "read_rate": 1, "write_rate": 2, "util": 3}]},
+        processes=[{"pid": 4, "ppid": 0, "name": "System", "state": "S", "user": "SYSTEM", "cpu": 0.0, "mem": 0.1,
+                    "rss": 1000, "threads": 200, "started": 1700000000, "cmd": "System"}],
+    )
+    assert ingest(client, TOKEN_A, win).status_code == 200
+    h = client.get("/api/hosts/alpha", headers=USER).json()
+    assert h["platform"] == "windows" and h["os"] == "Windows 11 Pro 24H2"
+    assert h["load"] == [0.0, 0.0, 0.0]
+    assert h["disks"][0]["mount"] == "C:\\"
+    assert h["processes"][0]["user"] == "SYSTEM"
+    # Anything but "windows" is treated as Linux, so the field can't be abused.
+    ingest(client, TOKEN_B, sample(platform="<b>"))
+    assert client.get("/api/hosts/beta", headers=USER).json()["platform"] == "linux"
+    assert sample()["platform"] == "linux"
+
+
+def test_windows_helpers():
+    import struct
+    from agent_collector import _filetime_to_unix, _win_os_name, _win_parse_pagefiles
+
+    assert _filetime_to_unix(116444736000000000 + 10000000 * 1700000000) == 1700000000
+    assert _filetime_to_unix(0) == 0
+    # Windows 11 still calls itself Windows 10 in the registry.
+    assert _win_os_name("Windows 10 Pro", "26100", "24H2") == "Windows 11 Pro 24H2"
+    assert _win_os_name("Windows 10 Pro", "19045", "22H2") == "Windows 10 Pro 22H2"
+    assert _win_os_name("Windows Server 2022 Standard", "20348") == "Windows Server 2022 Standard"
+    assert _win_os_name("", "junk") == "Windows"
+    # Two page files: NextEntryOffset, TotalSize, TotalInUse, PeakUsage, then the name.
+    raw = struct.pack("<IIII", 28, 1000, 250, 300) + b"\0" * 12 + struct.pack("<IIII", 0, 500, 5, 5)
+    assert _win_parse_pagefiles(raw, 4096) == (1500 * 4096, 255 * 4096)
+    assert _win_parse_pagefiles(b"", 4096) == (0, 0)
+
+
+def test_agent_log_file_is_rotated(tmp_path):
+    from agent_collector import _LogFile
+
+    log = _LogFile(str(tmp_path / "agent.log"), limit=100)
+    for i in range(30):
+        log.write("line %d\n" % i)
+    assert (tmp_path / "agent.log.1").exists()
+    assert 0 < (tmp_path / "agent.log").stat().st_size <= 100 + 20
+    assert "line 29" in (tmp_path / "agent.log").read_text()
+
+
+def test_collect_with_windows_backends(monkeypatch):
+    """The Windows code paths in collect(), with the Win32 calls stubbed out."""
+    import agent_collector as a
+
+    calls = {"n": 0}
+
+    def tick():
+        calls["n"] += 1
+        return calls["n"]
+
+    monkeypatch.setattr(a, "IS_WINDOWS", True)
+    monkeypatch.setattr(a, "_win_cpu_times", lambda: ({"cpu0": (100 * tick(), 100 * tick(), 0)}, 1700000000), raising=False)
+    monkeypatch.setattr(a, "_win_diskstats", lambda: {"PhysicalDrive0": (1000 * tick(), 500 * tick(), 10 * tick())}, raising=False)
+    monkeypatch.setattr(a, "_win_net_bytes", lambda: (1000 * tick(), 2000 * tick()), raising=False)
+    monkeypatch.setattr(a, "_win_uptime", lambda: 12345.0, raising=False)
+    monkeypatch.setattr(a, "_win_os_info", lambda: "Windows 11 Pro 24H2", raising=False)
+    monkeypatch.setattr(a, "_win_meminfo", lambda: {"total": 8, "available": 4, "used": 4, "percent": 50.0,
+                                                    "swap_total": 0, "swap_used": 0}, raising=False)
+    monkeypatch.setattr(a, "_win_disks", lambda: [{"mount": "C:\\", "device": "C:", "fs": "ntfs", "total": 10, "used": 4,
+                                                   "free": 6, "percent": 40.0}], raising=False)
+
+    def procs():
+        n = tick()
+        proc = {"state": "S", "ppid": 0, "threads": 4, "starttime": 5, "started": 1700000000}
+        return {
+            4: dict(proc, name="System", ticks=100, rss=1000, uid="SYSTEM", cmd=""),
+            100: dict(proc, name="app.exe", ticks=100 + n * 5000000, rss=2000, uid="alice", cmd="C:\\x\\app.exe"),
+        }
+
+    monkeypatch.setattr(a, "_win_proc_snapshot", procs, raising=False)
+
+    class FakeGpu:  # the real one needs the Windows performance counters
+        def snapshot(self):
+            return None
+
+        def report(self):
+            return {"adapters": [{"name": "RTX", "util": 12.5, "engine": "3D", "mem_used": 1, "mem_total": 2, "shared_used": 3}]}
+
+        def status(self):
+            return {"present": True, "available": True, "enabled": True}
+
+    monkeypatch.setattr(a, "_GPU", FakeGpu())
+    monkeypatch.setattr(a, "_win_temps", lambda: [
+        {"name": "ACPI thermal zone TZ00", "chip": "acpi", "kind": "board", "temp": 48.0, "high": None, "crit": None},
+        {"name": "RTX", "chip": "nvidia", "kind": "gpu", "temp": 61.0, "high": None, "crit": None}], raising=False)
+    s = a.collect(0.01, 50)[0]
+    assert s["platform"] == "windows" and s["os"] == "Windows 11 Pro 24H2" and s["load"] == [] and s["uptime"] == 12345.0
+    by_pid = {p["pid"]: p for p in s["processes"]}
+    assert by_pid[100]["user"] == "alice" and by_pid[100]["cmd"] == "C:\\x\\app.exe"
+    assert by_pid[100]["state"] == "R" and by_pid[4]["state"] == "S"
+    assert by_pid[4]["cmd"] == "System"  # no path (access denied): falls back to the name
+    assert by_pid[100]["started"] == 1700000000
+    assert s["tasks"]["running"] == 1 and s["docker"] is None and s["docker_ctl"] is None  # no Docker on Windows
+    assert s["gpu"]["adapters"][0]["util"] == 12.5 and s["gpu_ctl"]["enabled"] is True
+    assert [t["name"] for t in s["temps"]] == ["ACPI thermal zone TZ00", "RTX"]
+    assert s["gpu"]["adapters"][0]["temp"] == 61.0  # the NVIDIA reading is shown on the GPU too
+    assert s["disk_io"]["devices"][0]["label"] == "Disk 0"
+    assert s["disks"][0]["mount"] == "C:\\"
+    # What the server gets from a Windows agent is accepted as it is.
+    from app.schema import normalize
+    assert normalize(s, 100)["platform"] == "windows"
+    assert a.updates_enabled() is False
+
+
+# -- Windows: no-admin process list, GPU ----------------------------------------------
+
+def _process_entry(pid, ppid, threads, create, user, kernel, ws, name, base, name_at, nxt, ptr=8):
+    """One SYSTEM_PROCESS_INFORMATION entry as NtQuerySystemInformation lays it out."""
+    import struct
+    o = (64, 80, 88, 144, "<Q", 152) if ptr == 8 else (60, 68, 72, 104, "<I", 112)
+    buf = bytearray(o[5])
+    struct.pack_into("<II", buf, 0, nxt, threads)
+    struct.pack_into("<qqq", buf, 32, create, user, kernel)
+    raw = name.encode("utf-16-le")
+    struct.pack_into("<HH", buf, 56, len(raw), len(raw))
+    struct.pack_into(o[4], buf, o[0], base + name_at if raw else 0)
+    struct.pack_into(o[4], buf, o[1], pid)
+    struct.pack_into(o[4], buf, o[2], ppid)
+    struct.pack_into(o[4], buf, o[3], ws)
+    return bytes(buf), raw
+
+
+def test_win_parse_processes():
+    from agent_collector import _win_parse_processes
+
+    for ptr in (8, 4):
+        size = 152 if ptr == 8 else 112
+        base = 0x7FF000000000 if ptr == 8 else 0x10000000
+        names = ["", "System", "chrome.exe"]
+        # Entries first, then the names they point at, like the real buffer.
+        names_at = size * 3
+        offsets, pos = [], names_at
+        for n in names:
+            offsets.append(pos)
+            pos += len(n.encode("utf-16-le"))
+        entries = [
+            _process_entry(0, 0, 8, 0, 0, 999999, 8192, names[0], base, offsets[0], size, ptr),
+            _process_entry(4, 0, 200, 133000000000000000, 5, 10, 4096, names[1], base, offsets[1], size, ptr),
+            _process_entry(1234, 4, 31, 133000000000000000 + 10000000, 100, 50, 123456, names[2], base, offsets[2], 0, ptr),
+        ]
+        raw = b"".join(e[0] for e in entries) + b"".join(e[1] for e in entries)
+        procs = _win_parse_processes(raw, base, ptr)
+        assert sorted(procs) == [4, 1234]  # the idle process is left out
+        assert procs[4]["name"] == "System" and procs[4]["threads"] == 200 and procs[4]["ticks"] == 15
+        chrome = procs[1234]
+        assert chrome["name"] == "chrome.exe" and chrome["ppid"] == 4 and chrome["rss"] == 123456
+        assert chrome["ticks"] == 150 and chrome["starttime"] == 133000000000000000 + 10000000
+        assert chrome["started"] == int((133000000000000000 + 10000000 - 116444736000000000) / 10000000)
+
+
+def test_gpu_aggregate():
+    from agent_collector import _gpu_aggregate
+
+    luid_a, luid_b = "0x00000000_0x0000f3a5", "0x00000000_0x00010a2b"
+    adapters = [{"luid": luid_a, "name": "NVIDIA GeForce RTX 4070", "mem_total": 12 * 1024 ** 3},
+                {"luid": luid_b, "name": "Intel(R) UHD Graphics", "mem_total": 0}]
+    engines = [
+        # Two processes on the same 3D engine add up; another engine type is separate.
+        ("pid_10_luid_0x00000000_0x0000F3A5_phys_0_eng_0_engtype_3D", 30.0),
+        ("pid_11_luid_0x00000000_0x0000F3A5_phys_0_eng_0_engtype_3D", 25.0),
+        ("pid_11_luid_0x00000000_0x0000F3A5_phys_0_eng_3_engtype_VideoEncode", 40.0),
+        ("pid_12_luid_0x00000000_0x00010A2B_phys_0_eng_0_engtype_3D", 0.2),
+        ("junk", 99.0),
+    ]
+    dedicated = [("luid_0x00000000_0x0000F3A5_phys_0", 2.0 * 1024 ** 3)]
+    shared = [("luid_0x00000000_0x0000F3A5_phys_0", 100.0), ("luid_0x00000000_0x00010A2B_phys_0", 500.0)]
+    out = _gpu_aggregate(engines, dedicated, shared, adapters)
+    assert out[0] == {"name": "NVIDIA GeForce RTX 4070", "util": 55.0, "engine": "3D", "mem_used": 2.0 * 1024 ** 3,
+                      "mem_total": 12 * 1024 ** 3, "shared_used": 100.0}
+    assert out[1]["util"] == 0.2 and out[1]["engine"] == "" and out[1]["mem_total"] is None and out[1]["shared_used"] == 500.0
+    # Utilisation is capped, and without DXGI the GPUs are named from the counters.
+    capped = _gpu_aggregate([("pid_1_luid_0x0_0x1_phys_0_eng_0_engtype_3D", 80.0),
+                             ("pid_2_luid_0x0_0x1_phys_0_eng_0_engtype_3D", 80.0)], [], [], [])
+    assert capped == [{"name": "GPU 0", "util": 100.0, "engine": "3D", "mem_used": 0.0, "mem_total": None, "shared_used": None}]
+    assert _gpu_aggregate([], [], [], []) == []
+
+
+def test_gpu_toggle_and_settings(client):
+    ctl = {"present": True, "available": True, "enabled": False}
+    gpu = {"adapters": [{"name": "RTX", "util": 150, "engine": "3D", "mem_used": 5, "mem_total": 10, "shared_used": None}]}
+    ingest(client, TOKEN_A, sample(platform="windows", gpu_ctl=ctl, gpu=gpu, docker_ctl=None))
+    h = client.get("/api/hosts/alpha", headers=USER).json()
+    assert h["gpu_ctl"] == ctl and h["gpu_pref"] is None and h["docker_ctl"] is None
+    assert h["gpu"]["adapters"][0]["util"] == 100.0  # clamped
+    assert "settings" not in ingest(client, TOKEN_A, sample()).json()
+
+    assert client.post("/api/hosts/alpha/gpu", json={"enabled": True}, headers=USER).status_code == 403
+    assert client.post("/api/hosts/alpha/gpu", json={"enabled": "yes"}, headers=ACTION).status_code == 400
+    assert client.post("/api/hosts/alpha/gpu", json={"enabled": True}, headers=ACTION).status_code == 200
+    assert ingest(client, TOKEN_A, sample()).json()["settings"] == {"gpu": True}
+    # Docker and GPU choices are kept apart, and both reach the agent.
+    assert client.post("/api/hosts/alpha/docker", json={"enabled": False}, headers=ACTION).status_code == 200
+    assert ingest(client, TOKEN_A, sample()).json()["settings"] == {"docker": False, "gpu": True}
+    h = client.get("/api/hosts/alpha", headers=USER).json()
+    assert h["gpu_pref"] is True and h["docker_pref"] is False
+
+    ingest(client, TOKEN_B, sample(gpu={"error": "no counters"}, gpu_ctl="nonsense"))
+    h = client.get("/api/hosts/beta", headers=USER).json()
+    assert h["gpu"] == {"error": "no counters"} and h["gpu_ctl"] is None
+
+
+def test_host_prefs_table_gains_gpu_column(tmp_path):
+    import sqlite3
+    from app.store import Store
+
+    db = tmp_path / "old.db"
+    old = sqlite3.connect(db)
+    old.executescript("CREATE TABLE host_prefs (name TEXT PRIMARY KEY, docker INTEGER);"
+                      "INSERT INTO host_prefs VALUES ('alpha', 1);")
+    old.commit()
+    old.close()
+    store = Store(db)
+    assert store.docker_pref("alpha") is True and store.gpu_pref("alpha") is None
+    store.set_gpu_pref("alpha", True)
+    store.set_docker_pref("alpha", False)  # must not wipe the GPU choice
+    assert store.gpu_pref("alpha") is True and store.docker_pref("alpha") is False
+
+
+# -- Temperatures -----------------------------------------------------------------------
+
+def _sysfs(root, files):
+    for rel, text in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+
+
+def test_hwmon_temps(tmp_path):
+    from agent_collector import _hwmon_temps
+
+    _sysfs(tmp_path, {
+        "hwmon0/name": "coretemp\n",
+        "hwmon0/temp1_input": "42000\n", "hwmon0/temp1_label": "Package id 0\n",
+        "hwmon0/temp1_max": "100000\n", "hwmon0/temp1_crit": "100000\n",
+        "hwmon0/temp2_input": "40000\n", "hwmon0/temp2_label": "Core 0\n",
+        "hwmon0/temp3_input": "45500\n", "hwmon0/temp3_label": "Core 1\n",
+        "hwmon1/name": "nvme\n", "hwmon1/device/model": "Samsung SSD 970   EVO\n",
+        "hwmon1/temp1_input": "38000\n", "hwmon1/temp1_label": "Composite\n", "hwmon1/temp1_crit": "85000\n",
+        "hwmon1/temp2_input": "41000\n", "hwmon1/temp2_label": "Sensor 1\n",
+        "hwmon2/name": "thinkpad\n",
+        "hwmon2/temp1_input": "40000\n", "hwmon2/temp2_input": "0\n",  # nothing attached: left out
+        "hwmon3/name": "acpitz_0\n", "hwmon3/temp1_input": "30000\n",
+        "hwmon4/name": "BAT0\n",  # no temperature at all
+        "hwmon5/name": "amdgpu\n", "hwmon5/temp1_input": "61000\n", "hwmon5/temp1_label": "edge\n",
+        "hwmon6/name": "broken\n", "hwmon6/temp1_input": "n/a\n", "hwmon6/temp2_input": "200000\n",
+        "hwmon10/name": "iwlwifi_1_3\n", "hwmon10/temp1_input": "33000\n",
+    })
+    by = {(t["chip"], t["name"]): t for t in _hwmon_temps(str(tmp_path))}
+    assert by[("coretemp", "Package id 0")] == {"chip": "coretemp", "kind": "cpu", "temp": 42.0, "high": 100.0,
+                                                "crit": 100.0, "name": "Package id 0"}
+    assert by[("coretemp", "Cores (hottest of 2)")]["temp"] == 45.5  # cores folded into one row
+    assert not any("Core 0" in t["name"] for t in by.values())
+    assert by[("nvme", "Samsung SSD 970 EVO")]["kind"] == "disk" and by[("nvme", "Samsung SSD 970 EVO")]["crit"] == 85.0
+    assert by[("nvme", "Samsung SSD 970 EVO \u00b7 Sensor 1")]["temp"] == 41.0
+    assert by[("thinkpad", "thinkpad temp1")]["temp"] == 40.0 and ("thinkpad", "thinkpad temp2") not in by
+    assert by[("acpitz_0", "acpitz_0")]["kind"] == "board"
+    assert by[("amdgpu", "edge")]["kind"] == "gpu"
+    assert by[("iwlwifi_1_3", "iwlwifi_1_3")]["kind"] == "other"
+    assert not any(t["chip"] in ("BAT0", "broken") for t in by.values())  # no sensor, unreadable, absurd
+    assert _hwmon_temps(str(tmp_path / "missing")) == []
+
+
+def test_thermal_zone_fallback(tmp_path):
+    from agent_collector import _thermal_zone_temps
+
+    _sysfs(tmp_path, {"thermal_zone0/type": "cpu-thermal\n", "thermal_zone0/temp": "55123\n",
+                      "thermal_zone1/type": "gpu-thermal\n", "thermal_zone1/temp": "-274000\n",
+                      "cooling_device0/type": "Processor\n"})
+    zones = _thermal_zone_temps(str(tmp_path))
+    assert zones == [{"name": "cpu-thermal", "chip": "thermal", "kind": "cpu", "temp": 55.1, "high": None, "crit": None}]
+
+
+def test_windows_temperature_helpers():
+    from agent_collector import _gpu_attach_temps, _win_zone_sensors
+
+    zones = _win_zone_sensors([("\\_TZ.TZ00", 3231.5), ("\\_TZ.THRM", 0.0), ("TZ01", 9999.0)])
+    assert zones == [{"name": "ACPI thermal zone TZ00", "chip": "acpi", "kind": "board", "temp": 50.0,
+                      "high": None, "crit": None}]  # a zone at 0 K or absurdly hot isn't a reading
+
+    gpus = [{"name": "Intel(R) UHD Graphics"}, {"name": "NVIDIA GeForce RTX 4070"}, {"name": "NVIDIA GeForce RTX 4070"}]
+    _gpu_attach_temps(gpus, [("NVIDIA GeForce RTX 4070", 61.0), ("nvidia geforce rtx 4070", 70.0)])
+    assert [g["temp"] for g in gpus] == [None, 61.0, 70.0]
+    odd = [{"name": "NVIDIA RTX A2000 Laptop GPU"}]  # DXGI and NVML don't always spell the name the same
+    _gpu_attach_temps(odd, [("NVIDIA RTX A2000 Laptop GPU 4GB", 55.0)])
+    assert odd[0]["temp"] == 55.0
+
+
+def test_temperatures_in_sample(client):
+    temps = [
+        {"name": "Package id 0", "chip": "coretemp", "kind": "cpu", "temp": 61.5, "high": 100, "crit": 100},
+        {"name": "Samsung SSD", "chip": "nvme", "kind": "disk", "temp": 44},
+        {"name": "Strange", "chip": "x", "kind": "nonsense", "temp": 30},
+        {"name": "On fire", "kind": "cpu", "temp": 500},  # not a believable reading
+        "junk", {"name": "no reading"},
+    ]
+    ingest(client, TOKEN_A, sample(temps=temps))
+    h = client.get("/api/hosts/alpha", headers=USER).json()
+    assert [t["name"] for t in h["temps"]] == ["Package id 0", "Samsung SSD", "Strange"]
+    assert h["temps"][0] == {"name": "Package id 0", "chip": "coretemp", "kind": "cpu", "temp": 61.5,
+                             "high": 100.0, "crit": 100.0}
+    assert h["temps"][1]["high"] is None and h["temps"][2]["kind"] == "other"
+    ingest(client, TOKEN_B, sample(temps="nonsense", gpu={"adapters": [{"name": "RTX", "temp": 999}]}))
+    h = client.get("/api/hosts/beta", headers=USER).json()
+    assert h["temps"] == [] and h["gpu"]["adapters"][0]["temp"] is None
+
+
+def test_temperature_history(tmp_path):
+    import sqlite3
+    from app.store import Store, hottest_temp, metrics_from_sample
+
+    cpu, disk = {"kind": "cpu", "temp": 60.0}, {"kind": "disk", "temp": 70.0}
+    assert hottest_temp({"temps": [disk, cpu]}) == 60.0  # a CPU sensor is the one worth charting
+    assert hottest_temp({"temps": [disk, {"kind": "board", "temp": 50.0}]}) == 70.0
+    assert hottest_temp({"temps": []}) is None and hottest_temp({}) is None
+    assert metrics_from_sample({"temps": [cpu]})["temp"] == 60.0
+
+    # A database from before temperatures: the history tables and both roll-ups gain the column.
+    db = tmp_path / "old.db"
+    old = sqlite3.connect(db)
+    for table in ("history", "history_5m", "history_1h"):
+        old.execute(f"CREATE TABLE {table} (host TEXT NOT NULL, ts REAL NOT NULL, cpu REAL)")
+    old.commit()
+    old.close()
+    store = Store(db)
+    for table in ("history", "history_5m", "history_1h"):
+        assert "temp" in {r[1] for r in store._db.execute(f"PRAGMA table_info({table})")}
+    store.record("alpha", {"temps": [cpu]}, now=1000.0)
+    assert store._db.execute("SELECT temp FROM history").fetchone() == (60.0,)

@@ -122,6 +122,10 @@
           <figcaption>Tasks</figcaption>
           <div class="chart" id="chart-tasks"></div>
         </figure>
+        <figure class="card chart-card" id="chart-temp-card" hidden>
+          <figcaption>Temperature</figcaption>
+          <div class="chart" id="chart-temp"></div>
+        </figure>
       </div>
 
       <div class="card moment-card" id="moment-card" hidden>
@@ -157,6 +161,34 @@
         <div class="table-wrap">
           <table class="table" id="diskio-table">
             <thead><tr><th>Device</th><th class="num">Read</th><th class="num">Write</th><th class="meter-col">Busy</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card" id="temp-card" hidden>
+        <div class="proc-head">
+          <h2>Temperatures <span id="temp-count" class="muted"></span></h2>
+        </div>
+        <div class="table-wrap">
+          <table class="table" id="temp-table">
+            <thead><tr><th>Sensor</th><th>Source</th><th class="num">Temperature</th><th class="num">High / critical</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card" id="gpu-card" hidden>
+        <div class="proc-head">
+          <h2>GPU <span id="gpu-count" class="muted"></span></h2>
+          <span class="spacer"></span>
+          <button id="gpu-toggle" class="btn" type="button" hidden></button>
+        </div>
+        <p id="gpu-state" class="docker-state" hidden></p>
+        <div id="gpu-error" class="banner" hidden></div>
+        <div class="table-wrap" id="gpu-body">
+          <table class="table" id="gpu-table">
+            <thead><tr><th>GPU</th><th class="meter-col">Busy</th><th class="meter-col">Memory</th><th class="num">Temp</th><th class="num">Shared memory</th></tr></thead>
             <tbody></tbody>
           </table>
         </div>
@@ -232,12 +264,14 @@
     </div>
 
     <div data-panel="agent">
-      <p>The agent is a single Python file with no dependencies. It pushes stats to this server over HTTPS, so hosts need no inbound ports. Works with systemd and OpenRC.</p>
+      <p>The agent is a single Python file with no dependencies. It pushes stats to this server over HTTPS, so hosts need no inbound ports. Works with systemd, OpenRC and Windows.</p>
       <div id="join-flow">
         <label class="field">Name on the dashboard <span class="muted">(optional, defaults to the host's hostname)</span>
           <input id="agent-name" class="input" placeholder="hostname" spellcheck="false"></label>
         <p>Run this on the host. It joins with this server's join key and shows up here within seconds, with no config changes or restarts:</p>
         <pre id="agent-install" class="code"></pre>
+        <p><strong>On Windows</strong>, run this in PowerShell instead. No administrator rights needed, but it needs Python 3.6+ (<code>winget install Python.Python.3.12</code>):</p>
+        <pre id="agent-install-win" class="code"></pre>
         <p class="muted">Anyone with the join key can add a host, so treat it like a password.
           <button id="rotate-join" class="link" type="button">Make a new join key</button>
           (hosts that already joined keep working).</p>
@@ -249,6 +283,8 @@
         <pre id="agent-config" class="code"></pre>
         <p><strong>2.</strong> Run this on the host:</p>
         <pre id="agent-install-token" class="code"></pre>
+        <p>On Windows, run this in PowerShell instead (no administrator rights needed):</p>
+        <pre id="agent-install-win-token" class="code"></pre>
       </div>
     </div>
 
@@ -263,7 +299,8 @@
       <p class="muted">The host key is trusted on first connect and pinned afterwards. Hosts whose key isn't locked to the collector are refused.</p>
     </div>
 
-    <label class="check dialog-docker"><input id="add-docker" type="checkbox"> Also show Docker containers and compose stacks</label>
+    <label class="check dialog-docker"><input id="add-docker" type="checkbox"> Also show Docker containers and compose stacks <span class="muted">(Linux)</span></label>
+    <label class="check dialog-docker"><input id="add-gpu" type="checkbox"> Also show GPU usage <span class="muted">(Windows; can be turned on or off later from the host's page)</span></label>
     <p id="docker-warning" class="muted" hidden>This lets the collector read the Docker socket (docker group), which is root-equivalent on that host. It only makes fixed, read-only requests.</p>
   </dialog>
 

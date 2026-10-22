@@ -20,9 +20,10 @@ from .schema import normalize
 from .ssh_poller import AGENT_SCRIPT, SSHPoller, load_or_create_key
 from .store import Store
 
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 STATIC = Path(__file__).parent / "static"
 INSTALL_SH = AGENT_SCRIPT.parent / "install.sh"
+INSTALL_PS1 = AGENT_SCRIPT.parent / "install.ps1"
 MAX_INGEST_BYTES = 4 * 1024 * 1024
 
 # The agent this server hands out: agents update to it when you ask them to.
@@ -84,6 +85,7 @@ PUBLIC_PATHS = frozenset({
     "/api/enroll",
     "/api/agent/serverstats_agent.py",
     "/api/agent/install.sh",
+    "/api/agent/install.ps1",
     "/healthz",
 })
 
@@ -198,6 +200,7 @@ def _summary(request: Request, host: cfg.Host, with_processes: bool = False) -> 
         server_time=now,
         update_pending=host.name in request.app.state.update_pending,
         docker_pref=request.app.state.store.docker_pref(host.name),
+        gpu_pref=request.app.state.store.gpu_pref(host.name),
         update_available=host.mode == "agent" and bool(data)
         and _version_tuple(data.get("agent_version")) < _version_tuple(AGENT_VERSION),
     )
@@ -330,6 +333,23 @@ async def set_docker(request: Request, name: str):
     if not isinstance(enabled, bool):
         raise HTTPException(400, 'expected {"enabled": true|false}')
     request.app.state.store.set_docker_pref(host.name, enabled)
+    return {"ok": True, "enabled": enabled}
+
+
+@app.post("/api/hosts/{name}/gpu")
+async def set_gpu(request: Request, name: str):
+    """Turn GPU stats on or off for a Windows agent host; applied on its next report."""
+    _require_action_header(request)
+    host = _host_or_404(request, name)
+    if host.mode != "agent":
+        raise HTTPException(409, "GPU stats come from the Windows push agent")
+    try:
+        enabled = (await request.json())["enabled"]
+    except (ValueError, KeyError, TypeError):
+        raise HTTPException(400, 'expected {"enabled": true|false}')
+    if not isinstance(enabled, bool):
+        raise HTTPException(400, 'expected {"enabled": true|false}')
+    request.app.state.store.set_gpu_pref(host.name, enabled)
     return {"ok": True, "enabled": enabled}
 
 
@@ -469,9 +489,13 @@ async def ingest(request: Request):
     sample = normalize(data, request.app.state.conf.settings.max_procs)
     request.app.state.store.record(host.name, sample)
     reply = {"ok": True, "host": host.name}
-    docker_pref = request.app.state.store.docker_pref(host.name)
-    if docker_pref is not None:
-        reply["settings"] = {"docker": docker_pref}
+    settings = {}
+    for key, pref in (("docker", request.app.state.store.docker_pref(host.name)),
+                      ("gpu", request.app.state.store.gpu_pref(host.name))):
+        if pref is not None:
+            settings[key] = pref
+    if settings:
+        reply["settings"] = settings
     pending = request.app.state.update_pending
     if host.name in pending:
         done = _version_tuple(sample["agent_version"]) >= _version_tuple(AGENT_VERSION)
@@ -492,6 +516,11 @@ async def agent_script():
 @app.get("/api/agent/install.sh")
 async def agent_installer():
     return FileResponse(INSTALL_SH, media_type="text/x-shellscript", filename="install.sh")
+
+
+@app.get("/api/agent/install.ps1")
+async def agent_installer_windows():
+    return FileResponse(INSTALL_PS1, media_type="text/plain; charset=utf-8", filename="install.ps1")
 
 
 @app.get("/healthz")

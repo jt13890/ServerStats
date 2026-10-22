@@ -31,7 +31,7 @@ DAY = 86400
 # Host-level metrics tracked over time (all nullable REAL columns).
 METRICS = (
     "cpu", "mem", "swap", "load1", "load5", "load15", "rx", "tx",
-    "disk_util", "disk_read", "disk_write", "storage", "procs", "threads",
+    "disk_util", "disk_read", "disk_write", "storage", "procs", "threads", "temp",
 )
 # Percentages are clamped when averaged, so bad values that older agents
 # stored can't blow up the charts.
@@ -75,6 +75,13 @@ def _num(v):
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
+def hottest_temp(data: dict) -> float | None:
+    """The temperature worth charting for a host: its hottest CPU sensor, else the hottest of any."""
+    temps = [t for t in data.get("temps") or [] if isinstance(t, dict) and _num(t.get("temp")) is not None]
+    cpu = [t for t in temps if t.get("kind") == "cpu"]
+    return max((t["temp"] for t in cpu or temps), default=None)
+
+
 def metrics_from_sample(data: dict) -> dict:
     """Pick the host-level numbers we keep history for out of a sample."""
     cpu, mem, net, dio, tasks = (data.get(k) or {} for k in ("cpu", "memory", "net", "disk_io", "tasks"))
@@ -92,6 +99,7 @@ def metrics_from_sample(data: dict) -> dict:
         "disk_read": _num(dio.get("read_rate")), "disk_write": _num(dio.get("write_rate")),
         "storage": max((p for p in disks if _num(p) is not None), default=None),
         "procs": _num(tasks.get("total")), "threads": _num(tasks.get("threads")),
+        "temp": hottest_temp(data),
     }
 
 
@@ -192,7 +200,7 @@ class Store:
                 host TEXT PRIMARY KEY, received_at REAL NOT NULL, data TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS host_prefs (name TEXT PRIMARY KEY, docker INTEGER);
+            CREATE TABLE IF NOT EXISTS host_prefs (name TEXT PRIMARY KEY, docker INTEGER, gpu INTEGER);
             CREATE TABLE IF NOT EXISTS load_snapshots (
                 host TEXT NOT NULL, slot INTEGER NOT NULL, ts REAL NOT NULL,
                 load REAL NOT NULL, data BLOB NOT NULL,
@@ -205,10 +213,13 @@ class Store:
             """
         )
         # Databases from earlier versions lack some metric columns.
-        existing = {row[1] for row in self._db.execute("PRAGMA table_info(history)")}
-        for m in METRICS:
-            if m not in existing:
-                self._db.execute(f"ALTER TABLE history ADD COLUMN {m} REAL")
+        for table in ("history", "history_5m", "history_1h"):  # the roll-ups carry the same columns
+            existing = {row[1] for row in self._db.execute(f"PRAGMA table_info({table})")}
+            for m in METRICS:
+                if m not in existing:
+                    self._db.execute(f"ALTER TABLE {table} ADD COLUMN {m} REAL")
+        if "gpu" not in {row[1] for row in self._db.execute("PRAGMA table_info(host_prefs)")}:
+            self._db.execute("ALTER TABLE host_prefs ADD COLUMN gpu INTEGER")
         self._db.commit()
 
         self.states: dict[str, HostState] = {}
@@ -296,7 +307,19 @@ class Store:
 
     def set_docker_pref(self, name: str, enabled: bool) -> None:
         with self._lock, self._db:
-            self._db.execute("INSERT OR REPLACE INTO host_prefs (name, docker) VALUES (?, ?)", (name, int(enabled)))
+            self._db.execute("INSERT INTO host_prefs (name, docker) VALUES (?, ?) "
+                             "ON CONFLICT(name) DO UPDATE SET docker = excluded.docker", (name, int(enabled)))
+
+    def gpu_pref(self, name: str) -> bool | None:
+        """GPU stats on/off chosen in the dashboard; None = the agent's install-time default."""
+        with self._lock:
+            row = self._db.execute("SELECT gpu FROM host_prefs WHERE name = ?", (name,)).fetchone()
+        return None if row is None or row[0] is None else bool(row[0])
+
+    def set_gpu_pref(self, name: str, enabled: bool) -> None:
+        with self._lock, self._db:
+            self._db.execute("INSERT INTO host_prefs (name, gpu) VALUES (?, ?) "
+                             "ON CONFLICT(name) DO UPDATE SET gpu = excluded.gpu", (name, int(enabled)))
 
     def remove_host(self, name: str) -> None:
         """Forget an enrolled host and all of its data."""
