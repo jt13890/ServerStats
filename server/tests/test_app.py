@@ -1341,3 +1341,339 @@ def test_temperature_history(tmp_path):
         assert "temp" in {r[1] for r in store._db.execute(f"PRAGMA table_info({table})")}
     store.record("alpha", {"temps": [cpu]}, now=1000.0)
     assert store._db.execute("SELECT temp FROM history").fetchone() == (60.0,)
+
+
+# -- agents keep their reports while the server is away ------------------------------
+
+def _backfill(client, token, items, sent_at=None):
+    import time
+    return ingest(client, token, {"backfill": items, "sent_at": time.time() if sent_at is None else sent_at})
+
+
+def _slim_reports(n, end, step=10.0):
+    """n slim reports ending at `end`, `step` seconds apart, as an agent would have kept them."""
+    from agent_collector import _slim
+    base = sample(temps=[{"name": "Package", "chip": "coretemp", "kind": "cpu", "temp": 55.0}])
+    out = []
+    for i in range(n):
+        s = _slim(dict(base, collected_at=end - (n - 1 - i) * step, interval=step))
+        s["cpu"] = {"count": 4, "percent": float(i)}
+        out.append(s)
+    return out
+
+
+def _history_rows(client, host="alpha"):
+    store = client.app.state.store
+    return store._db.execute("SELECT ts, cpu FROM history WHERE host = ? ORDER BY ts", (host,)).fetchall()
+
+
+def test_ingest_tells_agents_they_may_buffer(client):
+    from app.main import MAX_BACKFILL
+    reply = ingest(client, TOKEN_A, sample()).json()
+    assert reply["backfill"] == MAX_BACKFILL == 500
+
+
+def test_backfill_fills_a_gap_without_touching_the_live_sample(client):
+    import time
+    ingest(client, TOKEN_A, sample())
+    store = client.app.state.store
+    before = (store.state("alpha").received_at, store.state("alpha").data)
+    snaps = store._db.execute("SELECT COUNT(*) FROM load_snapshots").fetchone()[0]
+    reports = _slim_reports(6, time.time() - 600)
+    r = _backfill(client, TOKEN_A, reports)
+    assert r.status_code == 200 and r.json() == {"ok": True, "host": "alpha", "stored": 6, "skipped": 0}
+    rows = _history_rows(client)
+    assert len(rows) == 7 and [c for _, c in rows[:6]] == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    assert (store.state("alpha").received_at, store.state("alpha").data) == before  # still the live one
+    assert store._db.execute("SELECT COUNT(*) FROM load_snapshots").fetchone()[0] == snaps  # no process list, no snapshots
+    # a host that only ever sent buffered reports does not look online
+    _backfill(client, TOKEN_B, _slim_reports(3, time.time() - 300))
+    assert store.state("beta").data is None
+    assert client.get("/api/hosts/beta", headers=USER).json()["status"] != "online"
+
+
+def test_backfill_is_repeat_safe_and_picky(client):
+    import time
+    now = time.time()
+    good = _slim_reports(4, now - 200)
+    assert _backfill(client, TOKEN_A, good).json()["stored"] == 4
+    again = _backfill(client, TOKEN_A, good).json()
+    assert (again["stored"], again["skipped"]) == (0, 4)  # nothing doubled
+    no_time = dict(good[0], collected_at=None)
+    future = dict(good[0], collected_at=now + 3600)
+    old = dict(good[0], collected_at=now - 4 * 86400)
+    r = _backfill(client, TOKEN_A, [no_time, future, old, "junk", 5, None]).json()
+    assert (r["stored"], r["skipped"]) == (0, 6)
+    assert len(_history_rows(client)) == 4
+    assert _backfill(client, TOKEN_A, "nope").status_code == 400
+    assert _backfill(client, TOKEN_A, [{}] * 501).status_code == 400
+    assert _backfill(client, "x" * 40, good).status_code == 401
+
+
+def test_backfill_corrects_a_skewed_agent_clock(client):
+    import time
+    now = time.time()
+    # the agent's clock runs 1000 s behind: its "now" is our now - 1000
+    skewed_now = now - 1000
+    r = _backfill(client, TOKEN_A, _slim_reports(1, skewed_now - 60), sent_at=skewed_now)
+    assert r.json()["stored"] == 1
+    ts = _history_rows(client)[0][0]
+    assert abs(ts - (now - 60)) < 5  # shifted onto the server's clock
+    # a clock difference of more than a day is not trusted: timestamps stay as sent
+    r = _backfill(client, TOKEN_B, _slim_reports(1, now - 60), sent_at=now + 3 * 86400)
+    assert r.json()["stored"] == 1
+    assert abs(_history_rows(client, "beta")[0][0] - (now - 60)) < 5
+
+
+def test_backfill_storage_history_is_spaced(client):
+    import time
+    store = client.app.state.store
+    _backfill(client, TOKEN_A, _slim_reports(5, time.time() - 100))  # 40 s of reports
+    assert store._db.execute("SELECT COUNT(DISTINCT ts) FROM storage_history WHERE host = 'alpha'").fetchone()[0] == 1
+    assert store._db.execute("SELECT COUNT(*) FROM history WHERE host = 'alpha'").fetchone()[0] == 5
+    assert store.state("alpha").data is None
+
+
+def test_slim_sample_gives_the_same_history_metrics():
+    from agent_collector import _slim
+    from app.store import metrics_from_sample
+    temps = [{"name": "nvme", "kind": "disk", "temp": 70.0}, {"name": "core0", "kind": "cpu", "temp": 55.0},
+             {"name": "core1", "kind": "cpu", "temp": 61.0}]
+    full = sample(temps=temps, processes=[{"pid": 1}], docker={"containers": []}, gpu={"adapters": []})
+    slim = _slim(full)
+    assert metrics_from_sample(slim) == metrics_from_sample(full)
+    assert slim["temps"] == [temps[2]] and "processes" not in slim and "docker" not in slim and "gpu" not in slim
+    assert len(json.dumps(slim)) < len(json.dumps(full))
+    assert _slim({})["temps"] == [] and metrics_from_sample(_slim({}))["cpu"] is None
+
+
+def test_backlog_queue(tmp_path):
+    import os
+    import stat
+    from agent_collector import _Backlog
+    path = tmp_path / "backlog.jsonl"
+    b = _Backlog(3, str(path))
+    for i in range(5):
+        b.add({"n": i})
+    assert [x["n"] for x in b.items] == [2, 3, 4] and len(b) == 3  # the oldest are dropped
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert [x["n"] for x in _Backlog(3, str(path)).items] == [2, 3, 4]  # survives a restart
+    assert [x["n"] for x in _Backlog(2, str(path)).items] == [3, 4]  # a smaller limit trims
+    assert len(path.read_text().splitlines()) == 2
+    b.drop(2)
+    assert [x["n"] for x in b.items] == [4] and len(path.read_text().splitlines()) == 1
+    assert b.peek(5) == [{"n": 4}]
+    b.clear()
+    assert not path.exists() and len(b) == 0
+    # junk lines are dropped and the file cleaned
+    path.write_text('{"n": 1}\nnot json\n[1, 2]\n{"n": 2}\n')
+    b = _Backlog(10, str(path))
+    assert [x["n"] for x in b.items] == [1, 2]
+    assert path.read_text().splitlines() == ['{"n":1}', '{"n":2}']
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
+def test_backlog_file_stays_bounded(tmp_path):
+    from agent_collector import _Backlog
+    path = tmp_path / "b.jsonl"
+    b = _Backlog(20, str(path))
+    for i in range(500):
+        b.add({"n": i})
+    assert len(b) == 20 and len(path.read_text().splitlines()) <= 20 + 10
+    assert [x["n"] for x in _Backlog(20, str(path)).items] == list(range(480, 500))
+
+
+def test_backlog_without_a_usable_file(tmp_path, capsys):
+    from agent_collector import _Backlog
+    b = _Backlog(3, str(tmp_path / "missing-dir" / "b.jsonl"))
+    for i in range(4):
+        b.add({"n": i})
+    assert [x["n"] for x in b.items] == [1, 2, 3] and b.path is None  # carries on in memory
+    assert "keeping them in memory" in capsys.readouterr().err
+    m = _Backlog(2)
+    m.add({"n": 1})
+    assert len(m) == 1 and not list(tmp_path.iterdir())
+
+
+def test_make_backlog(tmp_path, monkeypatch):
+    from agent_collector import _make_backlog
+    monkeypatch.delenv("STATE_DIRECTORY", raising=False)
+    monkeypatch.delenv("SERVERSTATS_STATE_DIR", raising=False)
+    monkeypatch.delenv("SERVERSTATS_SPOOL_DIR", raising=False)
+    assert _make_backlog(0, 15) is None and _make_backlog(-1, 15) is None
+    b = _make_backlog(24, 15)
+    assert b.limit == 5760 and b.path is None  # memory only without a place to keep it
+    assert _make_backlog(1000, 15).limit == 11520  # capped at 48 hours
+    assert _make_backlog(48, 2).limit == 20000  # and at 20000 reports
+    monkeypatch.setenv("SERVERSTATS_STATE_DIR", str(tmp_path / "state"))
+    assert _make_backlog(1, 15).path == str(tmp_path / "state" / "backlog.jsonl")
+    monkeypatch.setenv("SERVERSTATS_SPOOL_DIR", str(tmp_path / "spool"))  # the spool folder wins
+    assert _make_backlog(1, 15).path == str(tmp_path / "spool" / "backlog.jsonl")
+
+
+def test_retry_delay():
+    from agent_collector import _retry_delay, _transient
+    assert [_retry_delay(f, 15) for f in (1, 2)] == [0.0, 0.0]
+    assert _retry_delay(3, 15) == 30 and _retry_delay(10, 15) == 135 and _retry_delay(1000, 15) == 285
+    assert all(_transient(c) for c in (408, 425, 429, 500, 502, 503, 504))
+    assert not any(_transient(c) for c in (400, 401, 403, 404, 302))
+
+
+class _Stop(Exception):
+    pass
+
+
+def _drive_agent(monkeypatch, tmp_path, srv, plan, cycles, hours=24, interval=10.0, spool="spool"):
+    """Run the REAL run_agent loop against a pretend server on a fake clock.
+
+    srv: {"down": None | "net" | HTTP code, "takes": what the server announces (None = old server),
+          "backfill_status": None | HTTP code}; plan(cycle, srv) may change it between cycles.
+    Returns what the server received and how long the agent waited each time.
+    """
+    import types
+    import urllib.error
+    import agent_collector as mod
+
+    clock = {"mono": 1000.0, "wall": 1_700_000_000.0, "cycle": 0, "n": 0}
+    out = {"live": [], "backfill": [], "chunks": [], "sleeps": [], "collected": 0}
+
+    def fake_collect(sample_s, max_procs, prev):
+        n = clock["n"] = clock["n"] + 1
+        out["collected"] = n
+        return {"collected_at": clock["wall"], "cpu": {"count": 1, "percent": float(n)},
+                "memory": {"percent": 1.0}, "load": [0, 0, 0], "net": {}, "disk_io": {}, "tasks": {},
+                "disks": [], "temps": []}, {}
+
+    def fake_post(opener, url, token, payload, timeout=15):
+        if "backfill" in payload:
+            if srv.get("backfill_status"):
+                raise urllib.error.HTTPError(url, srv["backfill_status"], "no", {}, None)
+            out["chunks"].append(len(payload["backfill"]))
+            out["backfill"] += [int(x["cpu"]["percent"]) for x in payload["backfill"]]
+            return {"ok": True}
+        if srv["down"] == "net":
+            raise urllib.error.URLError("connection refused")
+        if srv["down"]:
+            raise urllib.error.HTTPError(url, srv["down"], "down", {}, None)
+        out["live"].append(int(payload["cpu"]["percent"]))
+        return {"ok": True} if srv["takes"] is None else {"ok": True, "backfill": srv["takes"]}
+
+    def fake_sleep(s):
+        out["sleeps"].append(s)
+        clock["mono"] += s
+        clock["wall"] += s
+        clock["cycle"] += 1
+        if clock["cycle"] >= cycles:
+            raise _Stop()
+        plan(clock["cycle"], srv)
+
+    fake_time = types.SimpleNamespace(monotonic=lambda: clock["mono"], time=lambda: clock["wall"], sleep=fake_sleep)
+    monkeypatch.setattr(mod, "time", fake_time)
+    monkeypatch.setattr(mod, "collect", fake_collect)
+    monkeypatch.setattr(mod, "_post", fake_post)
+    monkeypatch.setattr(mod, "updates_enabled", lambda: False)
+    monkeypatch.setattr(mod, "_mark_update_healthy", lambda: None)
+    for var in ("STATE_DIRECTORY", "SERVERSTATS_STATE_DIR", "SERVERSTATS_SPOOL_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    if spool:
+        (tmp_path / spool).mkdir(exist_ok=True)
+        monkeypatch.setenv("SERVERSTATS_SPOOL_DIR", str(tmp_path / spool))
+    args = types.SimpleNamespace(url="http://server", token="t" * 40, interval=interval, sample=1.0,
+                                 max_procs=10, ca_file=None, buffer_hours=hours)
+    srv_down_plan = plan
+    srv_down_plan(0, srv)
+    with pytest.raises(_Stop):
+        mod.run_agent(args, [])
+    return out
+
+
+def _outage(start, end, how):
+    def plan(cycle, srv):
+        srv["down"] = how if start <= cycle < end else None
+    return plan
+
+
+@pytest.mark.parametrize("how", ["net", 502, 503, 504, 429])
+def test_agent_buffers_while_the_server_is_away(monkeypatch, tmp_path, capsys, how):
+    srv = {"down": None, "takes": 500}
+    out = _drive_agent(monkeypatch, tmp_path, srv, _outage(3, 14, how), cycles=40)
+    # every report measured reached the server exactly once, the gap ones in order
+    assert sorted(out["live"] + out["backfill"]) == list(range(1, out["collected"] + 1))
+    assert out["backfill"] == sorted(out["backfill"]) and out["backfill"]
+    assert not (tmp_path / "spool" / "backlog.jsonl").exists()  # emptied
+    log = capsys.readouterr()
+    assert "buffering up to" in log.out and "no buffering" not in log.out  # the startup line
+    assert "buffering reports until the server is back" in log.out
+    assert "reporting recovered" in log.out and "sent" in log.out and "buffered report(s)" in log.out
+    # it kept measuring every interval while away, and tried the server less and less often
+    assert set(out["sleeps"]) == {10.0}
+
+
+@pytest.mark.parametrize("how", [400, 401, 403, 404, 302])
+def test_agent_does_not_buffer_when_the_server_refuses(monkeypatch, tmp_path, how):
+    srv = {"down": None, "takes": 500}
+    out = _drive_agent(monkeypatch, tmp_path, srv, _outage(2, 9, how), cycles=30)
+    assert out["backfill"] == [] and not (tmp_path / "spool" / "backlog.jsonl").exists()
+    assert max(out["sleeps"]) > 10.0  # the old longer waits, not a measurement every interval
+
+
+def test_agent_sends_buffered_reports_in_chunks(monkeypatch, tmp_path):
+    srv = {"down": None, "takes": 2}
+    out = _drive_agent(monkeypatch, tmp_path, srv, _outage(1, 12, "net"), cycles=40)
+    assert max(out["chunks"]) == 2 and len(out["chunks"]) >= 3
+    assert sorted(out["live"] + out["backfill"]) == list(range(1, out["collected"] + 1))
+
+
+def test_agent_buffer_survives_a_restart(monkeypatch, tmp_path):
+    first = _drive_agent(monkeypatch, tmp_path, {"down": "net", "takes": 500}, lambda c, s: None, cycles=8)
+    assert first["live"] == [] and (tmp_path / "spool" / "backlog.jsonl").exists()
+    kept = len((tmp_path / "spool" / "backlog.jsonl").read_text().splitlines())
+    assert kept == first["collected"] == 8
+    second = _drive_agent(monkeypatch, tmp_path, {"down": None, "takes": 500}, lambda c, s: None, cycles=4)
+    assert len(second["backfill"]) == kept  # the first run's reports (numbered afresh by the fake) all went out
+    assert not (tmp_path / "spool" / "backlog.jsonl").exists()
+
+
+def test_agent_buffer_is_bounded(monkeypatch, tmp_path):
+    # 0.01 hours of 10 s reports = 3 reports
+    srv = {"down": None, "takes": 500}
+    out = _drive_agent(monkeypatch, tmp_path, srv, _outage(1, 20, "net"), cycles=40, hours=0.01)
+    assert len(out["backfill"]) == 3
+    assert out["backfill"][-1] > out["backfill"][0] and out["backfill"] == sorted(out["backfill"])
+
+
+def test_agent_buffering_can_be_turned_off(monkeypatch, tmp_path):
+    out = _drive_agent(monkeypatch, tmp_path, {"down": None, "takes": 500}, _outage(2, 9, "net"), cycles=30, hours=0)
+    assert out["backfill"] == [] and not list((tmp_path / "spool").iterdir())
+    assert max(out["sleeps"]) > 10.0
+
+
+def test_agent_buffers_in_memory_without_a_folder(monkeypatch, tmp_path):
+    out = _drive_agent(monkeypatch, tmp_path, {"down": None, "takes": 500}, _outage(2, 9, "net"), cycles=30, spool=None)
+    assert sorted(out["live"] + out["backfill"]) == list(range(1, out["collected"] + 1))
+    assert not list(tmp_path.iterdir())
+
+
+def test_agent_does_not_buffer_for_an_older_server(monkeypatch, tmp_path):
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    (spool / "backlog.jsonl").write_text('{"collected_at":1,"cpu":{"percent":1}}\n')  # left over from a newer server
+    srv = {"down": None, "takes": None}  # replies without "backfill"
+    out = _drive_agent(monkeypatch, tmp_path, srv, _outage(3, 9, "net"), cycles=30)
+    assert out["backfill"] == [] and not (spool / "backlog.jsonl").exists()
+    assert max(out["sleeps"]) > 10.0
+
+
+def test_agent_backfill_refused_or_not_ready(monkeypatch, tmp_path):
+    def plan(refused):
+        def go(cycle, srv):
+            srv["down"] = "net" if 1 <= cycle < 6 else None
+            srv["backfill_status"] = (refused if cycle < 14 else None)
+        return go
+    # refused (400): that chunk is dropped, the agent carries on reporting
+    out = _drive_agent(monkeypatch, tmp_path, {"down": None, "takes": 500}, plan(400), cycles=20)
+    assert out["backfill"] == [] and len(out["live"]) > 10
+    assert not (tmp_path / "spool" / "backlog.jsonl").exists()
+    # not ready (503): kept, and sent once the server takes it
+    out = _drive_agent(monkeypatch, tmp_path, {"down": None, "takes": 500}, plan(503), cycles=20)
+    assert len(out["backfill"]) >= 4 and sorted(out["live"] + out["backfill"]) == list(range(1, out["collected"] + 1))

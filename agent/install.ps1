@@ -66,6 +66,7 @@ $UserDir  = Join-Path $env:LOCALAPPDATA 'ServerStats'
 $ServiceDir = Join-Path $env:ProgramData 'ServerStats'
 $Dir      = if ($Service) { $ServiceDir } else { $UserDir }
 $LogDir   = Join-Path $Dir 'logs'
+$SpoolDir = Join-Path $Dir 'spool'                                    # reports kept while the server is away
 $AgentPy  = Join-Path $Dir 'serverstats_agent.py'
 $EnvFile  = Join-Path $Dir 'agent.env'
 $LogFile  = Join-Path $LogDir 'agent.log'
@@ -138,7 +139,7 @@ Write-Host "Using Python at $py"
 
 # -- install the agent -------------------------------------------------------------
 Stop-Agent
-New-Item -ItemType Directory -Force -Path $Dir, $LogDir | Out-Null
+New-Item -ItemType Directory -Force -Path $Dir, $LogDir, $SpoolDir | Out-Null
 if ($Service) {
     $runSid  = if ($RunAsSystem) { '*S-1-5-18' } else { '*S-1-5-19' }   # SYSTEM, or LOCAL SERVICE
     $runUser = if ($RunAsSystem) { 'NT AUTHORITY\SYSTEM' } else { 'NT AUTHORITY\LocalService' }
@@ -147,6 +148,7 @@ if ($Service) {
     & icacls.exe $Dir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "${runSid}:(OI)(CI)RX" | Out-Null
     if ($LASTEXITCODE -ne 0) { Die "couldn't set permissions on $Dir" }
     & icacls.exe $LogDir /grant "${runSid}:(OI)(CI)M" | Out-Null
+    & icacls.exe $SpoolDir /grant "${runSid}:(OI)(CI)M" | Out-Null
 }   # otherwise the folder is in your profile: only you, SYSTEM and administrators can read the token
 
 $local = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'serverstats_agent.py' } else { $null }
@@ -197,7 +199,8 @@ $lines = @(
     "SERVERSTATS_TOKEN=$Token",
     "SERVERSTATS_INTERVAL=$Interval",
     "SERVERSTATS_GPU=$([int][bool]$Gpu)",
-    "SERVERSTATS_LOG_FILE=$LogFile"
+    "SERVERSTATS_LOG_FILE=$LogFile",
+    "SERVERSTATS_SPOOL_DIR=$SpoolDir"
 )
 if ($CaFile) { $lines += "SERVERSTATS_CA_FILE=$CaFile" }
 # UTF-8 without a byte order mark, which the agent's parser would read as part of the first key.

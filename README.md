@@ -109,6 +109,18 @@ Hosts report their temperature sensors, and the host page shows them as a **Temp
 - **Windows:** without administrator rights Windows offers two things: the **ACPI thermal zones** (real, CPU-area temperatures on most laptops; fixed or unrelated values on many desktops; nothing on VMs), and the **temperature of NVIDIA GPUs**, read from the driver's `nvml.dll`, which also shows in the GPU card. CPU package and core temperatures, and drive temperatures, need a kernel driver (administrator rights), so they aren't included.
 - **History** for temperature starts from when the server is updated; existing databases gain the column when it starts.
 
+### If the server is offline
+
+When the server can't be reached, agents keep measuring and hold on to their reports, then send them once it's back, so the history charts fill in instead of showing a gap. This needs agent 1.6.0 or newer talking to server 1.11 or newer.
+
+- **What is kept:** only what the history charts use: CPU, memory, load, network, disk I/O and usage, task counts and the hottest temperature. The process list, Docker and GPU data are not kept, so the load peaks and "what was running" views have no detail for the outage, but the charts do.
+- **How long:** 24 hours by default. Change it with `SERVERSTATS_BUFFER_HOURS` or `--buffer-hours` (at most 48; `0` turns it off). When the limit is reached the oldest reports are dropped.
+- **Where:** in `backlog.jsonl` (readable only by the agent's user) in the agent's state directory on systemd and OpenRC hosts, or in the `spool` folder next to the agent on Windows, so a restart or reboot doesn't lose it. If neither is available the reports are kept in memory only and are lost if the agent restarts.
+- **While the server is away:** the agent still measures every interval, but retries the server less often (up to every 5 minutes), as it always has. When a report gets through, the saved ones follow, oldest first, a few hundred per report.
+- **Only for an outage:** an agent buffers only if the server says it understands buffered reports, so an older server gets nothing extra. A refusal such as 401/403 (wrong token) or a redirect to a login page (the auth proxy isn't excluded for `/api/ingest`) is not treated as "offline": nothing is buffered, and the agent logs the problem as before. Timeouts, connection errors and 408, 425, 429 and 5xx answers (including a proxy's 502/503/504 while the server is down) count as offline.
+- **Safe to resend:** the server only fills in history. Buffered reports never make a host look online and never replace its live data, reports that overlap existing history are skipped, and the agent's clock is corrected against the server's. Buffered reports go to the same `/api/ingest` address, so there's no new proxy rule to add.
+- **Updating:** Linux hosts get 1.6.0 with **Update agents** after the server is updated; on Windows, rerun the installer (it also creates the `spool` folder).
+
 ### Updating agents
 
 When the server has a newer agent than a host is running, the host's page shows **Update agent**, and the overview shows **Update agents (N)** for all of them. Updating the server (`git pull` plus `docker compose up -d --build`) is what makes a new agent version available.

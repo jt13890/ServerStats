@@ -20,11 +20,14 @@ from .schema import normalize
 from .ssh_poller import AGENT_SCRIPT, SSHPoller, load_or_create_key
 from .store import Store
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 STATIC = Path(__file__).parent / "static"
 INSTALL_SH = AGENT_SCRIPT.parent / "install.sh"
 INSTALL_PS1 = AGENT_SCRIPT.parent / "install.ps1"
 MAX_INGEST_BYTES = 4 * 1024 * 1024
+# Reports an agent may send in one go after the server was away (also announced to agents).
+MAX_BACKFILL = 500
+MAX_CLOCK_OFFSET = 86400  # ignore a clock difference bigger than this
 
 # The agent this server hands out: agents update to it when you ask them to.
 _agent_code = AGENT_SCRIPT.read_bytes()
@@ -465,6 +468,29 @@ async def remove_host(request: Request, name: str):
     return {"ok": True}
 
 
+def _ingest_backfill(request: Request, host: cfg.Host, data: dict) -> dict:
+    """Reports an agent kept while the server was unreachable: history only."""
+    items = data["backfill"]
+    if not isinstance(items, list) or len(items) > MAX_BACKFILL:
+        raise HTTPException(400, "backfill must be a list of at most %d reports" % MAX_BACKFILL)
+    now = time.time()
+    sent_at = data.get("sent_at")
+    offset = 0.0
+    if isinstance(sent_at, (int, float)) and not isinstance(sent_at, bool) and abs(now - sent_at) < MAX_CLOCK_OFFSET:
+        offset = now - sent_at  # the agent's clock is off by this much: shift its timestamps to ours
+    samples = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        s = normalize(item, 0)
+        if s["collected_at"] is not None:
+            s["collected_at"] += offset
+        samples.append(s)
+    stored, skipped = request.app.state.store.record_backfill(host.name, samples, now)
+    skipped += len(items) - len(samples)
+    return {"ok": True, "host": host.name, "stored": stored, "skipped": skipped}
+
+
 @app.post("/api/ingest")
 async def ingest(request: Request):
     auth = request.headers.get("authorization", "")
@@ -486,9 +512,11 @@ async def ingest(request: Request):
     if not isinstance(data, dict):
         raise HTTPException(400, "unexpected payload")
 
+    if "backfill" in data:
+        return _ingest_backfill(request, host, data)
     sample = normalize(data, request.app.state.conf.settings.max_procs)
     request.app.state.store.record(host.name, sample)
-    reply = {"ok": True, "host": host.name}
+    reply = {"ok": True, "host": host.name, "backfill": MAX_BACKFILL}  # tells agents they may buffer
     settings = {}
     for key, pref in (("docker", request.app.state.store.docker_pref(host.name)),
                       ("gpu", request.app.state.store.gpu_pref(host.name))):

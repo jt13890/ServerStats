@@ -277,6 +277,44 @@ class Store:
         self._db.execute("INSERT OR REPLACE INTO load_snapshots (host, slot, ts, load, data) VALUES (?,?,?,?,?)",
                          (host, slot, now, load, blob))
 
+    def record_backfill(self, host: str, samples: list, now: float | None = None) -> tuple[int, int]:
+        """Keep history an agent saved while the server was away: (stored, skipped).
+
+        History only. It never touches the host's latest sample (buffered data
+        must not make the host look online) and keeps no load snapshots (the
+        agent doesn't send a process list). Re-sending is harmless: samples
+        too close to an existing row are skipped, as are ones from the future
+        or too old to be safely placed before the roll-up.
+        """
+        now = time.time() if now is None else now
+        oldest = now - (RAW_DAYS - 1) * DAY
+        stored = skipped = 0
+        with self._lock, self._db:
+            for data in samples:
+                ts = data.get("collected_at")
+                if ts is None or ts > now or ts < oldest:
+                    skipped += 1
+                    continue
+                gap = max((data.get("interval") or 15.0) / 2, 0.5)
+                if self._db.execute("SELECT 1 FROM history WHERE host = ? AND ts > ? AND ts < ? LIMIT 1",
+                                    (host, ts - gap, ts + gap)).fetchone():
+                    skipped += 1
+                    continue
+                m = metrics_from_sample(data)
+                self._db.execute(
+                    f"INSERT INTO history (host, ts, {', '.join(METRICS)}) VALUES (?, ?, {', '.join('?' * len(METRICS))})",
+                    (host, ts, *(m[k] for k in METRICS)),
+                )
+                if not self._db.execute("SELECT 1 FROM storage_history WHERE host = ? AND ts > ? AND ts < ? LIMIT 1",
+                                        (host, ts - STORAGE_SAMPLE_SECONDS, ts + STORAGE_SAMPLE_SECONDS)).fetchone():
+                    self._db.executemany(
+                        "INSERT INTO storage_history (host, ts, mount, used, total) VALUES (?,?,?,?,?)",
+                        [(host, ts, str(d.get("mount")), float(d.get("used") or 0), float(d.get("total") or 0))
+                         for d in (data.get("disks") or [])[:32] if isinstance(d, dict) and d.get("total")],
+                    )
+                stored += 1
+        return stored, skipped
+
     def record_error(self, host: str, error: str) -> None:
         st = self.state(host)
         st.error, st.error_at = error, time.time()
