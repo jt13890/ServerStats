@@ -101,6 +101,14 @@ What differs from Linux:
 - **Processes** are read the way Task Manager reads them, so a standard user sees CPU and memory for every process. The owner account and the executable's full path (instead of the command line) are only known for processes your account may open, so other users' and protected processes show their name only.
 - **Disks** are the fixed drives (C:, D:, …); network, optical and removable drives are left out. Disk I/O is read from each physical drive, and network totals from the physical adapters.
 
+### Temperatures
+
+Hosts report their temperature sensors, and the host page shows them as a **Temperatures** card, a **Temperature** tile (the hottest CPU sensor, else the hottest sensor), and a history chart of that same number. A reading turns amber within 10 °C of the sensor's own high or critical limit, and red at it (sensors with no limit: 80 °C and 90 °C). Hosts with no sensors (most VMs and containers) simply don't show it.
+
+- **Linux:** read from `/sys/class/hwmon`, the same files `lm-sensors` uses, with no root and nothing to install: CPU (`coretemp`, `k10temp`, ARM SoCs), NVMe drives, AMD/Nouveau GPUs, motherboard and chipset sensors, Wi-Fi. SATA drive temperatures appear if the `drivetemp` kernel module is loaded. A CPU's individual cores are folded into one "hottest core" row, sensors that read 0 (ThinkPads report that for ones with nothing attached) are left out, and boards without hwmon sensors (most single-board computers) fall back to their thermal zones.
+- **Windows:** without administrator rights Windows offers two things: the **ACPI thermal zones** (real, CPU-area temperatures on most laptops; fixed or unrelated values on many desktops; nothing on VMs), and the **temperature of NVIDIA GPUs**, read from the driver's `nvml.dll`, which also shows in the GPU card. CPU package and core temperatures, and drive temperatures, need a kernel driver (administrator rights), so they aren't included.
+- **History** for temperature starts from when the server is updated; existing databases gain the column when it starts.
+
 ### Updating agents
 
 When the server has a newer agent than a host is running, the host's page shows **Update agent**, and the overview shows **Update agents (N)** for all of them. Updating the server (`git pull` plus `docker compose up -d --build`) is what makes a new agent version available.
