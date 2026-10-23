@@ -58,7 +58,10 @@ function fmtBytes(n) {
   while (Math.abs(n) >= 1024 && i < UNITS.length - 1) { n /= 1024; i++; }
   return (i === 0 || n >= 100 ? Math.round(n) : n.toFixed(1)) + ' ' + UNITS[i];
 }
-const fmtTemp = (n) => (n == null || !isFinite(n) ? '—' : `${(+n).toFixed(1)} °C`);
+// Agents report and the server stores °C; the dashboard shows °F.
+const cToF = (c) => c * 9 / 5 + 32;
+const fmtF = (f) => (f == null || !isFinite(f) ? '—' : `${(+f).toFixed(1)} °F`);
+const fmtTemp = (c) => (c == null || !isFinite(c) ? '—' : fmtF(cToF(+c)));  // takes °C
 // The sensor worth a headline: the hottest CPU one, else the hottest of any.
 const hottest = (temps) => {
   const cpu = (temps || []).filter((t) => t.kind === 'cpu');
@@ -428,7 +431,7 @@ function updateCard(card, host, trend = {}) {
         disk ? `Fullest filesystem: ${disk.mount} (${fmtBytes(disk.used)} of ${fmtBytes(disk.total)})` : 'No filesystems',
         trend.storage || [])),
       // Not part of the load: its own row, only for hosts that have sensors. The bar and
-      // sparkline use a fixed 0-100 °C scale, so hosts compare like the percentages do.
+      // sparkline use a fixed 0-100 °C (32-212 °F) scale, so hosts compare like the percentages do.
       ...(hot ? [keyed('temp', meter('Temp', hot.temp,
         `Hottest ${hot.kind === 'cpu' ? 'CPU ' : ''}sensor: ${hot.name}`, trend.temp || [], fmtTemp(hot.temp),
         { fmt: fmtTemp, level: { full: 'critical', warning: 'warning' }[tempLevel(hot)] }))] : []),
@@ -1049,11 +1052,11 @@ function renderDetail(name) {
       ],
     });
 
-    const temp = pick('temp');
+    const temp = pick('temp').map((p) => ({ t: p.t, v: cToF(p.v) }));  // plotted in °F
     $('#chart-temp-card').hidden = !temp.length;
     if (temp.length) {
       lineChart($('#chart-temp'), {
-        ...common, title: 'Temperature', count: true, fmt: fmtTemp,
+        ...common, title: 'Temperature', count: true, fmt: fmtF,
         series: [{ label: 'Hottest sensor', slot: 1, points: temp }],
       });
     }
