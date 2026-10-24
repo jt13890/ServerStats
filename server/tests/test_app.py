@@ -1677,3 +1677,37 @@ def test_agent_backfill_refused_or_not_ready(monkeypatch, tmp_path):
     # not ready (503): kept, and sent once the server takes it
     out = _drive_agent(monkeypatch, tmp_path, {"down": None, "takes": 500}, plan(503), cycles=20)
     assert len(out["backfill"]) >= 4 and sorted(out["live"] + out["backfill"]) == list(range(1, out["collected"] + 1))
+
+
+def test_backfill_shows_in_long_ranges_after_a_rollup(tmp_path):
+    """Buffered history older than the last roll-up must reach the 5-minute and hourly
+    tiers too, or day/week/month charts keep the hole (only short ranges read raw rows)."""
+    import time
+    from app.schema import normalize
+    from app.store import Store
+    store = Store(tmp_path / "db.sqlite")
+    now = time.time()
+    # three days of live history, rolled up as the server does; then the server was away for the
+    # last 6 hours of the first day, and the agent sends what it kept afterwards
+    live = [s for s in range(0, 72 * 3600, 900) if not (24 * 3600 <= s < 30 * 3600)]
+    t0 = now - 72 * 3600
+    for s in live:
+        store.record("alpha", normalize(sample(collected_at=t0 + s, cpu={"count": 4, "percent": 10.0}), 10))
+    store.rollup(now)
+    gap = []
+    for s in range(24 * 3600, 30 * 3600, 900):
+        d = normalize(sample(collected_at=t0 + s, interval=900.0, cpu={"count": 4, "percent": 90.0}), 0)
+        gap.append(d)
+    stored, skipped = store.record_backfill("alpha", gap, now)
+    assert stored == len(gap) and skipped == 0
+
+    def gap_rows(hours):
+        rows = store.history("alpha", hours)["metrics"]
+        return [r for r in rows if r["cpu"] is not None and r["cpu"] > 50], rows
+    for hours in (72, 24 * 7, 24 * 30):  # 5-minute tier and then the hourly tier
+        high, rows = gap_rows(hours)
+        assert high, f"the backfilled gap is missing from the {hours}h chart"
+    # re-sending changes nothing, and it stays consistent with a fresh roll-up
+    assert store.record_backfill("alpha", gap, now) == (0, len(gap))
+    store.rollup(now)
+    assert gap_rows(72)[0]

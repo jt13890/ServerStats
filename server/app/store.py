@@ -289,6 +289,8 @@ class Store:
         now = time.time() if now is None else now
         oldest = now - (RAW_DAYS - 1) * DAY
         stored = skipped = 0
+        done: list[float] = []  # timestamps of the history rows written
+        done_storage: list[float] = []
         with self._lock, self._db:
             for data in samples:
                 ts = data.get("collected_at")
@@ -312,8 +314,42 @@ class Store:
                         [(host, ts, str(d.get("mount")), float(d.get("used") or 0), float(d.get("total") or 0))
                          for d in (data.get("disks") or [])[:32] if isinstance(d, dict) and d.get("total")],
                     )
+                    done_storage.append(ts)
+                done.append(ts)
                 stored += 1
+            self._reroll(host, done, done_storage)
         return stored, skipped
+
+    def _reroll(self, host: str, times: list[float], storage_times: list[float]) -> None:
+        """Redo the roll-ups that already passed over `times`.
+
+        Charts over a day or more read raw rows only for the part not rolled up yet; for older
+        periods they read the 5-minute and hourly averages. A row written behind the roll-up's
+        mark (buffered history) would never reach those tiers, so its periods are averaged
+        again from the finer tier, exactly as rollup() does. Periods the roll-up hasn't reached
+        yet are left for it."""
+        avgs = ", ".join(_avg(m) for m in METRICS)
+        cols = ", ".join(METRICS)
+        m5, h1, s1h = self._mark("m5"), self._mark("h1"), self._mark("s1h")
+        slots = {int(t // 300) * 300 for t in times}
+        for slot in sorted(x for x in slots if x + 300 <= m5):
+            self._db.execute(
+                f"""INSERT OR REPLACE INTO history_5m (host, ts, {cols})
+                    SELECT host, ?, {avgs} FROM history WHERE host = ? AND ts >= ? AND ts < ? GROUP BY host""",
+                (slot, host, slot, slot + 300))
+        for hour in sorted({x // 3600 * 3600 for x in slots if x + 300 <= m5}):
+            if hour + 3600 <= h1:
+                self._db.execute(
+                    f"""INSERT OR REPLACE INTO history_1h (host, ts, {cols})
+                        SELECT host, ?, {avgs} FROM history_5m WHERE host = ? AND ts >= ? AND ts < ? GROUP BY host""",
+                    (hour, host, hour, hour + 3600))
+        for hour in sorted({int(t // 3600) * 3600 for t in storage_times}):
+            if hour + 3600 <= s1h:
+                self._db.execute(
+                    """INSERT OR REPLACE INTO storage_1h (host, ts, mount, used, total)
+                        SELECT host, ?, mount, AVG(used), AVG(total) FROM storage_history
+                        WHERE host = ? AND ts >= ? AND ts < ? GROUP BY host, mount""",
+                    (hour, host, hour, hour + 3600))
 
     def record_error(self, host: str, error: str) -> None:
         st = self.state(host)
