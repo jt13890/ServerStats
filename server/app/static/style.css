@@ -212,7 +212,25 @@ td .meter { grid-template-columns: 1fr 52px; }
 .charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
 @media (max-width: 960px) { .charts { grid-template-columns: minmax(0, 1fr); } }
 .chart-card { margin: 0 0 16px; }
-.chart-card figcaption { font-weight: 600; font-size: 14px; }
+.chart-card figcaption { font-weight: 600; font-size: 14px; display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 26px; }
+.view-seg { flex: none; }
+.view-seg button { padding: 3px 10px; font-size: 12px; font-weight: 500; }
+.view-seg button[aria-checked="true"] { font-weight: 600; }
+
+/* pies: parts of a total are a pie, a percent of a capacity is a ring */
+.chart svg.pie-svg { width: auto; max-width: 100%; margin: 0 auto; overflow: visible; }
+.pie-wrap { display: flex; justify-content: center; padding: 2px 0 4px; }
+.chart .slice { fill: var(--c); stroke: var(--surface); stroke-width: 2; transition: opacity .12s; }
+.chart .slice:hover { opacity: .85; }
+.chart .slice-label { fill: #fff; font-size: 12px; font-weight: 600; pointer-events: none; font-variant-numeric: tabular-nums; }
+.donuts { display: flex; flex-wrap: wrap; gap: 8px 14px; justify-content: center; padding: 12px 0 6px; }
+.donut-cell { display: flex; flex-direction: column; align-items: center; gap: 4px; width: 112px; }
+.chart .ring-track { fill: none; stroke: var(--grid); stroke-width: 12; }
+.chart .ring { fill: none; stroke: var(--c); stroke-width: 12; }
+.chart .ring-value { fill: var(--ink); font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.donut-label { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; font-size: 12.5px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pie-caption { text-align: center; color: var(--muted); font-size: 12px; padding: 2px 8px 4px; }
+.pie-empty { color: var(--muted); font-size: 13px; text-align: center; padding: 70px 0; }
 .chart { position: relative; min-height: 200px; transition: opacity .2s; }
 .chart.loading { opacity: .55; }
 .chart svg { display: block; width: 100%; overflow: visible; }
