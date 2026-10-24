@@ -2,15 +2,17 @@
 
 A small, self-hosted dashboard for the Linux and Windows machines you run. It tracks:
 
-- **CPU**: total utilization, per-core count, load average
+- **CPU**: total utilization, per-core count, load average (Linux; Windows has no load average)
 - **RAM**: used/available memory and swap
 - **Disk utilization**: per-device busy %, read/write throughput
 - **Storage space**: used/free per filesystem, tracked over time so you can see disks filling up
 - **Network** throughput, **load average**, **task counts** and **processes** (sortable/filterable, like `top` for your whole fleet)
-- **Docker** (optional): CPU, memory, disk I/O, network and disk space per compose stack and container
+- **Docker** (optional, Linux): CPU, memory, disk I/O, network and disk space per compose stack and container
+- **Temperatures**: CPU, drive, GPU and board sensors, with a history chart of the hottest CPU sensor. Linux reads them from `hwmon`; Windows, without administrator rights, gets the ACPI thermal zones and NVIDIA GPU temperature. See [Temperatures](#temperatures)
+- **GPU** (optional, Windows): how busy each GPU is and how much of its memory is in use, for NVIDIA, AMD and Intel. Turn it on from the host's page or install with `-Gpu`. See [Windows hosts](#windows-hosts)
 - **Overall load**: two bars per host on the overview, out of 100%. **Load** is the 3-day average. **1% high** is the busiest 1% of the past 7 days (about 1¾ hours), averaged, so it shows what the load looks like when the server is at its peak. Load combines CPU, memory and disk I/O using the "volume" metric from Sandpiper ([Wood et al., NSDI 2007](https://www.usenix.org/legacy/events/nsdi07/tech/full_papers/wood/wood_html/index.html)), expressed as a percentage: 100% × (1 − (1−CPU)(1−memory)(1−disk)). It rises the busier any resource is, and faster when several are busy at once. It reads 100% (**Full**) when one of them is maxed out, and 90% and up is marked **Warning**. Storage has its own meter and doesn't count toward load. The bars are split into colored segments, one per resource, sized by each one's factor in the volume, −ln(1−u). That factor grows sharply as a resource nears full, but a quieter resource still shows, so you can see what's driving the load. Hover them for the breakdown.
 - **Load peaks**: each host's page charts the past week's load every 5 minutes, colored by resource, and lists the busiest times. Pick one, or click anywhere on the chart, to see what was running then: the top processes by CPU and by memory, Docker stacks, and the busiest disks. ServerStats keeps the busiest moment of every 5 minutes for 30 days (about 4 MB per host), then the busiest of every hour.
-- **Any point in time**: click any point on a host's history charts (or use the arrow keys and Enter) to see what was happening then. You get that moment's CPU, memory, swap, disk, network, load average, tasks and storage, its load breakdown, and the top processes, Docker stacks and disks at the busiest recorded moment around it. While a past moment is open, the live parts of the page (tiles, Docker, processes, charts) are paused so nothing shifts under you. **Back to live** resumes them.
+- **Any point in time**: click any point on a host's history charts (or use the arrow keys and Enter) to see what was happening then. You get that moment's CPU, memory, swap, disk, network, load average, tasks, storage and temperature, its load breakdown, and the top processes, Docker stacks and disks at the busiest recorded moment around it. While a past moment is open, the live parts of the page (tiles, Docker, processes, charts) are paused so nothing shifts under you. **Back to live** resumes them.
 - **Zoom**: drag across any history chart to zoom all of them into that span, as many times as you like. **Reset zoom**, or any range button, zooms back out. Older history shows at the finest detail still kept: raw samples for 3 days, then 5-minute and then hourly averages.
 
 History is kept forever, and the charts go from the last hour out to a full year. Full-detail samples are kept for 3 days, 5-minute averages for 90 days, and hourly averages after that, so each year of history is only a few MB per host. To free up space, click **Prune** in the top bar. It deletes history older than 1 month, 3 months, 6 months, 1 year, 2 years or 3 years, for all hosts or just one, and shows how much will go before you confirm. It runs in one Docker container with SQLite, has no build step, and is designed to sit behind **Authentik**.
@@ -21,10 +23,10 @@ Both modes run the same collector (`agent/serverstats_agent.py`). It uses only t
 
 | | **Push agent** (recommended) | **SSH pull** |
 |---|---|---|
-| Install on host | One Python file plus a systemd or OpenRC service (a one-line installer) | One Python file plus a locked-down `authorized_keys` entry (a one-line installer) |
+| Install on host | One Python file plus a systemd or OpenRC service on Linux, or a per-user startup entry (or a boot-time scheduled task) on Windows, with a one-line installer | One Python file plus a locked-down `authorized_keys` entry (a one-line installer) |
 | Network | Host makes outbound HTTPS to ServerStats. Works behind NAT, and the host needs no open ports | ServerStats must reach the host's SSH port |
-| If the ServerStats server is compromised | The attacker can push agent code to hosts that accept [remote updates](#updating-agents) (the default), running as the agent's user. Install with `--no-updates` and the server only receives data | The attacker can make hosts run the collector, and nothing else: the key is locked to it by a forced command |
-| Runs as | Dedicated unprivileged `serverstats-agent` user (in a locked-down sandbox under systemd) | Unprivileged `serverstats` user |
+| If the ServerStats server is compromised | The attacker can push agent code to Linux hosts that accept [remote updates](#updating-agents) (the default), running as the agent's user. Windows agents never accept remote updates. Install with `--no-updates` and the server only receives data | The attacker can make hosts run the collector, and nothing else: the key is locked to it by a forced command |
+| Runs as | Dedicated unprivileged `serverstats-agent` user (in a locked-down sandbox under systemd). On Windows: your own account, with no administrator rights, or `LOCAL SERVICE` | Unprivileged `serverstats` user |
 | Accuracy | CPU and disk rates are averaged over the whole report interval | 1-second sample at each poll |
 
 **Why agents are the default:** a monitoring server that holds SSH keys to every machine is a juicy target, and this one is internet-facing. With the push model, the server never has credentials for your hosts. Each host only has a token that lets it submit its own stats. The one thing a host trusts the server with is remote updates, and you can turn those off per host. SSH mode is handy when a host can't reach the server, or you'd rather not run a service on it.
@@ -54,7 +56,7 @@ The easiest way is the **Add host** button in the UI. It generates a token and g
 
 ### Agent
 
-On the host (needs systemd or OpenRC, `python3`, and `curl` or `wget`), run the command from **Add host** in the UI. It looks like this:
+On a Linux host (needs systemd or OpenRC, `python3`, and `curl` or `wget`), run the command from **Add host** in the UI. It looks like this (for Windows, see [Windows hosts](#windows-hosts)):
 ```sh
 curl -fsSL https://stats.example.com/api/agent/install.sh \
   | sudo sh -s -- --url https://stats.example.com --join <join key> [--name nas]
@@ -123,7 +125,7 @@ When the server can't be reached, agents keep measuring and hold on to their rep
 
 ### Updating agents
 
-When the server has a newer agent than a host is running, the host's page shows **Update agent**, and the overview shows **Update agents (N)** for all of them. Updating the server (`git pull` plus `docker compose up -d --build`) is what makes a new agent version available.
+When the server has a newer agent than a host is running, the host's page shows **Update agent**, and the overview shows **Update agents (N)** for all of them. Updating the server (`git pull` plus `docker compose up -d --build`) is what makes a new agent version available. Windows agents don't take remote updates: rerun the Windows installer, which keeps the host's token.
 
 - **How it works:** after you click, the server answers the host's next report with the new version and its SHA-256 hash. The agent downloads the code from the server, checks the hash, saves it in its own state directory (`/var/lib/serverstats-agent`) and restarts into it. It keeps running as the same unprivileged user.
 - **Safety net:** the installed copy stays untouched. If an update fails to start three times in a row, the agent goes back to the installed version, won't retry that version, and the host page tells you it failed. Rerun the installer to retry.
@@ -131,6 +133,8 @@ When the server has a newer agent than a host is running, the host's page shows 
 - **What you're trusting:** an agent that accepts updates runs whatever code the server gives it, so anyone who takes over the ServerStats server can run code on those hosts. On hosts installed with `--docker` that includes the Docker socket, which is root-equivalent. Install with `--no-updates` on hosts where that's not acceptable; the dashboard then says the host doesn't accept remote updates.
 
 ### SSH
+
+SSH pull is for Linux hosts. Windows hosts use the push agent.
 
 1. On the host, run the installer in SSH mode. **Add host → SSH** in the UI fills in the server's public key for you:
    ```sh
@@ -291,17 +295,18 @@ For Caddy, Nginx Proxy Manager, and others, follow [Authentik's proxy provider d
 ## Security notes
 
 **Where code can come from:**
-- **Remote updates are the one deliberate exception.** An agent that accepts them (the default) runs agent code the server provides when you click Update, so the server is trusted with code on those hosts. Install with `--no-updates` to opt a host out; see [Updating agents](#updating-agents). Update requests need the SSO header and a custom request header, so another site can't trigger one through your browser.
+- **Remote updates are the one deliberate exception.** A Linux agent that accepts them (the default) runs agent code the server provides when you click Update, so the server is trusted with code on those hosts. Windows agents never accept them. Install with `--no-updates` to opt a host out; see [Updating agents](#updating-agents). Update requests need the SSO header and a custom request header, so another site can't trigger one through your browser.
 - Apart from updates, the **agent** only sends data. It doesn't interpret anything else the server returns, and it refuses HTTP redirects, so the token can't be bounced elsewhere.
 - In **SSH mode** the key is locked to the collector (see above), and ServerStats refuses hosts where it isn't.
 - The **server** never executes, evaluates or unpickles anything. The config is read with `yaml.safe_load`, SQL is parameterized, and host data is validated against a strict schema. A test checks the server code for exec paths.
-- **Install time is the exception.** `curl … | sudo sh` trusts whoever serves the installer at that moment. The files come from the read-only container image, but for the strongest guarantee, install from a git checkout you've reviewed (`sudo ./agent/install.sh …`).
+- **Install time is the exception.** `curl … | sudo sh` (and the PowerShell command on Windows) trusts whoever serves the installer at that moment. The files come from the read-only container image, but for the strongest guarantee, install from a git checkout you've reviewed (`sudo ./agent/install.sh …`, or `.\agent\install.ps1 …` on Windows).
 
 Also:
 
 - **Don't expose port 8080 directly.** The SSO check trusts the `X-authentik-username` header, which is only meaningful when every request comes through your proxy. The compose file binds to `127.0.0.1`; with Traefik, use a Docker network and no published port.
 - Agent tokens are compared in constant time. Ingest payloads are capped at 4 MiB and normalized to a strict schema. Everything from hosts (process names, command lines) is rendered as text, never HTML. The UI sends a strict Content-Security-Policy.
-- Apart from the update buttons, the UI is read-only.
+- The UI only changes things through a few buttons: updating agents, the Docker and GPU switches, removing a host, **Prune**, and making a new join key.
+- **On Windows** the agent's token lives in `%LOCALAPPDATA%\ServerStats\agent.env`, readable only by you and administrators. With `-Service` it is in `C:\ProgramData\ServerStats`, where only administrators and SYSTEM can change it and the unprivileged `LOCAL SERVICE` account that runs the agent can read it.
 - The app runs as a non-root user (uid 10001) with no capabilities, `no-new-privileges`, and a read-only root filesystem. A startup script runs as root only long enough to make the bind-mounted `config` folder writable for that user (the only capabilities it's given are `CHOWN`, `SETUID` and `SETGID`), then drops to it for good. Persistent state lives in the `/data` volume: the SQLite DB, the join key, the SSH key, and pinned host keys.
 
 ## Configuration
