@@ -313,6 +313,7 @@ td .meter { grid-template-columns: 1fr 52px; }
 [data-part="mem"] { --part: var(--series-2); }
 [data-part="disk_util"] { --part: var(--series-3); }
 [data-part="storage"] { --part: var(--series-7); }
+[data-part="temp"] { --part: var(--series-8); }
 .load-seg { background: var(--part); }
 .meter[data-part] .meter-label::before {
   content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 2px;
