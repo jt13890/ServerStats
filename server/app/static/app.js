@@ -58,7 +58,10 @@ function fmtBytes(n) {
   while (Math.abs(n) >= 1024 && i < UNITS.length - 1) { n /= 1024; i++; }
   return (i === 0 || n >= 100 ? Math.round(n) : n.toFixed(1)) + ' ' + UNITS[i];
 }
-const fmtTemp = (n) => (n == null || !isFinite(n) ? '—' : `${(+n).toFixed(1)} °C`);
+// Agents report and the server stores °C; the dashboard shows °F.
+const cToF = (c) => c * 9 / 5 + 32;
+const fmtF = (f) => (f == null || !isFinite(f) ? '—' : `${(+f).toFixed(1)} °F`);
+const fmtTemp = (c) => (c == null || !isFinite(c) ? '—' : fmtF(cToF(+c)));  // takes °C
 // The sensor worth a headline: the hottest CPU one, else the hottest of any.
 const hottest = (temps) => {
   const cpu = (temps || []).filter((t) => t.kind === 'cpu');
@@ -428,7 +431,7 @@ function updateCard(card, host, trend = {}) {
         disk ? `Fullest filesystem: ${disk.mount} (${fmtBytes(disk.used)} of ${fmtBytes(disk.total)})` : 'No filesystems',
         trend.storage || [])),
       // Not part of the load: its own row, only for hosts that have sensors. The bar and
-      // sparkline use a fixed 0-100 °C scale, so hosts compare like the percentages do.
+      // sparkline use a fixed 0-100 °C (32-212 °F) scale, so hosts compare like the percentages do.
       ...(hot ? [keyed('temp', meter('Temp', hot.temp,
         `Hottest ${hot.kind === 'cpu' ? 'CPU ' : ''}sensor: ${hot.name}`, trend.temp || [], fmtTemp(hot.temp),
         { fmt: fmtTemp, level: { full: 'critical', warning: 'warning' }[tempLevel(hot)] }))] : []),
@@ -1001,6 +1004,32 @@ function renderDetail(name) {
     };
     const fmtCount = (v) => (v == null ? '—' : (+v.toFixed(v < 10 ? 2 : 0)).toLocaleString());
 
+    // Each card is either the line graph or a pie, per the Graph | Pie switch in
+    // its header (remembered across hosts and visits). Pies use the same data
+    // over the same range, as the average (storage: the latest sample).
+    const views = loadPref('chartView', {});
+    const spanText = zoom ? 'the zoomed span' : ({ 1: 'the last hour', 24: 'the last 24 hours', 168: 'the last 7 days', 720: 'the last 30 days', 4380: 'the last 6 months', 8760: 'the last year' }[state.range] || `the last ${state.range} hours`);
+    const avg = (points) => {
+      const v = points.filter((q) => q.t >= x0 && q.t <= x1).map((q) => q.v);
+      return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
+    };
+    const card = (id, title, lineOpts, pieOpts) => {
+      const el = $('#chart-' + id);
+      const bar = el.parentElement.querySelector('figcaption');
+      let seg = bar.querySelector('.view-seg');
+      if (!seg) {
+        bar.append(seg = h('div', { class: 'seg view-seg', role: 'radiogroup', 'aria-label': `${title} view` },
+          [['line', 'Graph'], ['pie', 'Pie']].map(([v, text]) => h('button', {
+            type: 'button', role: 'radio', 'data-view': v, text,
+            onclick: () => { savePref('chartView', { ...loadPref('chartView', {}), [id]: v }); drawCharts(); },
+          }))));
+      }
+      const mode = views[id] === 'pie' ? 'pie' : 'line';
+      seg.querySelectorAll('button').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.view === mode)));
+      if (mode === 'pie') pieChart(el, { title, ...pieOpts });
+      else lineChart(el, { ...lineOpts });
+    };
+
     const usage = [
       { label: 'CPU', slot: 1, points: pick('cpu') },
       { label: 'Memory', slot: 2, points: pick('mem') },
@@ -1009,62 +1038,82 @@ function renderDetail(name) {
     // Hosts without swap get no swap line rather than a flat 0%.
     const swap = pick('swap');
     if (swap.length) usage.push({ label: 'Swap', slot: 4, points: swap });
-    lineChart($('#chart-usage'), { ...common, title: 'Utilization', yMax: 100, fmt: fmtPct, series: usage });
+    card('usage', 'Utilization', { ...common, title: 'Utilization', yMax: 100, fmt: fmtPct, series: usage }, {
+      mode: 'fill', fmt: fmtPct, caption: `Average over ${spanText}`,
+      series: usage.map((u) => ({ label: u.label, slot: u.slot, value: avg(u.points) })),
+    });
 
     const storage = history.storage || {};
     const mounts = Object.keys(storage).sort().slice(0, 8);
-    lineChart($('#chart-storage'), {
+    const storageSeries = mounts.map((mount, i) => ({
+      label: mount, slot: i + 1,
+      points: storage[mount].map((r) => ({ t: r.t, v: r.total ? (100 * r.used) / r.total : 0, extra: `${fmtBytes(r.used)} of ${fmtBytes(r.total)}` })),
+    }));
+    card('storage', 'Storage used', {
       ...common, title: 'Storage used', yMax: 100, fmt: fmtPct,
       minGap: Math.max(history.bucket, 300) * 3,
       onPick: pickAt(Math.max(history.bucket, 300)), // storage is sampled every 5 minutes
-      series: mounts.map((mount, i) => ({
-        label: mount, slot: i + 1,
-        points: storage[mount].map((r) => ({ t: r.t, v: r.total ? (100 * r.used) / r.total : 0, extra: `${fmtBytes(r.used)} of ${fmtBytes(r.total)}` })),
-      })),
+      series: storageSeries,
       empty: 'Storage is sampled every 5 minutes',
+    }, {
+      mode: 'fill', fmt: fmtPct, caption: 'Latest sample', empty: 'Storage is sampled every 5 minutes',
+      series: storageSeries.map((q) => {
+        const last = q.points[q.points.length - 1];
+        return { label: q.label, slot: q.slot, value: last ? last.v : null, extra: last && last.extra };
+      }),
     });
 
-    lineChart($('#chart-diskio'), {
-      ...common, title: 'Disk I/O', bytes: true, fmt: fmtRate,
-      series: [
-        { label: 'Read', slot: 1, points: pick('disk_read') },
-        { label: 'Write', slot: 2, points: pick('disk_write') },
-      ],
+    const sharePie = (series, fmt) => ({
+      mode: 'share', fmt, caption: `Share of the average over ${spanText}`,
+      series: series.map((q) => ({ label: q.label, slot: q.slot, value: avg(q.points) })),
     });
 
-    lineChart($('#chart-net'), {
-      ...common, title: 'Network', bytes: true, fmt: fmtRate,
-      series: [
-        { label: 'Received', slot: 1, points: pick('rx') },
-        { label: 'Sent', slot: 2, points: pick('tx') },
-      ],
+    const diskio = [
+      { label: 'Read', slot: 1, points: pick('disk_read') },
+      { label: 'Write', slot: 2, points: pick('disk_write') },
+    ];
+    card('diskio', 'Disk I/O', { ...common, title: 'Disk I/O', bytes: true, fmt: fmtRate, series: diskio }, sharePie(diskio, fmtRate));
+
+    const net = [
+      { label: 'Received', slot: 1, points: pick('rx') },
+      { label: 'Sent', slot: 2, points: pick('tx') },
+    ];
+    card('net', 'Network', { ...common, title: 'Network', bytes: true, fmt: fmtRate, series: net }, sharePie(net, fmtRate));
+
+    const load = [
+      { label: '1 min', slot: 1, points: pick('load1') },
+      { label: '5 min', slot: 2, points: pick('load5') },
+      { label: '15 min', slot: 3, points: pick('load15') },
+    ];
+    const ncores = (host && host.cpu && host.cpu.count) || 1;
+    card('load', 'Load average', { ...common, title: 'Load average', count: true, fmt: fmtCount, series: load }, {
+      mode: 'fill', fmt: fmtCount,
+      caption: `Average over ${spanText}. A full ring is every one of ${ncores} core${ncores === 1 ? '' : 's'} busy`,
+      series: load.map((q) => {
+        const v = avg(q.points);
+        return { label: q.label, slot: q.slot, value: v, pct: v == null ? null : (100 * v) / ncores, extra: v == null ? null : `${fmtPct((100 * v) / ncores)} of ${ncores} core${ncores === 1 ? '' : 's'}` };
+      }),
     });
 
-    lineChart($('#chart-load'), {
-      ...common, title: 'Load average', count: true, fmt: fmtCount,
-      series: [
-        { label: '1 min', slot: 1, points: pick('load1') },
-        { label: '5 min', slot: 2, points: pick('load5') },
-        { label: '15 min', slot: 3, points: pick('load15') },
-      ],
-    });
-
-    const temp = pick('temp');
+    const tempC = pick('temp');
+    const temp = tempC.map((q) => ({ t: q.t, v: cToF(q.v) }));  // plotted in °F
     $('#chart-temp-card').hidden = !temp.length;
     if (temp.length) {
-      lineChart($('#chart-temp'), {
-        ...common, title: 'Temperature', count: true, fmt: fmtTemp,
+      card('temp', 'Temperature', {
+        ...common, title: 'Temperature', count: true, fmt: fmtF,
         series: [{ label: 'Hottest sensor', slot: 1, points: temp }],
+      }, {
+        // the ring uses the overview's fixed scale: 0-100 °C (32-212 °F)
+        mode: 'fill', fmt: fmtTemp, caption: `Average over ${spanText}. A full ring is 212 °F`,
+        series: [{ label: 'Hottest sensor', slot: 1, value: avg(tempC), pct: avg(tempC) }],
       });
     }
 
-    lineChart($('#chart-tasks'), {
-      ...common, title: 'Tasks', count: true, fmt: fmtCount,
-      series: [
-        { label: 'Processes', slot: 1, points: pick('procs') },
-        { label: 'Threads', slot: 2, points: pick('threads') },
-      ],
-    });
+    const tasks = [
+      { label: 'Processes', slot: 1, points: pick('procs') },
+      { label: 'Threads', slot: 2, points: pick('threads') },
+    ];
+    card('tasks', 'Tasks', { ...common, title: 'Tasks', count: true, fmt: fmtCount, series: tasks }, sharePie(tasks, fmtCount));
   }
 
   // -- load peaks: the past week's load, and what was running at its busiest --
@@ -1523,6 +1572,103 @@ function timeAxis(root, { x0, x1, X, iw, W, M, H }) {
     label.textContent = text;
     root.append(label);
   }
+}
+
+// A statistic as a pie. Two kinds: "share" (parts of one total, e.g. read vs
+// write) is a pie; "fill" (each series is its own percent of a capacity, e.g.
+// CPU, memory, one disk) is one ring per series, filled to that percent.
+function pieChart(container, opts) {
+  const { fmt } = opts;
+  container.replaceChildren();
+  const have = opts.series.filter((s) => s.value != null && isFinite(s.value));
+  const total = have.reduce((a, s) => a + Math.max(s.value, 0), 0);
+  if (!have.length || (opts.mode === 'share' && total <= 0)) {
+    container.append(h('div', { class: 'pie-empty', text: opts.empty || 'No data for this range yet' }));
+    return;
+  }
+
+  const tip = $('#tooltip');
+  const hideTip = () => { tip.hidden = true; };
+  const showTip = (e, s, detail) => {
+    tip.replaceChildren(
+      h('div', { class: 'tt-time', text: opts.caption }),
+      h('div', { class: `tt-row c${s.slot}` }, h('span', { class: 'key' }), h('b', { text: fmt(s.value) }),
+        h('span', { text: detail ? `${s.label} · ${detail}` : s.label })));
+    tip.hidden = false;
+    const tw = tip.offsetWidth, th = tip.offsetHeight;
+    let left = e.clientX + 14;
+    if (left + tw > window.innerWidth - 8) left = e.clientX - tw - 14;
+    tip.style.left = Math.max(8, left) + 'px';
+    tip.style.top = Math.max(8, Math.min(e.clientY - th / 2, window.innerHeight - th - 8)) + 'px';
+  };
+  const hover = (el, s, detail) => {
+    el.addEventListener('pointermove', (e) => showTip(e, s, detail));
+    el.addEventListener('pointerleave', hideTip);
+  };
+  const clamp01 = (n) => Math.max(0, Math.min(1, n));
+
+  if (opts.mode === 'share') {
+    const legend = h('div', { class: 'legend' });
+    for (const s of have) {
+      legend.append(h('span', { class: `legend-item c${s.slot}` }, h('span', { class: 'key' }), s.label, ' ', h('b', { text: fmt(s.value) }),
+        h('span', { class: 'muted', text: `${Math.round((100 * Math.max(s.value, 0)) / total)}%` })));
+    }
+    const S = 170, R = 80, C = S / 2;
+    const root = svg('svg', {
+      class: 'pie-svg', viewBox: `0 0 ${S} ${S}`, width: S, height: S, role: 'img',
+      'aria-label': `${opts.title}. ${opts.caption}: ` + have.map((s) => `${s.label} ${fmt(s.value)}`).join(', '),
+    });
+    let a0 = -Math.PI / 2;
+    for (const s of have) {
+      const frac = Math.max(s.value, 0) / total;
+      if (frac <= 0) continue;
+      const a1 = a0 + frac * 2 * Math.PI;
+      let el;
+      if (frac > 0.9999) {
+        el = svg('circle', { class: `slice c${s.slot}`, cx: C, cy: C, r: R });
+      } else {
+        const pt = (a) => `${(C + R * Math.cos(a)).toFixed(2)},${(C + R * Math.sin(a)).toFixed(2)}`;
+        el = svg('path', { class: `slice c${s.slot}`, d: `M${C},${C} L${pt(a0)} A${R},${R} 0 ${frac > 0.5 ? 1 : 0} 1 ${pt(a1)} Z` });
+      }
+      root.append(el);
+      hover(el, s, `${Math.round(frac * 1000) / 10}%`);
+      if (frac >= 0.07) {
+        const mid = (a0 + a1) / 2;
+        const label = svg('text', {
+          class: 'slice-label', x: C + R * 0.62 * Math.cos(mid), y: C + R * 0.62 * Math.sin(mid) + 4, 'text-anchor': 'middle',
+        });
+        label.textContent = `${Math.round(frac * 100)}%`;
+        root.append(label);
+      }
+      a0 = a1;
+    }
+    container.append(legend, h('div', { class: 'pie-wrap' }, root), h('div', { class: 'pie-caption', text: opts.caption }));
+    return;
+  }
+
+  // fill: one ring per series
+  const S = 112, R = 44, C = S / 2, circ = 2 * Math.PI * R;
+  const rings = h('div', { class: 'donuts' });
+  for (const s of have) {
+    const frac = clamp01((s.pct == null ? s.value : s.pct) / 100);
+    const root = svg('svg', {
+      class: 'pie-svg donut', viewBox: `0 0 ${S} ${S}`, width: S, height: S, role: 'img',
+      'aria-label': `${s.label}: ${fmt(s.value)}${s.extra ? ` (${s.extra})` : ''}`,
+    });
+    const arc = svg('circle', {
+      class: `ring c${s.slot}`, cx: C, cy: C, r: R, transform: `rotate(-90 ${C} ${C})`,
+      'stroke-dasharray': `${(circ * frac).toFixed(2)} ${circ.toFixed(2)}`,
+    });
+    root.append(svg('circle', { class: 'ring-track', cx: C, cy: C, r: R }), arc);
+    const val = svg('text', { class: 'ring-value', x: C, y: C + 5, 'text-anchor': 'middle' });
+    val.textContent = fmt(s.value);
+    root.append(val);
+    const cell = h('div', { class: 'donut-cell' }, root,
+      h('div', { class: `donut-label c${s.slot}`, title: s.label }, h('span', { class: 'key' }), s.label));
+    hover(cell, s, s.extra);
+    rings.append(cell);
+  }
+  container.append(rings, h('div', { class: 'pie-caption', text: opts.caption }));
 }
 
 function lineChart(container, opts) {
