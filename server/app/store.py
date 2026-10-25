@@ -14,6 +14,7 @@ removes the host.
 """
 
 import json
+import logging
 import math
 import sqlite3
 import threading
@@ -59,6 +60,8 @@ def _avg(m: str) -> str:
 HOST_TABLES = ("history", "history_5m", "history_1h", "storage_history", "storage_1h", "load_snapshots")
 
 TIERS = (("history", 0, None), ("history_5m", 300, "m5"), ("history_1h", 3600, "h1"))
+log = logging.getLogger("serverstats")
+
 STORAGE_TIERS = (("storage_history", STORAGE_SAMPLE_SECONDS, None), ("storage_1h", 3600, "s1h"))
 
 
@@ -223,6 +226,8 @@ class Store:
         self._db.commit()
 
         self.states: dict[str, HostState] = {}
+        # Called with (host, previous report or None, new report) after each live report is stored.
+        self.on_sample = None
         self._storage_last: dict[str, float] = {}
         self._snapshot_best: dict[str, tuple[int, float]] = {}  # host -> (slot, load) already stored
         for host, received_at, data in self._db.execute("SELECT host, received_at, data FROM latest"):
@@ -236,6 +241,7 @@ class Store:
     def record(self, host: str, data: dict, now: float | None = None) -> None:
         now = time.time() if now is None else now
         st = self.state(host)
+        prev = st.data
         st.data, st.received_at, st.error, st.error_at = data, now, None, None
         m = metrics_from_sample(data)
         with self._lock, self._db:
@@ -258,6 +264,11 @@ class Store:
                 "INSERT OR REPLACE INTO latest (host, received_at, data) VALUES (?,?,?)",
                 (host, now, json.dumps(data, separators=(",", ":"))),
             )
+        if self.on_sample is not None:
+            try:
+                self.on_sample(host, prev, data)
+            except Exception:
+                log.exception("sample hook failed")
 
     def _record_snapshot(self, host: str, data: dict, m: dict, now: float) -> None:
         """Keep the busiest moment of each 5-minute slot (caller holds the lock)."""
@@ -399,11 +410,26 @@ class Store:
         """Forget an enrolled host and all of its data."""
         with self._lock, self._db:
             self._db.execute("DELETE FROM host_prefs WHERE name = ?", (name,))
+            self._db.execute("DELETE FROM meta WHERE key = ?", (f"offline:{name}",))
             for table in ("enrolled", "latest", *HOST_TABLES):
                 self._db.execute(f"DELETE FROM {table} WHERE {'name' if table == 'enrolled' else 'host'} = ?", (name,))
         self.states.pop(name, None)
 
     # -- rollups, compaction and pruning ------------------------------------
+
+    def flag(self, key: str) -> float | None:
+        """A small persistent marker (e.g. "offline:HOST" -> when it was raised), or None."""
+        with self._lock:
+            row = self._db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_flag(self, key: str, value: float) -> None:
+        with self._lock, self._db:
+            self._set_mark(key, value)
+
+    def clear_flag(self, key: str) -> None:
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM meta WHERE key = ?", (key,))
 
     def _mark(self, key: str) -> float:
         row = self._db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()

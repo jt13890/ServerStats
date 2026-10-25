@@ -57,6 +57,28 @@ settings:
   # Report at most this many processes per host (busiest first).
   max_procs: 500
 
+# Chat notifications. Create an incoming webhook in Rocket.Chat (Administration
+# > Integrations > New > Incoming) and paste its URL here, or put it in .env as
+# SERVERSTATS_ROCKETCHAT_WEBHOOK so it stays out of this file (.env wins).
+# notifications:
+#   rocketchat:
+#     webhook_url: https://chat.example.com/hooks/ID/TOKEN
+#     on_oom: true      # a host's kernel killed a process for lack of memory
+#     cooldown: 300     # at most one message per host this often (seconds)
+#     channel: ""       # optional: post to this channel instead of the webhook's own
+#     on_offline: true  # a host stopped reporting AND stopped answering ping
+#     on_recovery: true # ...and it's back
+
+# When a host stops reporting, ping it (by the Tailscale name it reported, or its
+# ping_host / ssh address from the host list) to tell a stopped agent from a stopped
+# machine. Only a host that stays silent for `failures` rounds is called offline.
+# ping:
+#   enabled: true
+#   interval: 30      # seconds between rounds
+#   failures: 3
+#   port: 22          # also tried over TCP (a refusal means the machine is up)
+#   timeout: 3
+
 # Hosts that join with the join key don't need to be listed here. List SSH
 # hosts (the server connects to them), or agents with a fixed token:
 hosts: []
@@ -102,6 +124,7 @@ class Host:
     description: str = ""
     enrolled: bool = False  # joined with the join key rather than listed in config.yaml
     token_hash: str | None = None  # enrolled hosts: sha256 of their token
+    ping_host: str | None = None  # what to ping when it stops reporting (default: its Tailscale name)
 
 
 @dataclass
@@ -116,12 +139,80 @@ class Settings:
 
 
 @dataclass
+class RocketChat:
+    webhook_url: str = ""
+    on_oom: bool = True  # tell the channel when an agent reports an out-of-memory kill
+    cooldown: float = 300.0  # seconds between out-of-memory messages about the same host
+    channel: str = ""  # post here instead of the webhook's own channel
+    on_offline: bool = True  # tell the channel when a host is confirmed offline (see Ping)
+    on_recovery: bool = True  # ...and when it comes back
+
+
+@dataclass
+class Notifications:
+    rocketchat: RocketChat = field(default_factory=RocketChat)
+
+
+@dataclass
+class Ping:
+    """Pinging hosts that stop reporting, to tell a stopped agent from a stopped machine."""
+    enabled: bool = True
+    interval: float = 30.0  # seconds between rounds
+    failures: int = 3  # unanswered rounds in a row before the machine counts as offline
+    port: int = 22  # also tried over TCP; a refusal counts as an answer
+    timeout: float = 3.0  # seconds to wait for each answer
+
+
+@dataclass
 class Config:
     settings: Settings
     hosts: list[Host]
+    notifications: Notifications = field(default_factory=Notifications)
+    ping: Ping = field(default_factory=Ping)
 
     def host(self, name: str) -> Host | None:
         return next((h for h in self.hosts if h.name == name), None)
+
+
+def _notifications(raw) -> Notifications:
+    rc = ((raw or {}).get("rocketchat") if isinstance(raw, dict) else None) or {}
+    if not isinstance(rc, dict):
+        raise ConfigError("notifications.rocketchat must be a mapping")
+    # The URL holds a secret, so it may come from .env instead of this file.
+    url = os.environ.get("SERVERSTATS_ROCKETCHAT_WEBHOOK", "").strip() or str(rc.get("webhook_url") or "").strip()
+    if url and not re.match(r"^https?://[^\s/]+\S*$", url):
+        raise ConfigError("notifications.rocketchat.webhook_url must be an http(s) URL")
+    try:
+        cooldown = max(float(rc.get("cooldown", 300)), 0.0)
+    except (TypeError, ValueError):
+        raise ConfigError("notifications.rocketchat.cooldown must be a number of seconds")
+    return Notifications(rocketchat=RocketChat(
+        webhook_url=url,
+        on_oom=bool(rc.get("on_oom", True)),
+        on_offline=bool(rc.get("on_offline", True)),
+        on_recovery=bool(rc.get("on_recovery", True)),
+        cooldown=cooldown,
+        channel=str(rc.get("channel") or "").strip(),
+    ))
+
+
+def _ping(raw) -> Ping:
+    raw = raw or {}
+    if not isinstance(raw, dict):
+        raise ConfigError("ping must be a mapping")
+    try:
+        p = Ping(
+            enabled=bool(raw.get("enabled", True)),
+            interval=float(raw.get("interval", 30)),
+            failures=int(raw.get("failures", 3)),
+            port=int(raw.get("port", 22)),
+            timeout=float(raw.get("timeout", 3)),
+        )
+    except (TypeError, ValueError):
+        raise ConfigError("ping: interval, failures, port and timeout must be numbers")
+    if not (5 <= p.interval <= 3600 and 1 <= p.failures <= 20 and 1 <= p.port <= 65535 and 0.5 <= p.timeout <= 10):
+        raise ConfigError("ping: interval must be 5-3600, failures 1-20, port 1-65535 and timeout 0.5-10")
+    return p
 
 
 def load(path: Path | None = None) -> Config:
@@ -163,6 +254,10 @@ def load(path: Path | None = None) -> Config:
 
         mode = str(h.get("mode", "agent")).lower()
         host = Host(name=name, mode=mode, description=str(h.get("description", "")))
+        if h.get("ping_host"):
+            host.ping_host = str(h["ping_host"]).strip()
+            if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$", host.ping_host):
+                raise ConfigError(f"host {name!r}: ping_host must be a host name or IP address")
         if mode == "agent":
             token = str(h.get("token") or "")
             if len(token) < 24:
@@ -183,4 +278,5 @@ def load(path: Path | None = None) -> Config:
             raise ConfigError(f"host {name!r}: mode must be 'agent' or 'ssh', got {mode!r}")
         hosts.append(host)
 
-    return Config(settings=settings, hosts=hosts)
+    return Config(settings=settings, hosts=hosts, notifications=_notifications(raw.get("notifications")),
+                  ping=_ping(raw.get("ping")))

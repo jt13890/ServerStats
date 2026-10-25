@@ -43,7 +43,7 @@ IS_WINDOWS = sys.platform == "win32"
 if not IS_WINDOWS:
     import pwd
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 if IS_WINDOWS:
     CLK_TCK = 10000000  # Windows process times are 100 ns FILETIME ticks
@@ -1049,6 +1049,19 @@ def _meminfo():
     }
 
 
+def _oom_kills():
+    """Processes the kernel has killed for lack of memory since boot (a counter), or None where unknown."""
+    if IS_WINDOWS:
+        return None
+    try:
+        for line in _read("/proc/vmstat").splitlines():
+            if line.startswith("oom_kill "):
+                return max(int(line.split()[1]), 0)
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def _disks():
     if IS_WINDOWS:
         return _win_disks()
@@ -1639,6 +1652,7 @@ def collect(sample_seconds=1.0, max_procs=500, prev=None):
         },
         "load": [round(x, 2) for x in load],
         "memory": mem,
+        "oom_kills": _oom_kills(),
         "disks": _disks(),
         "disk_io": _disk_io(io0, io1, elapsed),
         "docker": _docker_delta(docker0, docker1, elapsed, mem["total"]),

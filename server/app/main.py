@@ -16,11 +16,13 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
+from .notify import Notifier
+from .pingmon import Item, PingMonitor
 from .schema import normalize
 from .ssh_poller import AGENT_SCRIPT, SSHPoller, load_or_create_key
 from .store import Store
 
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 STATIC = Path(__file__).parent / "static"
 INSTALL_SH = AGENT_SCRIPT.parent / "install.sh"
 INSTALL_PS1 = AGENT_SCRIPT.parent / "install.ps1"
@@ -107,6 +109,11 @@ async def lifespan(app: FastAPI):
 
     app.state.conf = conf
     app.state.store = store
+    notifier = app.state.notifier = Notifier(conf.notifications.rocketchat)
+    store.on_sample = notifier.sample
+    pingmon = app.state.pingmon = PingMonitor(conf.ping, store, notifier)
+    if notifier.enabled:
+        log.info("Rocket.Chat notifications are on (out-of-memory kills)")
     # host -> times the update was offered; it's offered on each report until
     # the agent runs the new version, at most MAX_UPDATE_OFFERS times.
     app.state.update_pending = {}
@@ -124,12 +131,30 @@ async def lifespan(app: FastAPI):
                 log.exception("history maintenance failed")
             await asyncio.sleep(300)
 
+    async def ping_loop():
+        # A host that stopped reporting gets pinged: stopped agent, or stopped machine?
+        while True:
+            try:
+                now = time.time()
+                items = []
+                for h in all_hosts(app):
+                    st = store.state(h.name)
+                    target, trusted = _ping_target(h, st)
+                    items.append(Item(h.name, _status(h, st, conf.settings, now), target, trusted, st.received_at))
+                await pingmon.check(items, now)
+            except Exception:
+                log.exception("ping check failed")
+            await asyncio.sleep(5)
+
     pruner = asyncio.create_task(maintenance())
+    pinger = asyncio.create_task(ping_loop()) if conf.ping.enabled else None
     log.info("loaded %d host(s) from config (%d agent, %d ssh), %d joined with the join key",
              len(conf.hosts), sum(h.mode == "agent" for h in conf.hosts),
              sum(h.mode == "ssh" for h in conf.hosts), len(store.enrolled_hosts()))
     yield
     pruner.cancel()
+    if pinger:
+        pinger.cancel()
     await poller.stop()
 
 
@@ -182,6 +207,20 @@ def _status(host: cfg.Host, st, settings: cfg.Settings, now: float) -> str:
     return "online"
 
 
+def _ping_target(host: cfg.Host, st) -> tuple[str | None, bool]:
+    """What to ping for a host that stopped reporting, and whether the admin chose it.
+
+    A name the host reported about itself isn't trusted: it's only pinged if it
+    resolves to a Tailscale address.
+    """
+    if host.ping_host:
+        return host.ping_host, True
+    if host.mode == "ssh" and host.address:
+        return host.address, True
+    name = (st.data or {}).get("hostname")
+    return (name, False) if isinstance(name, str) and name else (None, False)
+
+
 def _summary(request: Request, host: cfg.Host, with_processes: bool = False) -> dict:
     conf = request.app.state.conf
     st = request.app.state.store.state(host.name)
@@ -202,6 +241,7 @@ def _summary(request: Request, host: cfg.Host, with_processes: bool = False) -> 
         enrolled=host.enrolled,
         server_time=now,
         update_pending=host.name in request.app.state.update_pending,
+        ping=request.app.state.pingmon.info(host.name),
         docker_pref=request.app.state.store.docker_pref(host.name),
         gpu_pref=request.app.state.store.gpu_pref(host.name),
         update_available=host.mode == "agent" and bool(data)
