@@ -136,6 +136,12 @@ def _ctl(v):
     return {k: v.get(k) is True for k in ("present", "available", "enabled")}
 
 
+def _counter(v):
+    """A count that only goes up (OOM kills since boot), or None when the host doesn't report it."""
+    n = _opt(v)
+    return int(n) if n is not None and 0 <= n < 2 ** 53 else None
+
+
 def _pct(v, top=100.0):
     """A percentage clamped to 0..top (older agents could report absurd CPU%)."""
     return min(max(_num(v), 0.0), top)
@@ -209,6 +215,7 @@ def normalize(d: dict, max_procs: int) -> dict:
         "kernel": _str(d.get("kernel")),
         "arch": _str(d.get("arch"), 32),
         "uptime": _num(d.get("uptime"), None),
+        "oom_kills": _counter(d.get("oom_kills")),
         "cpu": {"count": ncpu, "percent": _pct(cpu.get("percent"))},
         "load": load + [0.0] * (3 - len(load)),
         "memory": {**{k: _num(mem.get(k)) for k in ("total", "available", "used", "swap_total", "swap_used")},

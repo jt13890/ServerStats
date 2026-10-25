@@ -10,6 +10,8 @@ services:
     environment:
       # Set SERVERSTATS_REQUIRE_AUTH_HEADER=false in .env for a LAN test without Authentik.
       SERVERSTATS_REQUIRE_AUTH_HEADER: ${SERVERSTATS_REQUIRE_AUTH_HEADER:-}
+      # Rocket.Chat incoming webhook for out-of-memory alerts (see README, Notifications).
+      SERVERSTATS_ROCKETCHAT_WEBHOOK: ${SERVERSTATS_ROCKETCHAT_WEBHOOK:-}
     # Don't publish the port to the internet: everything except the agent
     # endpoints should only be reachable through Authentik. Binds to localhost
     # by default (or drop "ports" and attach the container to your proxy's
