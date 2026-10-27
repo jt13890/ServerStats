@@ -1124,6 +1124,19 @@ function renderDetail(name) {
       });
     }
 
+    // Only hosts whose agent reports GPU stats have these; turning them off stops new points.
+    const gpu = [
+      { label: 'GPU busy', slot: 1, points: pick('gpu') },
+      { label: 'GPU memory', slot: 2, points: pick('gpu_mem') },
+    ].filter((q) => q.points.length);
+    $('#chart-gpu-card').hidden = !gpu.length;
+    if (gpu.length) {
+      card('gpu', 'GPU', { ...common, title: 'GPU', yMax: 100, fmt: fmtPct, series: gpu }, {
+        mode: 'fill', fmt: fmtPct, caption: `Average over ${spanText}`,
+        series: gpu.map((q) => ({ label: q.label, slot: q.slot, value: avg(q.points) })),
+      });
+    }
+
     const tasks = [
       { label: 'Processes', slot: 1, points: pick('procs') },
       { label: 'Threads', slot: 2, points: pick('threads') },

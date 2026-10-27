@@ -1235,6 +1235,23 @@ def test_gpu_toggle_and_settings(client):
     assert h["gpu"] == {"error": "no counters"} and h["gpu_ctl"] is None
 
 
+def test_gpu_history_is_charted(client):
+    from app.store import gpu_metrics
+
+    gpu = {"adapters": [{"name": "A", "util": 40, "mem_used": 2, "mem_total": 8},
+                        {"name": "B", "util": 10, "mem_used": 9, "mem_total": 10, "shared_used": 5}]}
+    assert gpu_metrics({"gpu": gpu}) == (40.0, 90.0)
+    assert gpu_metrics({"gpu": {"adapters": [{"util": 5, "mem_used": 0, "mem_total": None}]}}) == (5.0, None)
+    assert gpu_metrics({}) == (None, None) and gpu_metrics({"gpu": {"error": "x"}}) == (None, None)
+
+    ingest(client, TOKEN_A, sample(platform="windows", gpu=gpu))
+    row = client.get("/api/hosts/alpha/history?hours=1", headers=USER).json()["metrics"][-1]
+    assert row["gpu"] == 40.0 and row["gpu_mem"] == 90.0
+    ingest(client, TOKEN_B, sample())  # hosts without GPU stats just have no GPU series
+    row = client.get("/api/hosts/beta/history?hours=1", headers=USER).json()["metrics"][-1]
+    assert row["gpu"] is None and row["gpu_mem"] is None
+
+
 def test_host_prefs_table_gains_gpu_column(tmp_path):
     import sqlite3
     from app.store import Store

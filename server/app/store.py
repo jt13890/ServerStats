@@ -33,10 +33,11 @@ DAY = 86400
 METRICS = (
     "cpu", "mem", "swap", "load1", "load5", "load15", "rx", "tx",
     "disk_util", "disk_read", "disk_write", "storage", "procs", "threads", "temp",
+    "gpu", "gpu_mem",
 )
 # Percentages are clamped when averaged, so bad values that older agents
 # stored can't blow up the charts.
-PERCENT_METRICS = {"cpu", "mem", "swap", "disk_util", "storage"}
+PERCENT_METRICS = {"cpu", "mem", "swap", "disk_util", "storage", "gpu", "gpu_mem"}
 # Components of a host's overall load score (see load_of).
 # Storage isn't part of it: a full disk has its own meter, and it's not load.
 LOAD_PARTS = ("cpu", "mem", "disk_util")
@@ -85,11 +86,21 @@ def hottest_temp(data: dict) -> float | None:
     return max((t["temp"] for t in cpu or temps), default=None)
 
 
+def gpu_metrics(data: dict) -> tuple[float | None, float | None]:
+    """(busiest GPU's busy %, fullest GPU's dedicated-memory %) from a sample; None when GPU stats are off."""
+    adapters = [a for a in (data.get("gpu") or {}).get("adapters") or [] if isinstance(a, dict)]
+    busy = [a["util"] for a in adapters if _num(a.get("util")) is not None]
+    mem = [100.0 * a["mem_used"] / a["mem_total"] for a in adapters
+           if _num(a.get("mem_used")) is not None and _num(a.get("mem_total")) and a["mem_total"] > 0]
+    return max(busy, default=None), max(mem, default=None)
+
+
 def metrics_from_sample(data: dict) -> dict:
     """Pick the host-level numbers we keep history for out of a sample."""
     cpu, mem, net, dio, tasks = (data.get(k) or {} for k in ("cpu", "memory", "net", "disk_io", "tasks"))
     load = (data.get("load") or []) + [None] * 3
     swap_total = _num(mem.get("swap_total")) or 0
+    gpu, gpu_mem = gpu_metrics(data)
     disks = [d.get("percent") for d in data.get("disks") or [] if isinstance(d, dict)]
     return {
         "cpu": _num(cpu.get("percent")),
@@ -103,6 +114,7 @@ def metrics_from_sample(data: dict) -> dict:
         "storage": max((p for p in disks if _num(p) is not None), default=None),
         "procs": _num(tasks.get("total")), "threads": _num(tasks.get("threads")),
         "temp": hottest_temp(data),
+        "gpu": gpu, "gpu_mem": gpu_mem,
     }
 
 
