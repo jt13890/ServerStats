@@ -508,6 +508,32 @@ async def remove_host(request: Request, name: str):
     return {"ok": True}
 
 
+@app.post("/api/hosts/{name}/rename")
+async def rename_host(request: Request, name: str):
+    """Rename a host that joined with the join key; its token, history and settings stay."""
+    _require_action_header(request)
+    host = _host_or_404(request, name)
+    if not host.enrolled:
+        raise HTTPException(409, "this host is defined in config.yaml; rename it there")
+    try:
+        new = str((await request.json())["name"]).strip()
+    except (ValueError, KeyError, TypeError):
+        raise HTTPException(400, 'expected {"name": "<new name>"}')
+    if not cfg.NAME_RE.match(new):
+        raise HTTPException(400, "name must be 1-64 letters, digits, '.', '_' or '-'")
+    if new == host.name:
+        return {"ok": True, "name": new}
+    if any(h.name == new for h in all_hosts(request.app)) or not request.app.state.store.rename_host(host.name, new):
+        raise HTTPException(409, f"a host named {new!r} already exists")
+    app_state = request.app.state
+    if host.name in app_state.update_pending:
+        app_state.update_pending[new] = app_state.update_pending.pop(host.name)
+    app_state.pingmon.tracks.pop(host.name, None)
+    app_state.load_cache = None
+    log.info("host %s renamed to %s", host.name, new)
+    return {"ok": True, "name": new}
+
+
 def _ingest_backfill(request: Request, host: cfg.Host, data: dict) -> dict:
     """Reports an agent kept while the server was unreachable: history only."""
     items = data["backfill"]

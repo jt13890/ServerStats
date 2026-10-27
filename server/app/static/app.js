@@ -641,10 +641,25 @@ function renderDetail(name) {
     }
   });
 
+  const renameBtn = $('#d-rename');
+  renameBtn.addEventListener('click', async () => {
+    const input = prompt(`New name for ${name}? Its history and token stay with it. `
+      + "The agent's own --name setting isn't changed; it only affects the first join.", name);
+    const next = input === null ? '' : input.trim();
+    if (!next || next === name) return;
+    try {
+      const r = await apiPost(`/api/hosts/${enc}/rename`, { name: next });
+      location.hash = '#/host/' + encodeURIComponent(r.name);
+    } catch (e) {
+      alert(`Couldn't rename ${name}: ${e.message}`);
+    }
+  });
+
   function drawHost() {
     markRange();
     drawUpdate();
     removeBtn.hidden = !host.enrolled;
+    renameBtn.hidden = !host.enrolled;
     setStatus($('#d-status'), host.status);
     const sub = [
       host.description,

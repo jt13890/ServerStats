@@ -67,6 +67,7 @@ The host joins with the server's **join key** and appears on the dashboard withi
 - **Naming:** the host uses its hostname unless you pass `--name`. Names must be unique, so a host can't take over another's name.
 - **Reinstalling** keeps the token the host already has.
 - **The join key** is only good for adding hosts, but anyone with it can add one, so treat it like a password. **Add host → Make a new join key** replaces it; hosts that already joined keep working.
+- **Renaming:** enrolled hosts have a **Rename** button on their page. History, settings and the token stay with the host. The agent's `--name` only matters for the first join, so reinstalling with the old name later would add a new host.
 - **Removing:** enrolled hosts have a **Remove host** button, which deletes them and their history.
 - **Turning joining off:** set `enrollment: false` in the config.
 

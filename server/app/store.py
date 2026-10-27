@@ -415,6 +415,37 @@ class Store:
                 self._db.execute(f"DELETE FROM {table} WHERE {'name' if table == 'enrolled' else 'host'} = ?", (name,))
         self.states.pop(name, None)
 
+    def rename_host(self, old: str, new: str) -> bool:
+        """Rename an enrolled host, keeping its token, history and settings.
+
+        False if `new` is already used by an enrolled host. Every table keyed by
+        the host's name is updated in one transaction.
+        """
+        with self._lock, self._db:
+            try:
+                self._db.execute("UPDATE enrolled SET name = ? WHERE name = ?", (new, old))
+            except sqlite3.IntegrityError:
+                return False
+            # A stale row under the new name (e.g. from a host removed earlier) would clash.
+            for table in ("host_prefs",):
+                self._db.execute(f"DELETE FROM {table} WHERE name = ?", (new,))
+                self._db.execute(f"UPDATE {table} SET name = ? WHERE name = ?", (new, old))
+            self._db.execute("DELETE FROM meta WHERE key = ?", (f"offline:{new}",))
+            self._db.execute("UPDATE meta SET key = ? WHERE key = ?", (f"offline:{new}", f"offline:{old}"))
+            for table in ("latest", *HOST_TABLES):
+                self._db.execute(f"DELETE FROM {table} WHERE host = ?", (new,))
+                self._db.execute(f"UPDATE {table} SET host = ? WHERE host = ?", (new, old))
+        state = self.states.pop(old, None)
+        self.states.pop(new, None)
+        if state is not None:
+            self.states[new] = state
+        if old in self._storage_last:
+            self._storage_last[new] = self._storage_last.pop(old)
+        self._snapshot_best.pop(new, None)
+        if old in self._snapshot_best:
+            self._snapshot_best[new] = self._snapshot_best.pop(old)
+        return True
+
     # -- rollups, compaction and pruning ------------------------------------
 
     def flag(self, key: str) -> float | None:

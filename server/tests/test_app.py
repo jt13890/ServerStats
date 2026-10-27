@@ -506,6 +506,17 @@ def test_enrollment(client):
     assert _join(client, key, "other").status_code == 401
     assert ingest(client, token, sample()).status_code == 200
 
+    # Enrolled hosts can be renamed (history and token follow); config.yaml hosts can't.
+    assert client.post("/api/hosts/newbox/rename", json={"name": "renamed"}, headers=USER).status_code == 403
+    assert client.post("/api/hosts/alpha/rename", json={"name": "x"}, headers=ACTION).status_code == 409
+    assert client.post("/api/hosts/newbox/rename", json={"name": "alpha"}, headers=ACTION).status_code == 409
+    assert client.post("/api/hosts/newbox/rename", json={"name": "bad name!"}, headers=ACTION).status_code == 400
+    assert client.post("/api/hosts/newbox/rename", json={"name": "renamed"}, headers=ACTION).status_code == 200
+    assert client.get("/api/hosts/newbox", headers=USER).status_code == 404
+    assert client.get("/api/hosts/renamed", headers=USER).json()["status"] == "online"
+    assert ingest(client, token, sample()).json()["host"] == "renamed"
+    assert client.post("/api/hosts/renamed/rename", json={"name": "newbox"}, headers=ACTION).status_code == 200
+
     # Enrolled hosts can be removed; config.yaml hosts can't be removed from the UI.
     assert client.post("/api/hosts/alpha/remove", headers=ACTION).status_code == 409
     assert client.post("/api/hosts/newbox/remove", headers=USER).status_code == 403
