@@ -1268,6 +1268,7 @@ function renderDetail(name) {
   });
 
   state.redraw = () => { drawCharts(); drawPeaks(); };
+  setupScanCard(name, () => host);
   every(5000, loadHost);
   every(30000, loadHistory);
   every(300000, loadPeaks);

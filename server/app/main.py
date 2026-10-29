@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import re
 import secrets
 import time
@@ -18,11 +19,11 @@ from fastapi.staticfiles import StaticFiles
 from . import config as cfg
 from .notify import Notifier
 from .pingmon import Item, PingMonitor
-from .schema import normalize
+from .schema import normalize, normalize_scan
 from .ssh_poller import AGENT_SCRIPT, SSHPoller, load_or_create_key
 from .store import Store
 
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 STATIC = Path(__file__).parent / "static"
 INSTALL_SH = AGENT_SCRIPT.parent / "install.sh"
 INSTALL_PS1 = AGENT_SCRIPT.parent / "install.ps1"
@@ -127,6 +128,7 @@ async def lifespan(app: FastAPI):
             try:
                 store.rollup()
                 store.compact({h.name for h in all_hosts(app)})
+                store.scan_expire(time.time())
             except Exception:
                 log.exception("history maintenance failed")
             await asyncio.sleep(300)
@@ -396,6 +398,91 @@ async def set_gpu(request: Request, name: str):
     return {"ok": True, "enabled": enabled}
 
 
+# -- disk scans: on demand, one at a time per host, every run kept ---------------
+#
+# The agent does the walking (see "disk scan" in the agent). The dashboard
+# asks here; the request goes out in the reply to the agent's next report, and
+# the result comes back through /api/ingest like any other report.
+
+SCAN_MIN_AGENT = "1.8.0"
+MAX_SCAN_PATH = 1024
+_ABS_PATH = re.compile(r"^(/|[A-Za-z]:[\\/])")
+
+
+def _scan_unavailable(request: Request, host: cfg.Host) -> str | None:
+    """Why this host can't be scanned right now, or None."""
+    if host.mode != "agent":
+        return "disk scans need the push agent; SSH hosts only run a fixed read-only probe"
+    st = request.app.state.store.state(host.name)
+    if not st.data:
+        return "this agent hasn't reported yet"
+    if _version_tuple(st.data.get("agent_version")) < _version_tuple(SCAN_MIN_AGENT):
+        return f"this agent is too old to scan disks (needs {SCAN_MIN_AGENT}); update it first"
+    return None
+
+
+@app.get("/api/hosts/{name}/scans")
+def list_scans(request: Request, name: str):
+    host = _host_or_404(request, name)
+    return {"scans": request.app.state.store.scan_list(host.name, time.time()),
+            "unavailable": _scan_unavailable(request, host)}
+
+
+@app.post("/api/hosts/{name}/scans")
+async def start_scan(request: Request, name: str):
+    """Ask a host's agent to scan a folder. Runs only when asked; nothing is scheduled."""
+    _require_action_header(request)
+    host = _host_or_404(request, name)
+    reason = _scan_unavailable(request, host)
+    if reason:
+        raise HTTPException(409, reason)
+    st = request.app.state.store.state(host.name)
+    now = time.time()
+    if _status(host, st, request.app.state.conf.settings, now) != "online":
+        raise HTTPException(409, "this host is offline; a scan starts when its agent next reports")
+    try:
+        body = await request.json()
+        path, cross_fs = body["path"], body.get("cross_fs", False)
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise HTTPException(400, 'expected {"path": "/", "cross_fs": false}')
+    if (not isinstance(path, str) or not isinstance(cross_fs, bool) or not 0 < len(path) <= MAX_SCAN_PATH
+            or not _ABS_PATH.match(path) or any(ord(c) < 32 for c in path)):
+        raise HTTPException(400, "path must be an absolute folder path such as / or C:\\")
+    sid, why = request.app.state.store.scan_request(
+        host.name, path, cross_fs, request.headers.get(request.app.state.conf.settings.auth_header), now)
+    if sid is None:
+        raise HTTPException(409, why)
+    log.info("disk scan %d of %s on %s requested", sid, path, host.name)
+    return {"ok": True, "id": sid}
+
+
+@app.get("/api/hosts/{name}/scans/{sid}")
+def get_scan(request: Request, name: str, sid: int):
+    host = _host_or_404(request, name)
+    scan = request.app.state.store.scan_get(host.name, sid, time.time())
+    if scan is None:
+        raise HTTPException(404, "unknown scan")
+    return scan
+
+
+@app.post("/api/hosts/{name}/scans/{sid}/cancel")
+async def cancel_scan(request: Request, name: str, sid: int):
+    _require_action_header(request)
+    host = _host_or_404(request, name)
+    if not request.app.state.store.scan_cancel(host.name, sid, time.time()):
+        raise HTTPException(409, "that scan isn't running")
+    return {"ok": True}
+
+
+@app.post("/api/hosts/{name}/scans/{sid}/delete")
+async def delete_scan(request: Request, name: str, sid: int):
+    _require_action_header(request)
+    host = _host_or_404(request, name)
+    if not request.app.state.store.scan_delete(host.name, sid):
+        raise HTTPException(409, "that scan doesn't exist or is still running; cancel it first")
+    return {"ok": True}
+
+
 @app.post("/api/update-agents")
 async def update_all(request: Request):
     """Queue updates for every outdated agent that accepts them."""
@@ -557,6 +644,48 @@ def _ingest_backfill(request: Request, host: cfg.Host, data: dict) -> dict:
     return {"ok": True, "host": host.name, "stored": stored, "skipped": skipped}
 
 
+def _scan_id(v) -> int:
+    if not isinstance(v, int) or isinstance(v, bool) or not 0 < v < 1 << 62:
+        raise HTTPException(400, "invalid scan id")
+    return v
+
+
+def _ingest_scan_progress(request: Request, host: cfg.Host, info) -> dict:
+    if not isinstance(info, dict):
+        raise HTTPException(400, "unexpected scan progress")
+    sid = _scan_id(info.get("id"))
+    clean = {"files": _count(info.get("files")), "dirs": _count(info.get("dirs")), "bytes": _count(info.get("bytes")),
+             "unreadable": _count(info.get("unreadable")), "current": str(info.get("current") or "")[:300]}
+    keep_going = request.app.state.store.scan_progress(host.name, sid, clean, time.time())
+    return {"ok": True, "cancel": not keep_going}
+
+
+def _count(v) -> int:
+    return min(max(int(v), 0), 1 << 62) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else 0
+
+
+def _ingest_scan_result(request: Request, host: cfg.Host, payload) -> dict:
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "unexpected scan result")
+    sid = _scan_id(payload.get("id"))
+    store = request.app.state.store
+    now = time.time()
+    if payload.get("cancelled") is True:
+        stored = store.scan_finish(host.name, sid, now, cancelled=True)
+    elif payload.get("result") is not None:
+        try:
+            result = normalize_scan(payload["result"])
+        except (ValueError, TypeError, RecursionError) as e:
+            stored = store.scan_finish(host.name, sid, now, error=f"the agent sent a result that couldn't be read ({e})")
+        else:
+            stored = store.scan_finish(host.name, sid, now, result=result)
+            log.info("disk scan %d of %s on %s stored: %d files, %d bytes", sid, result["path"], host.name,
+                     result["files"], result["alloc"])
+    else:
+        stored = store.scan_finish(host.name, sid, now, error=str(payload.get("error") or "the scan failed")[:300])
+    return {"ok": True, "stored": stored}
+
+
 @app.post("/api/ingest")
 async def ingest(request: Request):
     auth = request.headers.get("authorization", "")
@@ -580,6 +709,10 @@ async def ingest(request: Request):
 
     if "backfill" in data:
         return _ingest_backfill(request, host, data)
+    if "scan_progress" in data:
+        return _ingest_scan_progress(request, host, data["scan_progress"])
+    if "scan_result" in data:
+        return _ingest_scan_result(request, host, data["scan_result"])
     sample = normalize(data, request.app.state.conf.settings.max_procs)
     request.app.state.store.record(host.name, sample)
     reply = {"ok": True, "host": host.name, "backfill": MAX_BACKFILL}  # tells agents they may buffer
@@ -590,6 +723,10 @@ async def ingest(request: Request):
             settings[key] = pref
     if settings:
         reply["settings"] = settings
+    if host.mode == "agent" and _version_tuple(sample["agent_version"]) >= _version_tuple(SCAN_MIN_AGENT):
+        offer = request.app.state.store.scan_offer(host.name, time.time())
+        if offer:
+            reply["scan"] = offer
     pending = request.app.state.update_pending
     if host.name in pending:
         done = _version_tuple(sample["agent_version"]) >= _version_tuple(AGENT_VERSION)
@@ -629,7 +766,7 @@ def _index_html() -> str:
     their contents, so browsers (and any cache in between) pick up a new
     release instead of running a stale app.js against the new server."""
     html = (STATIC / "index.html").read_text()
-    for name in ("app.js", "style.css"):
+    for name in ("app.js", "scan.js", "style.css"):
         digest = hashlib.sha256((STATIC / name).read_bytes()).hexdigest()[:12]
         html = html.replace(f'"/static/{name}"', f'"/static/{name}?v={digest}"')
     return html
