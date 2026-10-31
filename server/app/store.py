@@ -28,6 +28,11 @@ STORAGE_SAMPLE_SECONDS = 300
 RAW_DAYS = 3
 M5_DAYS = 90
 DAY = 86400
+# Disk scans (see Store.scan_request): saved until deleted, but bounded so they can't fill the disk.
+MAX_SCANS_PER_HOST = 500
+SCAN_PICKUP_SECONDS = 600     # an agent has this long to start a requested scan
+SCAN_SILENCE_SECONDS = 600    # a running scan that reports nothing for this long is given up on
+SCAN_MAX_SECONDS = 3 * 3600
 
 # Host-level metrics tracked over time (all nullable REAL columns).
 METRICS = (
@@ -221,6 +226,14 @@ class Store:
                 load REAL NOT NULL, data BLOB NOT NULL,
                 PRIMARY KEY (host, slot)
             );
+            CREATE TABLE IF NOT EXISTS scans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT NOT NULL, path TEXT NOT NULL,
+                cross_fs INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, requested REAL NOT NULL,
+                requested_by TEXT, started REAL, finished REAL, updated REAL NOT NULL,
+                alloc INTEGER, apparent INTEGER, files INTEGER, dirs INTEGER, unreadable INTEGER,
+                fs_used INTEGER, fs_total INTEGER, error TEXT, progress TEXT, data BLOB
+            );
+            CREATE INDEX IF NOT EXISTS scans_host ON scans (host, id);
             CREATE TABLE IF NOT EXISTS enrolled (
                 name TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE,
                 hostname TEXT, created REAL NOT NULL
@@ -418,10 +431,143 @@ class Store:
             self._db.execute("INSERT INTO host_prefs (name, gpu) VALUES (?, ?) "
                              "ON CONFLICT(name) DO UPDATE SET gpu = excluded.gpu", (name, int(enabled)))
 
+    # -- disk scans ------------------------------------------------------------
+    #
+    # Every run is kept until someone deletes it (prune leaves scans alone).
+    # A run is requested from the dashboard (pending), handed to the agent on
+    # its next report (running), and ends done, failed or cancelled.
+
+    SCAN_COLUMNS = ("id, host, path, cross_fs, status, requested, requested_by, started, finished, updated, "
+                    "alloc, apparent, files, dirs, unreadable, fs_used, fs_total, error, progress")
+
+    def _scan_row(self, row) -> dict:
+        keys = [k.strip() for k in self.SCAN_COLUMNS.split(",")]
+        d = dict(zip(keys, row))
+        d["cross_fs"] = bool(d["cross_fs"])
+        d["progress"] = json.loads(d["progress"]) if d["progress"] else None
+        return d
+
+    def scan_request(self, host: str, path: str, cross_fs: bool, by: str | None, now: float) -> tuple[int | None, str | None]:
+        """Queue a scan; returns (id, None), or (None, why not)."""
+        with self._lock, self._db:
+            self._expire_scans(now)
+            if self._db.execute("SELECT 1 FROM scans WHERE host = ? AND status IN ('pending', 'running')",
+                                (host,)).fetchone():
+                return None, "a scan of this host is already in progress"
+            (have,) = self._db.execute("SELECT COUNT(*) FROM scans WHERE host = ?", (host,)).fetchone()
+            if have >= MAX_SCANS_PER_HOST:
+                return None, f"this host already has {have} saved scans; delete some old ones first"
+            cur = self._db.execute(
+                "INSERT INTO scans (host, path, cross_fs, status, requested, requested_by, updated) "
+                "VALUES (?, ?, ?, 'pending', ?, ?, ?)", (host, path, int(cross_fs), now, (by or "")[:128] or None, now))
+            return cur.lastrowid, None
+
+    def scan_offer(self, host: str, now: float) -> dict | None:
+        """The scan to hand the agent in its reply, if one is waiting for it.
+
+        Offered on every report until the agent says it has started, so a
+        reply lost on the way doesn't strand the request.
+        """
+        with self._lock:
+            row = self._db.execute(
+                "SELECT id, path, cross_fs FROM scans WHERE host = ? AND status IN ('pending', 'running') "
+                "AND started IS NULL ORDER BY id LIMIT 1", (host,)).fetchone()
+            if row is None:
+                return None
+            with self._db:
+                self._db.execute("UPDATE scans SET status = 'running', updated = ? WHERE id = ?", (now, row[0]))
+            return {"id": row[0], "path": row[1], "cross_fs": bool(row[2])}
+
+    def scan_progress(self, host: str, sid: int, info: dict, now: float) -> bool:
+        """Record a progress report; False tells the agent to stop (cancelled, or nobody wants it)."""
+        with self._lock, self._db:
+            row = self._db.execute("SELECT status FROM scans WHERE id = ? AND host = ?", (sid, host)).fetchone()
+            if row is None or row[0] not in ("pending", "running"):
+                return False
+            self._db.execute("UPDATE scans SET status = 'running', started = COALESCE(started, ?), updated = ?, "
+                             "progress = ? WHERE id = ?", (now, now, json.dumps(info), sid))
+            return True
+
+    def scan_finish(self, host: str, sid: int, now: float, result: dict | None = None,
+                    error: str | None = None, cancelled: bool = False) -> bool:
+        """Store what the agent sent back. False if that scan isn't waiting for a result."""
+        with self._lock, self._db:
+            row = self._db.execute("SELECT status FROM scans WHERE id = ? AND host = ?", (sid, host)).fetchone()
+            if row is None or row[0] not in ("pending", "running"):
+                return False
+            if result is not None:
+                fs = result["fs"] or {}
+                blob = zlib.compress(json.dumps(result, separators=(",", ":")).encode(), 6)
+                self._db.execute(
+                    "UPDATE scans SET status = 'done', finished = ?, updated = ?, started = COALESCE(started, ?), "
+                    "progress = NULL, alloc = ?, apparent = ?, files = ?, dirs = ?, unreadable = ?, fs_used = ?, "
+                    "fs_total = ?, data = ? WHERE id = ?",
+                    (now, now, now, result["alloc"], result["apparent"], result["files"], result["dirs"],
+                     result["unreadable"], fs.get("used"), fs.get("total"), blob, sid))
+            else:
+                self._db.execute("UPDATE scans SET status = ?, finished = ?, updated = ?, progress = NULL, error = ? "
+                                 "WHERE id = ?", ("cancelled" if cancelled else "failed", now, now,
+                                                  None if cancelled else (error or "the scan failed")[:300], sid))
+            return True
+
+    def scan_cancel(self, host: str, sid: int, now: float) -> bool:
+        with self._lock, self._db:
+            cur = self._db.execute(
+                "UPDATE scans SET status = 'cancelled', finished = ?, updated = ?, progress = NULL "
+                "WHERE id = ? AND host = ? AND status IN ('pending', 'running')", (now, now, sid, host))
+            return cur.rowcount > 0
+
+    def scan_delete(self, host: str, sid: int) -> bool:
+        """Delete a finished scan. A scan still in progress has to be cancelled first."""
+        with self._lock, self._db:
+            cur = self._db.execute("DELETE FROM scans WHERE id = ? AND host = ? AND status NOT IN ('pending', 'running')",
+                                   (sid, host))
+            return cur.rowcount > 0
+
+    def scan_list(self, host: str, now: float) -> list[dict]:
+        with self._lock:
+            with self._db:
+                self._expire_scans(now)
+            rows = self._db.execute(f"SELECT {self.SCAN_COLUMNS} FROM scans WHERE host = ? ORDER BY id DESC", (host,))
+            return [self._scan_row(r) for r in rows.fetchall()]
+
+    def scan_get(self, host: str, sid: int, now: float) -> dict | None:
+        """One scan: its summary, and for a finished one the full result."""
+        with self._lock:
+            with self._db:
+                self._expire_scans(now)
+            row = self._db.execute(f"SELECT {self.SCAN_COLUMNS}, data FROM scans WHERE id = ? AND host = ?",
+                                   (sid, host)).fetchone()
+        if row is None:
+            return None
+        out = self._scan_row(row[:-1])
+        out["result"] = json.loads(zlib.decompress(row[-1])) if row[-1] else None
+        return out
+
+    def scan_expire(self, now: float) -> None:
+        with self._lock, self._db:
+            self._expire_scans(now)
+
+    def _expire_scans(self, now: float) -> None:
+        """Give up on scans nobody is working on (agent gone, stopped, or never got the request)."""
+        for sid, started, updated, requested in self._db.execute(
+                "SELECT id, started, updated, requested FROM scans WHERE status IN ('pending', 'running')").fetchall():
+            if started is None and now - requested > SCAN_PICKUP_SECONDS:
+                why = "the agent didn't pick up the request; is it online and up to date?"
+            elif started is not None and now - updated > SCAN_SILENCE_SECONDS:
+                why = "the agent stopped reporting progress"
+            elif started is not None and now - started > SCAN_MAX_SECONDS:
+                why = "the scan ran longer than the limit"
+            else:
+                continue
+            self._db.execute("UPDATE scans SET status = 'failed', finished = ?, updated = ?, progress = NULL, error = ? "
+                             "WHERE id = ?", (now, now, why, sid))
+
     def remove_host(self, name: str) -> None:
         """Forget an enrolled host and all of its data."""
         with self._lock, self._db:
             self._db.execute("DELETE FROM host_prefs WHERE name = ?", (name,))
+            self._db.execute("DELETE FROM scans WHERE host = ?", (name,))
             self._db.execute("DELETE FROM meta WHERE key = ?", (f"offline:{name}",))
             for table in ("enrolled", "latest", *HOST_TABLES):
                 self._db.execute(f"DELETE FROM {table} WHERE {'name' if table == 'enrolled' else 'host'} = ?", (name,))
@@ -442,6 +588,8 @@ class Store:
             for table in ("host_prefs",):
                 self._db.execute(f"DELETE FROM {table} WHERE name = ?", (new,))
                 self._db.execute(f"UPDATE {table} SET name = ? WHERE name = ?", (new, old))
+            self._db.execute("DELETE FROM scans WHERE host = ?", (new,))
+            self._db.execute("UPDATE scans SET host = ? WHERE host = ?", (new, old))
             self._db.execute("DELETE FROM meta WHERE key = ?", (f"offline:{new}",))
             self._db.execute("UPDATE meta SET key = ? WHERE key = ?", (f"offline:{new}", f"offline:{old}"))
             for table in ("latest", *HOST_TABLES):
@@ -543,6 +691,9 @@ class Store:
                     for table in ("latest", *HOST_TABLES):
                         self._db.execute(f"DELETE FROM {table} WHERE host = ?", (host,))
                     self.states.pop(host, None)
+            for (host,) in self._db.execute("SELECT DISTINCT host FROM scans").fetchall():
+                if host not in known_hosts:
+                    self._db.execute("DELETE FROM scans WHERE host = ?", (host,))
 
     def prune_preview(self, days: float, host: str | None = None) -> dict:
         """What prune_older_than(days, host) would delete."""

@@ -25,6 +25,7 @@ socket (i.e. is in the docker group); set SERVERSTATS_DOCKER=0 to turn that off.
 import argparse
 import collections
 import hashlib
+import heapq
 import http.client
 import json
 import os
@@ -32,6 +33,7 @@ import platform
 import re
 import socket
 import ssl
+import stat
 import struct
 import sys
 import threading
@@ -43,7 +45,7 @@ IS_WINDOWS = sys.platform == "win32"
 if not IS_WINDOWS:
     import pwd
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 
 if IS_WINDOWS:
     CLK_TCK = 10000000  # Windows process times are 100 ns FILETIME ticks
@@ -1709,6 +1711,512 @@ def _post(opener, url, token, payload, timeout=15):
     return reply if isinstance(reply, dict) else {}
 
 
+# -- disk scan -----------------------------------------------------------------
+#
+# "Where did my disk space go?" Click Scan on a host's page and the server answers
+# that host's next report with {"scan": {"id", "path", "cross_fs"}}. The agent then
+# walks that folder in a background thread, at low priority, and posts what it
+# found back to /api/ingest (so there is no new endpoint to let past your SSO
+# proxy). Nothing is scanned unless someone asks, and the agent only reads
+# names, sizes and dates: never file contents. It runs as the agent's own
+# unprivileged user, so folders that user can't open are counted and reported
+# as unreadable rather than skipped silently.
+#
+# What comes back is small enough to keep forever: a tree holding only the
+# folders and files of 256 KiB or more (smaller ones are folded into a
+# "smaller items" entry per folder), the largest files, and totals per
+# extension. Sizes are space on disk (allocated blocks), like WizTree's
+# "Allocated"; Windows has no block count here, so it is the size rounded up to
+# 4 KiB clusters.
+
+SCAN_KEEP_MIN = 256 * 1024         # smaller files and folders are folded into their parent
+SCAN_MAX_NODES = 12000             # nodes in the reported tree
+SCAN_MAX_DEPTH = 48                # deeper levels are folded into their folder
+SCAN_MAX_BYTES = 3 * 1024 * 1024   # whole result; the server accepts 4 MiB
+SCAN_TOP_FILES = 1000
+SCAN_MAX_EXTS = 200
+SCAN_MAX_SECONDS = 2 * 3600
+SCAN_PROGRESS_SECONDS = 5
+SCAN_EXAMPLES = 100                # unreadable folders / skipped mounts named in the result
+# Inhibitors: a scan must never be the thing that hurts the host it is measuring.
+SCAN_LIVE_NODES = 50000            # finished nodes held while walking; above this the cut-off rises
+SCAN_MAX_WALK_DEPTH = 200          # every open folder holds a file descriptor
+SCAN_MAX_HARDLINKS = 200000        # hard-linked files remembered so each is counted once
+SCAN_MAX_RSS = 192 * 1024 * 1024   # memory growth a scan may cause before it sheds detail
+SCAN_LOAD_FACTOR = 2.0             # pause while the 1-minute load is above this many times the CPU count
+SCAN_MAX_PAUSE = 900               # seconds a scan may spend paused for load in total
+_REPARSE_POINT = 0x400             # Windows junctions, mount points, cloud placeholders...
+
+
+def _human(n):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return "%d %s" % (n, unit)
+        n //= 1024
+
+
+def _clean(s):
+    """A name that is valid UTF-8 (file names can hold bytes that aren't)."""
+    return s.encode("utf-8", "replace").decode("utf-8")
+
+
+def _rss():
+    """This process's resident memory in bytes, or None where it can't be read."""
+    try:
+        if IS_WINDOWS:
+            import ctypes
+            from ctypes import wintypes
+
+            class _Counters(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("faults", wintypes.DWORD)] + [
+                    (n, ctypes.c_size_t) for n in ("peak_ws", "ws", "q1", "q2", "q3", "q4", "pagefile", "peak_pagefile")]
+
+            kernel = ctypes.windll.kernel32
+            kernel.GetCurrentProcess.restype = wintypes.HANDLE
+            kernel.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(_Counters), wintypes.DWORD]
+            counters = _Counters()
+            counters.cb = ctypes.sizeof(counters)
+            if kernel.K32GetProcessMemoryInfo(kernel.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+                return counters.ws
+            return None
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except Exception:
+        return None
+
+
+def _host_busy():
+    """True while the machine is much busier than the scan should add to (Linux only)."""
+    try:
+        return os.getloadavg()[0] > (os.cpu_count() or 1) * SCAN_LOAD_FACTOR
+    except (AttributeError, OSError):
+        return False
+
+
+class _Frame(object):
+    """One folder being walked."""
+
+    __slots__ = ("name", "path", "it", "alloc", "apparent", "files", "big", "kids",
+                 "sub_alloc", "sub_apparent", "sub_files", "small_alloc", "small_apparent",
+                 "small_files", "small_dirs")
+
+    def __init__(self, name, path, it):
+        self.name, self.path, self.it = name, path, it
+        self.alloc = self.apparent = self.files = 0              # files directly in this folder
+        self.big = []                                            # (alloc, apparent, name, mtime) worth naming
+        self.kids = []                                           # finished subfolder nodes worth keeping
+        self.sub_alloc = self.sub_apparent = self.sub_files = 0  # everything in subfolders
+        self.small_alloc = self.small_apparent = self.small_files = self.small_dirs = 0  # folded subfolders
+
+
+class _Cancelled(Exception):
+    pass
+
+
+class _Scan(object):
+    def __init__(self, path, cross_fs, stop, progress=None):
+        self.path, self.cross_fs, self.stop, self.progress = path, cross_fs, stop, progress
+        self.files = self.dirs = self.links = self.unreadable = self.too_deep = 0
+        self.alloc = self.apparent = 0
+        self.unreadable_paths, self.skipped_mounts = [], []
+        self.top = []        # min-heap of (alloc, apparent, path, mtime)
+        self.exts = {}       # extension -> [alloc, apparent, files]
+        self.seen = set()    # (device, inode) of hard-linked files already counted
+        self.current = path
+        self.truncated = None
+        self.keep_min = SCAN_KEEP_MIN  # rises when the walk holds too much (see _compact)
+        self.live = 0                  # finished nodes currently held
+        self.notes = []
+        self.paused = 0.0
+        self.rss0 = _rss()
+        self.shed_at = 0               # entry count at the last compaction
+
+    # -- walking ---------------------------------------------------------------
+
+    def run(self):
+        root_stat = os.lstat(self.path)
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise ValueError("not a folder: %s" % self.path)
+        self.root_dev = root_stat.st_dev
+        deadline = time.monotonic() + SCAN_MAX_SECONDS
+        root = _Frame(_clean(self.path), self.path, os.scandir(self.path))
+        stack = [root]
+        result = None
+        n = 0
+        while stack:
+            n += 1
+            if n % 256 == 0:
+                if self.stop.is_set():
+                    raise _Cancelled()
+                if time.monotonic() > deadline:
+                    self.truncated = "stopped after %d hours; the totals are partial" % (SCAN_MAX_SECONDS // 3600)
+                    break
+                time.sleep(0.002)  # be gentle on the disk
+                if self.live > SCAN_LIVE_NODES:
+                    self._compact(stack)
+                if n % 2048 == 0:
+                    self._check_memory(stack, n)
+                    self._wait_while_busy()
+                    if self.progress is not None:
+                        self.progress(self)
+            frame = stack[-1]
+            try:
+                entry = next(frame.it)
+            except StopIteration:
+                result = self._finish(stack)
+                continue
+            except OSError:
+                self._unreadable(frame.path)
+                result = self._finish(stack)
+                continue
+            self._visit(entry, frame, stack)
+        while stack:  # stopped early: close what is open so the partial result is whole
+            result = self._finish(stack)
+        return result
+
+    def _unreadable(self, path):
+        self.unreadable += 1
+        if len(self.unreadable_paths) < SCAN_EXAMPLES:
+            self.unreadable_paths.append(_clean(path))
+
+    def _visit(self, entry, frame, stack):
+        try:
+            if entry.is_symlink():
+                self.links += 1
+                return
+            is_dir = entry.is_dir(follow_symlinks=False)
+            st = entry.stat(follow_symlinks=False)
+        except OSError:
+            self._unreadable(entry.path)
+            return
+        if is_dir:
+            if IS_WINDOWS:
+                if getattr(st, "st_file_attributes", 0) & _REPARSE_POINT:
+                    self.links += 1  # junctions and mount points: never followed
+                    return
+            elif not self.cross_fs and st.st_dev != self.root_dev:
+                if len(self.skipped_mounts) < SCAN_EXAMPLES:
+                    self.skipped_mounts.append(_clean(entry.path))
+                return
+            if len(stack) >= SCAN_MAX_WALK_DEPTH:
+                self.too_deep += 1  # not entered: every open folder holds a file descriptor
+                return
+            try:
+                it = os.scandir(entry.path)
+            except OSError:
+                self._unreadable(entry.path)
+                return
+            self.dirs += 1
+            self.current = entry.path
+            stack.append(_Frame(_clean(entry.name), entry.path, it))
+            return
+        if not stat.S_ISREG(st.st_mode):
+            return
+        if not IS_WINDOWS and st.st_nlink > 1:
+            key = (st.st_dev, st.st_ino)
+            if key in self.seen:
+                return  # another name for a file already counted
+            if len(self.seen) < SCAN_MAX_HARDLINKS:
+                self.seen.add(key)
+            else:
+                self._note("more than %d hard-linked files: some may be counted more than once" % SCAN_MAX_HARDLINKS)
+        apparent = st.st_size
+        blocks = getattr(st, "st_blocks", None)
+        alloc = blocks * 512 if blocks is not None else ((apparent + 4095) // 4096) * 4096
+        self.files += 1
+        self.alloc += alloc
+        self.apparent += apparent
+        frame.alloc += alloc
+        frame.apparent += apparent
+        frame.files += 1
+        mtime = int(st.st_mtime)
+        if alloc >= self.keep_min:
+            frame.big.append((alloc, apparent, entry.name, mtime))
+            if len(frame.big) > 64:
+                frame.big.sort(reverse=True)
+                del frame.big[32:]
+        if len(self.top) < SCAN_TOP_FILES:
+            heapq.heappush(self.top, (alloc, apparent, entry.path, mtime))
+        elif alloc > self.top[0][0]:
+            heapq.heapreplace(self.top, (alloc, apparent, entry.path, mtime))
+        ext = os.path.splitext(entry.name)[1].lower()[:24] or "(none)"
+        row = self.exts.get(ext)
+        if row is None:
+            row = self.exts.get("(other)") if len(self.exts) >= 20000 else None
+            if row is None:
+                row = self.exts[ext] = [0, 0, 0]
+        row[0] += alloc
+        row[1] += apparent
+        row[2] += 1
+
+    def _finish(self, stack):
+        """Close the innermost folder: build its node and hand its totals to its parent."""
+        frame = stack.pop()
+        try:
+            frame.it.close()
+        except Exception:
+            pass
+        kept = sorted((b for b in frame.big if b[0] >= self.keep_min), reverse=True)[:32]
+        kept_alloc = sum(k[0] for k in kept)
+        kept_apparent = sum(k[1] for k in kept)
+        alloc = frame.alloc + frame.sub_alloc
+        apparent = frame.apparent + frame.sub_apparent
+        files = frame.files + frame.sub_files
+        kids = list(frame.kids) + [
+            {"n": _clean(name), "t": "f", "s": a, "a": p, "f": 1, "m": m} for a, p, name, m in kept]
+        folded = frame.files - len(kept) + frame.small_dirs
+        other_files = frame.files - len(kept) + frame.small_files
+        if folded > 0 or other_files > 0:
+            kids.append({"t": "o", "s": frame.alloc - kept_alloc + frame.small_alloc,
+                         "a": frame.apparent - kept_apparent + frame.small_apparent,
+                         "f": other_files, "k": folded})
+        kids.sort(key=lambda k: k["s"], reverse=True)
+        node = {"n": frame.name, "t": "d", "s": alloc, "a": apparent, "f": files}
+        if len(kids) > 1 or (kids and kids[0]["t"] != "o"):
+            node["c"] = kids
+        if not stack:
+            return node
+        parent = stack[-1]
+        parent.sub_alloc += alloc
+        parent.sub_apparent += apparent
+        parent.sub_files += files
+        self.live += len(kids)
+        if alloc >= self.keep_min:
+            parent.kids.append(node)
+        else:
+            parent.small_alloc += alloc
+            parent.small_apparent += apparent
+            parent.small_files += files
+            parent.small_dirs += 1
+        return node
+
+    # -- inhibitors ------------------------------------------------------------------
+
+    def _note(self, text):
+        if text not in self.notes:
+            self.notes.append(text)
+
+    def _compact(self, stack):
+        """Hold less: raise the size below which finished folders are folded away, and apply it to
+        everything already held. Totals stay exact; only the detail shown gets coarser."""
+        while True:
+            self.keep_min *= 2
+            live = 0
+            for frame in stack:
+                keep = []
+                for kid in frame.kids:
+                    if kid["s"] < self.keep_min:
+                        frame.small_alloc += kid["s"]
+                        frame.small_apparent += kid["a"]
+                        frame.small_files += kid["f"]
+                        frame.small_dirs += 1
+                    else:
+                        _shrink_tree(kid, self.keep_min)
+                        keep.append(kid)
+                frame.kids = keep
+                frame.big = [b for b in frame.big if b[0] >= self.keep_min]
+                live += len(frame.big) + sum(_count_nodes(k) for k in keep)
+            self.live = live
+            if live <= SCAN_LIVE_NODES // 2 or self.keep_min >= 1 << 40:
+                break
+
+    def _check_memory(self, stack, n):
+        rss = _rss()
+        if rss is None or self.rss0 is None:
+            return
+        grown = rss - self.rss0
+        if grown > SCAN_MAX_RSS * 1.5:
+            raise MemoryError("stopped: the scan was using %d MiB of memory, over its %d MiB limit"
+                              % (grown // 1048576, SCAN_MAX_RSS // 1048576))
+        if grown > SCAN_MAX_RSS and n - self.shed_at > 20000:
+            self.shed_at = n
+            self._compact(stack)
+
+    def _wait_while_busy(self):
+        """Hold off while the host is under heavy load, up to SCAN_MAX_PAUSE seconds in all."""
+        while self.paused < SCAN_MAX_PAUSE and _host_busy():
+            if self.stop.wait(1.0):
+                raise _Cancelled()
+            self.paused += 1.0
+            if self.progress is not None:
+                self.progress(self)
+
+    # -- the result ------------------------------------------------------------------
+
+    def _usage(self):
+        try:
+            if IS_WINDOWS:
+                import shutil
+                total, used, free = shutil.disk_usage(self.path)
+            else:
+                v = os.statvfs(self.path)
+                total, free = v.f_blocks * v.f_frsize, v.f_bavail * v.f_frsize
+                used = (v.f_blocks - v.f_bfree) * v.f_frsize
+            return {"total": total, "used": used, "free": free}
+        except Exception:
+            return None
+
+    def result(self, tree, started, finished):
+        exts = sorted(self.exts.items(), key=lambda kv: kv[1][0], reverse=True)
+        keep, rest = exts[:SCAN_MAX_EXTS], exts[SCAN_MAX_EXTS:]
+        rows = [[_clean(k), v[0], v[1], v[2]] for k, v in keep]
+        if rest:
+            rows.append(["(other)", sum(v[0] for _, v in rest), sum(v[1] for _, v in rest), sum(v[2] for _, v in rest)])
+        notes = list(self.notes)
+        if self.keep_min > SCAN_KEEP_MIN:
+            notes.append("this filesystem is very large: items under %s were folded away to keep the agent's memory low"
+                         % _human(self.keep_min))
+        if self.paused >= 1:
+            notes.append("paused for %d s in total while the host was busy" % self.paused)
+        if self.too_deep:
+            notes.append("%d folder%s nested more than %d levels deep %s not entered"
+                         % (self.too_deep, "" if self.too_deep == 1 else "s", SCAN_MAX_WALK_DEPTH,
+                            "was" if self.too_deep == 1 else "were"))
+        out = {
+            "path": _clean(self.path), "started": started, "finished": finished,
+            "cross_fs": self.cross_fs, "windows": IS_WINDOWS,
+            "alloc": self.alloc, "apparent": self.apparent, "files": self.files, "dirs": self.dirs + 1,
+            "links": self.links, "unreadable": self.unreadable,
+            "unreadable_paths": self.unreadable_paths, "skipped_mounts": self.skipped_mounts,
+            "truncated": self.truncated, "notes": notes, "fs": self._usage(),
+            "tree": tree, "exts": rows,
+            "top": [[_clean(p), a, ap, m] for a, ap, p, m in sorted(self.top, reverse=True)],
+        }
+        _fit_scan(out, self.keep_min)
+        return out
+
+
+def _count_nodes(root):
+    n, todo = 0, [root]
+    while todo:
+        node = todo.pop()
+        n += 1
+        todo.extend(node.get("c") or ())
+    return n
+
+
+def _shrink_tree(root, threshold):
+    """Fold nodes smaller than `threshold` (and anything deeper than SCAN_MAX_DEPTH) into "smaller items"."""
+    todo = [(root, 0)]
+    while todo:
+        node, depth = todo.pop()
+        kids = node.get("c")
+        if not kids:
+            continue
+        if depth >= SCAN_MAX_DEPTH:
+            del node["c"]
+            continue
+        keep, other = [], None
+        for k in kids:
+            if k["t"] != "o" and k["s"] >= threshold:
+                keep.append(k)
+                continue
+            if other is None:
+                other = {"t": "o", "s": 0, "a": 0, "f": 0, "k": 0}
+            other["s"] += k["s"]
+            other["a"] += k["a"]
+            other["f"] += k["f"]
+            other["k"] += k.get("k", 1) if k["t"] == "o" else 1
+        if other is not None:
+            keep.append(other)
+        if len(keep) == 1 and keep[0]["t"] == "o":
+            del node["c"]  # nothing worth showing below here
+            continue
+        node["c"] = keep
+        todo.extend((k, depth + 1) for k in keep if k["t"] == "d")
+
+
+def _fit_scan(result, threshold=SCAN_KEEP_MIN):
+    """Raise the size below which things are folded away until the result is small enough."""
+    _shrink_tree(result["tree"], threshold)  # also applies the depth limit
+    while True:
+        size = len(json.dumps(result, separators=(",", ":")))
+        if _count_nodes(result["tree"]) <= SCAN_MAX_NODES and size <= SCAN_MAX_BYTES:
+            break
+        threshold *= 2
+        if threshold > 1 << 50:
+            result["top"] = result["top"][:100]
+            result["unreadable_paths"] = result["skipped_mounts"] = []
+            break
+        _shrink_tree(result["tree"], threshold)
+    result["keep_min"] = threshold
+
+
+class _Scanner(object):
+    """Runs at most one scan at a time, in a background thread."""
+
+    def __init__(self):
+        self.thread = None
+        self.stop = threading.Event()
+        self.current = None  # id of the scan in progress
+
+    def maybe_start(self, opener, url, token, req):
+        """Start the scan the server asked for, unless one is already running."""
+        sid, path = req.get("id"), req.get("path")
+        if not isinstance(sid, int) or isinstance(sid, bool) or not isinstance(path, str) or not path:
+            return
+        if sid == self.current or (self.thread is not None and self.thread.is_alive()):
+            return  # the server offers it on every report until it hears we're running
+        self.stop = threading.Event()
+        self.current = sid
+        self.thread = threading.Thread(
+            target=self._run, name="disk-scan", daemon=True,
+            args=(opener, url, token, sid, path, req.get("cross_fs") is True, self.stop))
+        self.thread.start()
+
+    def _run(self, opener, url, token, sid, path, cross_fs, stop):
+        started = time.time()
+        print("disk scan %d of %s started" % (sid, path), flush=True)
+        try:
+            os.nice(10)  # on Linux this lowers just this thread's priority
+        except (AttributeError, OSError):
+            pass
+        last = [time.monotonic()]
+
+        def progress(scan, force=False):
+            now = time.monotonic()
+            if not force and now - last[0] < SCAN_PROGRESS_SECONDS:
+                return
+            last[0] = now
+            try:
+                reply = _post(opener, url, token, {"scan_progress": {
+                    "id": sid, "files": scan.files, "dirs": scan.dirs, "bytes": scan.alloc,
+                    "unreadable": scan.unreadable, "current": _clean(scan.current)[:300]}})
+                if reply.get("cancel"):
+                    stop.set()
+            except Exception:
+                pass  # the server being briefly away doesn't stop a scan
+
+        payload = {"id": sid}
+        try:
+            if not os.path.isabs(path):
+                raise ValueError("the path must be absolute")
+            scan = _Scan(path, cross_fs, stop, progress)
+            progress(scan, force=True)  # tells the server we're on it, so it stops offering the request
+            tree = scan.run()
+            payload["result"] = scan.result(tree, started, time.time())
+        except _Cancelled:
+            payload["cancelled"] = True
+        except Exception as e:
+            payload["error"] = _clean("%s: %s" % (type(e).__name__, e))[:300]
+        for attempt in range(4):
+            try:
+                _post(opener, url, token, {"scan_result": payload}, timeout=120)
+                break
+            except urllib.error.HTTPError as e:
+                print("server rejected the scan: HTTP %d %s" % (e.code, e.reason), file=sys.stderr, flush=True)
+                if not _transient(e.code):
+                    break
+            except Exception as e:
+                print("couldn't send the scan: %s" % e, file=sys.stderr, flush=True)
+            time.sleep(5 * (attempt + 1))
+        print("disk scan %d finished%s" % (sid, " (cancelled)" if payload.get("cancelled") else
+                                         " with an error" if payload.get("error") else ""), flush=True)
+
+
+_SCANNER = _Scanner()
+
+
 # -- remote updates ------------------------------------------------------------
 #
 # When you click "Update agent" in the UI, the server answers the next report
@@ -2051,6 +2559,8 @@ def run_agent(args, argv):
                     if _GPU.override != settings["gpu"]:
                         print("GPU stats turned %s from the dashboard" % ("on" if settings["gpu"] else "off"), flush=True)
                     _GPU.override = settings["gpu"]
+                if isinstance(reply.get("scan"), dict):
+                    _SCANNER.maybe_start(opener, args.url, args.token, reply["scan"])
                 if can_update and isinstance(reply.get("update"), dict):
                     try:
                         _apply_update(opener, args.url, reply["update"], argv)

@@ -237,3 +237,109 @@ def normalize(d: dict, max_procs: int) -> dict:
         "gpu_ctl": _ctl(d.get("gpu_ctl")),
         "processes": processes,
     }
+
+
+# -- disk scans ----------------------------------------------------------------
+#
+# A finished scan is a folder tree plus the largest files and per-extension
+# totals. It comes from the host (untrusted), so it is rebuilt here from known
+# fields with every number, string, count and depth bounded.
+
+SCAN_MAX_NODES = 20000
+SCAN_MAX_DEPTH = 64
+SCAN_MAX_FILES = 1000
+SCAN_MAX_EXTS = 201
+SCAN_MAX_EXAMPLES = 100
+BIG = 1 << 62
+
+
+def _text(v, limit):
+    """A string that is valid UTF-8 and at most `limit` characters."""
+    if not isinstance(v, str):
+        return ""
+    return v[:limit].encode("utf-8", "replace").decode("utf-8")
+
+
+def _size(v):
+    return min(max(_int(v), 0), BIG)
+
+
+def _scan_node(raw, depth):
+    t = raw.get("t")
+    if t not in ("d", "f", "o"):
+        return None
+    node = {"t": t, "s": _size(raw.get("s")), "a": _size(raw.get("a")), "f": _size(raw.get("f"))}
+    if t != "o":
+        node["n"] = _text(raw.get("n"), 255) or "?"
+    if t == "o":
+        node["k"] = _size(raw.get("k"))
+    if t == "f":
+        node["m"] = min(max(_int(raw.get("m")), 0), 1 << 40)
+    return node
+
+
+def _scan_tree(raw):
+    """Rebuild the tree iteratively (so deep input can't exhaust the stack)."""
+    if not isinstance(raw, dict) or raw.get("t") != "d":
+        raise ValueError("the scan has no folder tree")
+    root = _scan_node(raw, 0)
+    count = 1
+    todo = [(raw, root, 0)]
+    while todo:
+        src, dst, depth = todo.pop()
+        kids = src.get("c")
+        if not isinstance(kids, list) or dst["t"] != "d" or depth >= SCAN_MAX_DEPTH:
+            continue
+        out = []
+        for k in kids:
+            if count >= SCAN_MAX_NODES:
+                break
+            if not isinstance(k, dict):
+                continue
+            node = _scan_node(k, depth + 1)
+            if node is None:
+                continue
+            count += 1
+            out.append(node)
+            if node["t"] == "d":
+                todo.append((k, node, depth + 1))
+        out.sort(key=lambda n: n["s"], reverse=True)
+        if out:
+            dst["c"] = out
+    return root
+
+
+def normalize_scan(raw) -> dict:
+    """Validate a finished scan from an agent; raises ValueError if it isn't one."""
+    if not isinstance(raw, dict):
+        raise ValueError("unexpected scan result")
+    fs = raw.get("fs")
+    out = {
+        "path": _text(raw.get("path"), 1024),
+        "started": _opt(raw.get("started")),
+        "finished": _opt(raw.get("finished")),
+        "cross_fs": raw.get("cross_fs") is True,
+        "windows": raw.get("windows") is True,
+        "alloc": _size(raw.get("alloc")),
+        "apparent": _size(raw.get("apparent")),
+        "files": _size(raw.get("files")),
+        "dirs": _size(raw.get("dirs")),
+        "links": _size(raw.get("links")),
+        "unreadable": _size(raw.get("unreadable")),
+        "unreadable_paths": [_text(p, 1024) for p in _list(raw.get("unreadable_paths"))[:SCAN_MAX_EXAMPLES]],
+        "skipped_mounts": [_text(p, 1024) for p in _list(raw.get("skipped_mounts"))[:SCAN_MAX_EXAMPLES]],
+        "notes": [_text(n, 300) for n in _list(raw.get("notes"))[:10]],
+        "truncated": _text(raw.get("truncated"), 200) or None,
+        "keep_min": _size(raw.get("keep_min")),
+        "fs": {k: _size(fs.get(k)) for k in ("total", "used", "free")} if isinstance(fs, dict) else None,
+        "tree": _scan_tree(raw.get("tree")),
+        "exts": [],
+        "top": [],
+    }
+    for row in _list(raw.get("exts"))[:SCAN_MAX_EXTS]:
+        if isinstance(row, list) and len(row) >= 4:
+            out["exts"].append([_text(row[0], 32), _size(row[1]), _size(row[2]), _size(row[3])])
+    for row in _list(raw.get("top"))[:SCAN_MAX_FILES]:
+        if isinstance(row, list) and len(row) >= 4:
+            out["top"].append([_text(row[0], 4096), _size(row[1]), _size(row[2]), min(max(_int(row[3]), 0), 1 << 40)])
+    return out

@@ -6,6 +6,7 @@
   <title>ServerStats</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/scan.js" defer></script>
   <script src="/static/app.js" defer></script>
 </head>
 <body>
@@ -159,6 +160,34 @@
             <tbody></tbody>
           </table>
         </div>
+      </div>
+
+      <div class="card" id="scan-card">
+        <div class="proc-head">
+          <h2>Disk usage <span class="muted">scan on demand</span></h2>
+        </div>
+        <p class="muted scan-intro">Finds the biggest folders and files on this host. It only runs when you click Scan, reads names and sizes (never file contents), and every run is saved here so you can look back at it.</p>
+        <p id="scan-unavailable" class="docker-state" hidden></p>
+        <div id="scan-controls" class="scan-controls">
+          <label class="scan-field">Folder
+            <input id="scan-path" class="input" list="scan-mounts" spellcheck="false" autocomplete="off" placeholder="/"></label>
+          <datalist id="scan-mounts"></datalist>
+          <label class="check"><input id="scan-cross" type="checkbox"> Include other filesystems</label>
+          <button id="scan-go" class="btn" type="button">Scan</button>
+        </div>
+        <div id="scan-error" class="banner" hidden></div>
+        <div id="scan-active" class="docker-state scan-active" hidden>
+          <span id="scan-active-text"></span>
+          <button id="scan-cancel" class="btn" type="button">Cancel</button>
+        </div>
+        <p id="scan-empty" class="muted" hidden>No scans yet.</p>
+        <div class="table-wrap">
+          <table class="table scan-runs" id="scan-runs" hidden>
+            <thead><tr><th>When</th><th>Folder</th><th class="num">Found</th><th class="num">Change</th><th class="num">Files</th><th>Result</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div id="scan-view" class="scan-view"></div>
       </div>
 
       <div class="card">

@@ -26,7 +26,7 @@ Both modes run the same collector (`agent/serverstats_agent.py`). It uses only t
 |---|---|---|
 | Install on host | One Python file plus a systemd or OpenRC service on Linux, or a per-user startup entry (or a boot-time scheduled task) on Windows, with a one-line installer | One Python file plus a locked-down `authorized_keys` entry (a one-line installer) |
 | Network | Host makes outbound HTTPS to ServerStats. Works behind NAT, and the host needs no open ports | ServerStats must reach the host's SSH port |
-| If the ServerStats server is compromised | The attacker can push agent code to Linux hosts that accept [remote updates](#updating-agents) (the default), running as the agent's user. Windows agents never accept remote updates. Install with `--no-updates` and the server only receives data | The attacker can make hosts run the collector, and nothing else: the key is locked to it by a forced command |
+| If the ServerStats server is compromised | The attacker can push agent code to Linux hosts that accept [remote updates](#updating-agents) (the default), running as the agent's user. Windows agents never accept remote updates. Install with `--no-updates` and the server can no longer send code, but it can still ask the agent to list file names and sizes ([disk usage scans](#disk-usage-scans)) | The attacker can make hosts run the collector, and nothing else: the key is locked to it by a forced command |
 | Runs as | Dedicated unprivileged `serverstats-agent` user (in a locked-down sandbox under systemd). On Windows: your own account, with no administrator rights, or `LOCAL SERVICE` | Unprivileged `serverstats` user |
 | Accuracy | CPU and disk rates are averaged over the whole report interval | 1-second sample at each poll |
 
@@ -100,6 +100,7 @@ For a machine that should report from boot, before anyone signs in (a Windows se
 
 What differs from Linux:
 - **Push agent only.** There is no SSH pull mode, and no Docker section: the Windows agent never touches Docker.
+- **Disk usage scans work here too** (untested on real Windows hosts so far: it skips junctions and mount points rather than following them).
 - **No load average.** Windows doesn't have one, so the host page leaves it out. The overall Load meters still work: they come from CPU, memory and disk I/O.
 - **Updates:** remote updates are off. To update, rerun the installer (it keeps the host's token).
 - **Processes** are read the way Task Manager reads them, so a standard user sees CPU and memory for every process. The owner account and the executable's full path (instead of the command line) are only known for processes your account may open, so other users' and protected processes show their name only.
@@ -161,6 +162,20 @@ SSH pull is for Linux hosts. Windows hosts use the push agent.
 **The key can only ever run the collector.** With `command=` in `authorized_keys`, sshd ignores whatever command the client asks for and runs the collector instead. `restrict` blocks port forwarding, SFTP, PTYs and `~/.ssh/rc`. ServerStats never sends code or asks for a shell: the only command it requests is a harmless `echo` marker. A correctly set-up host runs the collector instead and returns stats. A host whose key isn't locked down would run the `echo`, and ServerStats refuses to use it and shows how to fix it. So even someone who steals the server's key can't do anything on your hosts except read stats.
 
 The host key is **trusted on first use** and pinned in `/data/known_hosts.json`. If it later changes, ServerStats refuses to connect and shows an error on the dashboard. You can pin a key up front with `host_key: "SHA256:…"` (get it with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`).
+
+### Disk usage scans
+
+"Where did my disk space go?" Every push agent (1.8.0 and later, Linux and Windows) can scan a folder and show the result the way WizTree does. There is nothing to turn on: open a host's page, go to **Disk usage**, pick a folder (the host's mounts are suggested) and click **Scan**.
+
+- **Only when you ask.** Nothing is scheduled and nothing runs in the background. The request goes out in the reply to the agent's next report (a few seconds), and the agent scans in a low-priority background thread while its normal reporting carries on. The page shows live progress and a **Cancel** button.
+- **Every run is saved** until you delete it (pruning history leaves scans alone), so you can open any earlier run. The runs table shows how much each folder grew or shrank since the previous scan of the same folder. A host keeps up to 500 runs.
+- **What you get:** a treemap you can click to zoom into folders, an expandable folder tree (% of parent, size on disk, file size, file count), the 1,000 largest files with a path filter, and totals per file type. Sizes are space on disk (allocated blocks, hard links counted once, symlinks never followed), like WizTree's *Allocated*. On Windows, which has no block count here, it is the size rounded up to 4 KiB clusters.
+- **Names, sizes and dates only.** The agent never reads file contents, and never writes or deletes anything. It stays on the filesystem you pick unless you tick **Include other filesystems**, so `/proc`, `/sys` and network mounts are skipped by default.
+- **It sees what the agent's user can see.** The agent runs unprivileged, so folders that user can't open (often `/root` and `/var/lib/docker`) are counted and listed as unreadable rather than hidden, and the page says when the filesystem reports noticeably more used space than the scan found. ServerStats doesn't escalate the agent's privileges to fill that gap.
+- **Safeguards so a scan can't hurt the host:** it runs at low CPU priority and pauses while the host's load is high; it caps its own memory by folding small items into "smaller items" when a filesystem is huge (totals stay exact) and stops with an error if its memory still grows past a limit; hard-link tracking, open-folder depth and run time (2 hours) are all capped; the result is trimmed to fit the 4 MiB ingest limit; one scan runs per host at a time; and a request an agent never picks up, or a scan that goes quiet, is marked failed after 10 minutes.
+- **SSH hosts and agents older than 1.8.0** can't scan: the SSH key is locked to a fixed read-only probe, and old agents need an [update](#updating-agents).
+- **No new proxy rule.** Requests, progress and results all use the existing `/api/ingest` address.
+- **What a compromised server could do with this:** ask an agent to list names, sizes and dates of any folder its unprivileged user can read. It can't read contents, change anything, or run code through it (that's still only [remote updates](#updating-agents)).
 
 ### Docker and compose stacks
 
@@ -298,7 +313,7 @@ For Caddy, Nginx Proxy Manager, and others, follow [Authentik's proxy provider d
 
 **Where code can come from:**
 - **Remote updates are the one deliberate exception.** A Linux agent that accepts them (the default) runs agent code the server provides when you click Update, so the server is trusted with code on those hosts. Windows agents never accept them. Install with `--no-updates` to opt a host out; see [Updating agents](#updating-agents). Update requests need the SSO header and a custom request header, so another site can't trigger one through your browser.
-- Apart from updates, the **agent** only sends data. It doesn't interpret anything else the server returns, and it refuses HTTP redirects, so the token can't be bounced elsewhere.
+- Apart from updates, the **agent** only sends data, plus the on-demand [disk usage scans](#disk-usage-scans) a signed-in user requests: the server's reply can name a folder to list (names, sizes and dates, read-only, as the agent's unprivileged user), which the agent validates before walking it. It doesn't interpret anything else the server returns, and it refuses HTTP redirects, so the token can't be bounced elsewhere.
 - In **SSH mode** the key is locked to the collector (see above), and ServerStats refuses hosts where it isn't.
 - The **server** never executes, evaluates or unpickles anything. The config is read with `yaml.safe_load`, SQL is parameterized, and host data is validated against a strict schema. A test checks the server code for exec paths.
 - **Install time is the exception.** `curl … | sudo sh` (and the PowerShell command on Windows) trusts whoever serves the installer at that moment. The files come from the read-only container image, but for the strongest guarantee, install from a git checkout you've reviewed (`sudo ./agent/install.sh …`, or `.\agent\install.ps1 …` on Windows).
@@ -347,7 +362,7 @@ agent/install.sh             installer: systemd or OpenRC agent service, or lock
 agent/install.ps1            installer for Windows: runs as you from sign-in, or as a boot-time service (-Service)
 server/app/main.py           FastAPI app: UI API, agent ingest, auth gate
 server/app/ssh_poller.py     SSH pull mode (asyncssh): forced-command check, host key pinning
-server/app/store.py          latest samples + tiered SQLite history (raw / 5 min / 1 h)
-server/app/schema.py         payload normalization
-server/app/static/           the UI (plain HTML/CSS/JS, no build step)
+server/app/store.py          latest samples + tiered SQLite history (raw / 5 min / 1 h), saved disk scans
+server/app/schema.py         payload normalization (reports and disk scan results)
+server/app/static/           the UI (plain HTML/CSS/JS, no build step); scan.js is the disk usage view
 ```
