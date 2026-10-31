@@ -21,6 +21,13 @@
 #                     SSH mode: adds the serverstats user to the docker group
 #                     (root-equivalent) so it can report containers.
 #   --no-docker       agent mode: don't install the Docker helper
+#   --no-root-scan    agent mode: don't install the scan helper. Agent mode
+#                     also installs a small root service that does the disk
+#                     usage scans the dashboard asks for, so a scan can see
+#                     every folder while the agent itself stays unprivileged.
+#                     It only reads names, sizes and dates (never file
+#                     contents), can't write anything, and has no network.
+#                     Without it, scans only see what the agent's user can open.
 #   --ssh-from ADDR   SSH mode: only accept the key from this address/CIDR
 #   --no-updates      agent mode: refuse remote updates from the server (by
 #                     default the "Update agent" button in the UI can replace
@@ -42,6 +49,7 @@ SSH_KEY=""
 SSH_FROM=""
 DOCKER=0
 NO_DOCKER=0
+NO_ROOT_SCAN=0
 INTERVAL="15"
 CA_FILE=""
 UNINSTALL=0
@@ -55,6 +63,8 @@ INITD=/etc/init.d/serverstats-agent
 HELPER_UNIT=/etc/systemd/system/serverstats-docker.service
 HELPER_INITD=/etc/init.d/serverstats-docker
 HELPER_USER=serverstats-docker
+SCAN_UNIT=/etc/systemd/system/serverstats-scan.service
+SCAN_INITD=/etc/init.d/serverstats-scan
 OPENRC_LOG=/var/log/serverstats-agent.log
 AGENT_USER=serverstats-agent   # the agent's unprivileged system user (systemd and OpenRC)
 # Where remote updates are stored (systemd: StateDirectory, maybe under private/).
@@ -63,7 +73,7 @@ SSH_USER=serverstats
 FORCED='command="/usr/local/bin/serverstats-agent --once"'
 
 die() { echo "error: $*" >&2; exit 1; }
-usage() { die "usage: install.sh --url <server url> (--join <join key> [--name name] | --token <token> | --ssh-key '<public key>') [--docker | --no-docker] [--no-updates] [--ssh-from addr] [--interval 15] [--ca-file path] | --uninstall"; }
+usage() { die "usage: install.sh --url <server url> (--join <join key> [--name name] | --token <token> | --ssh-key '<public key>') [--docker | --no-docker] [--no-root-scan] [--no-updates] [--ssh-from addr] [--interval 15] [--ca-file path] | --uninstall"; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -75,6 +85,7 @@ while [ $# -gt 0 ]; do
         --ssh-from) SSH_FROM="${2:-}"; shift 2 ;;
         --docker) DOCKER=1; shift ;;
         --no-docker) NO_DOCKER=1; shift ;;
+        --no-root-scan) NO_ROOT_SCAN=1; shift ;;
         --no-updates) UPDATES=0; shift ;;
         --interval) INTERVAL="${2:-}"; shift 2 ;;
         --ca-file) CA_FILE="${2:-}"; shift 2 ;;
@@ -136,12 +147,17 @@ if [ "$UNINSTALL" -eq 1 ]; then
     fi
     if [ "$INIT" = systemd ]; then
         systemctl disable --now serverstats-docker 2>/dev/null || true
+        systemctl disable --now serverstats-scan 2>/dev/null || true
     fi
     if [ -f "$HELPER_INITD" ]; then
         rc-service serverstats-docker stop 2>/dev/null || true
         rc-update del serverstats-docker default 2>/dev/null || true
     fi
-    rm -rf "$BIN" "$ENV_FILE" "$UNIT" "$DROPIN_DIR" "$INITD" "$HELPER_UNIT" "$HELPER_INITD" $STATE_DIRS
+    if [ -f "$SCAN_INITD" ]; then
+        rc-service serverstats-scan stop 2>/dev/null || true
+        rc-update del serverstats-scan default 2>/dev/null || true
+    fi
+    rm -rf "$BIN" "$ENV_FILE" "$UNIT" "$DROPIN_DIR" "$INITD" "$HELPER_UNIT" "$HELPER_INITD" "$SCAN_UNIT" "$SCAN_INITD" $STATE_DIRS
     [ "$INIT" = systemd ] && systemctl daemon-reload
     if user_exists "$SSH_USER"; then
         AK="$(user_home "$SSH_USER")/.ssh/authorized_keys"
@@ -382,15 +398,71 @@ EOF
         rm -f "$HELPER_UNIT"
     fi
 
+    # Scan helper: runs as root so disk usage scans can see every folder, but
+    # only with the capability to read directories and files (not to write or
+    # change anything), a read-only filesystem, no network, and hard resource
+    # limits so a scan can't take the host down. It runs the installed code,
+    # never a remote update, and only the agent's group can reach its socket.
+    if [ "$NO_ROOT_SCAN" -eq 0 ]; then
+        cat > "$SCAN_UNIT" <<'EOF'
+[Unit]
+Description=ServerStats scan helper (read-only disk usage scans as root for the agent)
+
+[Service]
+ExecStart=/usr/local/bin/serverstats-agent --scan-helper /run/serverstats-scan/scan.sock
+User=root
+Group=serverstats-agent
+RuntimeDirectory=serverstats-scan
+RuntimeDirectoryMode=0750
+Restart=always
+RestartSec=5
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateDevices=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+MemoryMax=512M
+TasksMax=32
+OOMScoreAdjust=500
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=20
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    else
+        systemctl disable --now serverstats-scan >/dev/null 2>&1 || true
+        rm -f "$SCAN_UNIT"
+    fi
+
     systemctl daemon-reload
     if [ "$HELPER" -eq 1 ]; then
         systemctl enable serverstats-docker >/dev/null 2>&1
         systemctl restart serverstats-docker
     fi
+    if [ "$NO_ROOT_SCAN" -eq 0 ]; then
+        systemctl enable serverstats-scan >/dev/null 2>&1
+        systemctl restart serverstats-scan
+    fi
     systemctl enable serverstats-agent >/dev/null 2>&1
     systemctl restart serverstats-agent
     echo "ServerStats agent installed and running. Logs: journalctl -u serverstats-agent -f"
     [ "$HELPER" -eq 1 ] && echo "Docker helper installed: turn Docker stats on or off from this host's page in the dashboard."
+    [ "$NO_ROOT_SCAN" -eq 0 ] && echo "Scan helper installed: disk usage scans from the dashboard can see every folder (read-only, as root)."
     exit 0
 fi
 
@@ -471,8 +543,41 @@ elif [ -f "$HELPER_INITD" ]; then
     rm -f "$HELPER_INITD"
 fi
 
+if [ "$NO_ROOT_SCAN" -eq 0 ]; then
+    cat > "$SCAN_INITD" <<EOF
+#!/sbin/openrc-run
+# ServerStats scan helper (installed by install.sh): read-only disk usage
+# scans as root for the agent, so a scan can see every folder while the agent
+# itself stays unprivileged. It only reads names, sizes and dates.
+name="serverstats-scan"
+description="ServerStats scan helper"
+command="$BIN"
+command_args="--scan-helper /run/serverstats-scan/scan.sock"
+command_user="root:$AGENT_GROUP"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+output_log="/var/log/serverstats-scan.log"
+error_log="/var/log/serverstats-scan.log"
+no_new_privs="yes"
+
+start_pre() {
+    checkpath --directory --owner root:$AGENT_GROUP --mode 0750 /run/serverstats-scan
+    checkpath --file --owner root:$AGENT_GROUP --mode 0640 /var/log/serverstats-scan.log
+}
+EOF
+    chmod 0755 "$SCAN_INITD"
+    rc-update add serverstats-scan default >/dev/null 2>&1 || true
+    rc-service serverstats-scan restart >/dev/null 2>&1 || rc-service serverstats-scan start
+elif [ -f "$SCAN_INITD" ]; then
+    rc-service serverstats-scan stop >/dev/null 2>&1 || true
+    rc-update del serverstats-scan default >/dev/null 2>&1 || true
+    rm -f "$SCAN_INITD"
+fi
+
 rc-update add serverstats-agent default >/dev/null 2>&1 || true
 rc-service serverstats-agent restart >/dev/null 2>&1 || rc-service serverstats-agent start
 echo "ServerStats agent installed and running (OpenRC). Logs: tail -f $OPENRC_LOG"
 [ "$HELPER" -eq 1 ] && echo "Docker helper installed: turn Docker stats on or off from this host's page in the dashboard."
+[ "$NO_ROOT_SCAN" -eq 0 ] && echo "Scan helper installed: disk usage scans from the dashboard can see every folder (read-only, as root)."
 exit 0

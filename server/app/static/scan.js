@@ -300,7 +300,7 @@ function setupScanCard(name, getHost) {
       tile('Folders', fmtNum(result.dirs), `took ${scanTook((result.finished || 0) - (result.started || 0))}`));
 
     view.replaceChildren(
-      h('div', { class: 'scan-when muted', text: `Scan from ${fmtWhen(meta.finished || meta.requested)}${meta.requested_by ? ` · started by ${meta.requested_by}` : ''}` }),
+      h('div', { class: 'scan-when muted', text: `Scan from ${fmtWhen(meta.finished || meta.requested)}${meta.requested_by ? ` · started by ${meta.requested_by}` : ''}${result.root === true ? ' · read with root access' : ''}` }),
       tiles,
       scanNotes(result),
       h('div', { id: 'scan-crumbs', class: 'scan-crumbs' }),
@@ -321,7 +321,7 @@ function setupScanCard(name, getHost) {
     const items = [];
     if (result.unreadable) {
       items.push(h('li', null,
-        `${fmtNum(result.unreadable)} folder${result.unreadable === 1 ? '' : 's'} couldn't be opened by the agent's user, so what's inside isn't counted. `,
+        `${fmtNum(result.unreadable)} folder${result.unreadable === 1 ? '' : 's'} couldn't be opened${result.root === true ? ', even with root access' : " by the agent's user"}, so what's inside isn't counted. `,
         result.unreadable_paths.length ? h('details', null, h('summary', { text: 'Which ones' }),
           h('ul', { class: 'scan-paths' }, ...result.unreadable_paths.map((p) => h('li', { text: p })),
             result.unreadable > result.unreadable_paths.length ? h('li', { class: 'muted', text: `…and ${fmtNum(result.unreadable - result.unreadable_paths.length)} more` }) : null)) : null));
@@ -331,9 +331,12 @@ function setupScanCard(name, getHost) {
         h('span', { class: 'scan-mono', text: result.skipped_mounts.slice(0, 8).join(', ') + (result.skipped_mounts.length > 8 ? ', …' : '') }),
         '. Tick “Include other filesystems” to scan them too.'));
     }
+    if (result.root === false && !result.windows) {
+      items.push(h('li', { class: 'is-warn', text: "This scan ran without root access, so folders only root can open aren't counted. Re-run this host's install command to add the scan helper, which does the scanning as root (read-only)." }));
+    }
     const root = /^(\/|[A-Za-z]:[\\/]?)$/.test(result.path);
     if (result.fs && root && !result.cross_fs && result.fs.used > result.alloc * 1.05 + (1 << 28)) {
-      items.push(h('li', { text: `The filesystem reports ${fmtBytes(result.fs.used)} used but ${fmtBytes(result.alloc)} was found in files. The difference is usually folders the agent can't open, filesystem metadata and journals, or deleted files that are still held open.` }));
+      items.push(h('li', { text: `The filesystem reports ${fmtBytes(result.fs.used)} used but ${fmtBytes(result.alloc)} was found in files. The difference is usually ${result.root === true ? '' : "folders the agent can't open, "}filesystem metadata and journals, or deleted files that are still held open.` }));
     }
     if (result.keep_min > 0) {
       items.push(h('li', { text: `Folders and files under ${fmtBytes(result.keep_min)} are grouped as “smaller items”. Totals include them.` }));

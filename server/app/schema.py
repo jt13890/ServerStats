@@ -320,6 +320,7 @@ def normalize_scan(raw) -> dict:
         "finished": _opt(raw.get("finished")),
         "cross_fs": raw.get("cross_fs") is True,
         "windows": raw.get("windows") is True,
+        "root": raw.get("root") if isinstance(raw.get("root"), bool) else None,  # None: not known (Windows, older agent)
         "alloc": _size(raw.get("alloc")),
         "apparent": _size(raw.get("apparent")),
         "files": _size(raw.get("files")),

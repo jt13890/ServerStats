@@ -23,7 +23,7 @@ from .schema import normalize, normalize_scan
 from .ssh_poller import AGENT_SCRIPT, SSHPoller, load_or_create_key
 from .store import Store
 
-VERSION = "1.13.0"
+VERSION = "1.13.1"
 STATIC = Path(__file__).parent / "static"
 INSTALL_SH = AGENT_SCRIPT.parent / "install.sh"
 INSTALL_PS1 = AGENT_SCRIPT.parent / "install.ps1"
