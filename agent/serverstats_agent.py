@@ -45,7 +45,7 @@ IS_WINDOWS = sys.platform == "win32"
 if not IS_WINDOWS:
     import pwd
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 
 if IS_WINDOWS:
     CLK_TCK = 10000000  # Windows process times are 100 ns FILETIME ticks
@@ -1720,7 +1720,9 @@ def _post(opener, url, token, payload, timeout=15):
 # proxy). Nothing is scanned unless someone asks, and the agent only reads
 # names, sizes and dates: never file contents. It runs as the agent's own
 # unprivileged user, so folders that user can't open are counted and reported
-# as unreadable rather than skipped silently.
+# as unreadable rather than skipped silently. Where install.sh has set up the
+# root scan helper (below), the agent asks that to do the walking instead, so
+# nothing on the disk is out of reach; the agent itself stays unprivileged.
 #
 # What comes back is small enough to keep forever: a tree holding only the
 # folders and files of 256 KiB or more (smaller ones are folded into a
@@ -2078,7 +2080,7 @@ class _Scan(object):
             "alloc": self.alloc, "apparent": self.apparent, "files": self.files, "dirs": self.dirs + 1,
             "links": self.links, "unreadable": self.unreadable,
             "unreadable_paths": self.unreadable_paths, "skipped_mounts": self.skipped_mounts,
-            "truncated": self.truncated, "notes": notes, "fs": self._usage(),
+            "truncated": self.truncated, "notes": notes, "fs": self._usage(), "root": _is_root(),
             "tree": tree, "exts": rows,
             "top": [[_clean(p), a, ap, m] for a, ap, p, m in sorted(self.top, reverse=True)],
         }
@@ -2173,15 +2175,13 @@ class _Scanner(object):
             pass
         last = [time.monotonic()]
 
-        def progress(scan, force=False):
+        def post_progress(info, force=False):
             now = time.monotonic()
             if not force and now - last[0] < SCAN_PROGRESS_SECONDS:
                 return
             last[0] = now
             try:
-                reply = _post(opener, url, token, {"scan_progress": {
-                    "id": sid, "files": scan.files, "dirs": scan.dirs, "bytes": scan.alloc,
-                    "unreadable": scan.unreadable, "current": _clean(scan.current)[:300]}})
+                reply = _post(opener, url, token, {"scan_progress": dict(_progress_info(info), id=sid)})
                 if reply.get("cancel"):
                     stop.set()
             except Exception:
@@ -2191,10 +2191,18 @@ class _Scanner(object):
         try:
             if not os.path.isabs(path):
                 raise ValueError("the path must be absolute")
-            scan = _Scan(path, cross_fs, stop, progress)
-            progress(scan, force=True)  # tells the server we're on it, so it stops offering the request
-            tree = scan.run()
-            payload["result"] = scan.result(tree, started, time.time())
+            post_progress({"current": path}, force=True)  # tells the server we're on it, so it stops offering the request
+            via = _scan_via_helper(path, cross_fs, stop, post_progress)
+            if via is None:  # no root helper on this host: scan as the agent's own user
+                scan = _Scan(path, cross_fs, stop, lambda s, force=False: post_progress(_scan_info(s), force))
+                tree = scan.run()
+                payload["result"] = scan.result(tree, started, time.time())
+            elif via[0] == "result":
+                payload["result"] = via[1]
+            elif via[0] == "cancelled":
+                payload["cancelled"] = True
+            else:
+                payload["error"] = via[1]
         except _Cancelled:
             payload["cancelled"] = True
         except Exception as e:
@@ -2212,6 +2220,251 @@ class _Scanner(object):
             time.sleep(5 * (attempt + 1))
         print("disk scan %d finished%s" % (sid, " (cancelled)" if payload.get("cancelled") else
                                          " with an error" if payload.get("error") else ""), flush=True)
+
+
+def _scan_info(scan):
+    return {"files": scan.files, "dirs": scan.dirs, "bytes": scan.alloc,
+            "unreadable": scan.unreadable, "current": scan.current}
+
+
+def _progress_info(info):
+    """A progress report with only plain numbers and a short string, whoever produced it."""
+    def num(v):
+        return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+    return {"files": num(info.get("files")), "dirs": num(info.get("dirs")), "bytes": num(info.get("bytes")),
+            "unreadable": num(info.get("unreadable")), "current": _clean(str(info.get("current") or ""))[:300]}
+
+
+# -- the root scan helper ------------------------------------------------------
+#
+# A scan can only count what its user can open, and the agent is deliberately
+# unprivileged. So install.sh also sets up this small second service. It runs
+# the *installed* code (never a remote update) as root, with only the
+# capability to read directories and files it doesn't own (not to write or
+# change anything), no network, and a read-only view of the filesystem. It does
+# one thing: on request, it walks a folder, reading names, sizes and dates. It
+# never opens a file. The agent talks to it over a Unix socket that only the
+# agent's group can reach, much like the Docker helper below. If no helper is
+# installed, the agent scans as itself.
+#
+# Protocol: the client sends one JSON line {"v": 1, "path": "/", "cross_fs": false}.
+# The helper answers with JSON lines: any number of {"progress": {...}}, then
+# one {"result": {...}}, {"cancelled": true} or {"error": "..."}. Closing the
+# connection cancels the scan. One scan runs at a time.
+
+SCAN_HELPER_SOCK = os.environ.get("SERVERSTATS_SCAN_HELPER", "/run/serverstats-scan/scan.sock")
+SCAN_HELPER_PROTOCOL = 1
+SCAN_HELPER_MAX_REPLY = 8 * 1024 * 1024
+SCAN_HELPER_PROGRESS_SECONDS = 2
+SCAN_HELPER_SILENCE = 120  # seconds without a word from the helper before the agent gives up on it
+
+
+def _is_root():
+    """True when this process runs as root; None where that doesn't apply (Windows)."""
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        return None
+
+
+def _scan_request_error(req):
+    """Why a request to the helper isn't acceptable, or None."""
+    if not isinstance(req, dict) or req.get("v") != SCAN_HELPER_PROTOCOL:
+        return "unsupported request: this helper speaks protocol %d (re-run the installer to update it)" % SCAN_HELPER_PROTOCOL
+    path = req.get("path")
+    if not isinstance(path, str) or not 0 < len(path) <= 1024 or not os.path.isabs(path) \
+            or any(ord(c) < 32 for c in path):
+        return "the path must be an absolute folder path"
+    if not isinstance(req.get("cross_fs"), bool):
+        return "cross_fs must be true or false"
+    return None
+
+
+class _ScanHelper(object):
+    def __init__(self, path):
+        self.path = path
+        self.server = None
+        self.busy = threading.Lock()
+
+    def bind(self):
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+        old = os.umask(0o117)  # created as 0660 from the start: the agent's group and nobody else
+        try:
+            self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.server.bind(self.path)
+        finally:
+            os.umask(old)
+        os.chmod(self.path, 0o660)
+        self.server.listen(4)
+
+    def serve_forever(self):
+        while True:
+            try:
+                conn, _ = self.server.accept()
+            except OSError:
+                return  # closed
+            threading.Thread(target=self._handle, args=(conn,), name="scan-client", daemon=True).start()
+
+    def close(self):
+        try:
+            self.server.close()
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _send(conn, obj):
+        conn.sendall(json.dumps(obj, separators=(",", ":")).encode() + b"\n")
+
+    def _handle(self, conn):
+        try:
+            conn.settimeout(10)
+            line = b""
+            while b"\n" not in line:
+                if len(line) >= 4096:
+                    self._send(conn, {"error": "request too long"})
+                    return
+                chunk = conn.recv(4096 - len(line))
+                if not chunk:
+                    return
+                line += chunk
+            try:
+                req = json.loads(line.split(b"\n", 1)[0].decode("utf-8"))
+            except ValueError:
+                self._send(conn, {"error": "unreadable request"})
+                return
+            why = _scan_request_error(req)
+            if why:
+                self._send(conn, {"error": why})
+                return
+            if not self.busy.acquire(False):
+                self._send(conn, {"error": "another scan is already running on this host"})
+                return
+            try:
+                conn.settimeout(None)
+                self._scan(conn, req["path"], req["cross_fs"])
+            finally:
+                self.busy.release()
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)  # also wakes the thread waiting for a cancel
+            except OSError:
+                pass
+            conn.close()
+
+    def _scan(self, conn, path, cross_fs):
+        stop = threading.Event()
+
+        def watch():  # the client hanging up cancels the scan
+            try:
+                conn.recv(1)
+            except OSError:
+                pass
+            stop.set()
+
+        threading.Thread(target=watch, name="scan-watch", daemon=True).start()
+        last = [0.0]
+
+        def progress(scan, force=False):
+            now = time.monotonic()
+            if not force and now - last[0] < SCAN_HELPER_PROGRESS_SECONDS:
+                return
+            last[0] = now
+            try:
+                self._send(conn, {"progress": _scan_info(scan)})
+            except OSError:
+                stop.set()
+
+        try:
+            os.nice(10)
+        except (AttributeError, OSError):
+            pass
+        try:
+            started = time.time()
+            scan = _Scan(path, cross_fs, stop, progress)
+            progress(scan, force=True)
+            tree = scan.run()
+            reply = {"result": scan.result(tree, started, time.time())}
+        except _Cancelled:
+            reply = {"cancelled": True}
+        except Exception as e:
+            reply = {"error": _clean("%s: %s" % (type(e).__name__, e))[:300]}
+        try:
+            conn.settimeout(120)
+            self._send(conn, reply)
+        except OSError:
+            pass
+
+
+def serve_scan_helper(path):
+    helper = _ScanHelper(path)
+    helper.bind()
+    print("serverstats scan helper %s listening on %s (running as uid %s)" % (VERSION, path, os.geteuid()), flush=True)
+    helper.serve_forever()
+
+
+def _scan_via_helper(path, cross_fs, stop, on_progress):
+    """Have the root scan helper scan `path`.
+
+    Returns ("result", dict), ("cancelled", None) or ("error", message), or None
+    when there is no helper this agent can reach (the caller then scans itself).
+    """
+    if IS_WINDOWS or not os.path.exists(SCAN_HELPER_SOCK):
+        return None
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(5)
+        try:
+            sock.connect(SCAN_HELPER_SOCK)
+        except OSError:
+            return None  # not running, or not for us (no permission)
+        sock.sendall(json.dumps({"v": SCAN_HELPER_PROTOCOL, "path": path, "cross_fs": cross_fs}).encode() + b"\n")
+        sock.settimeout(1.0)
+        buf, quiet = bytearray(), time.monotonic()
+        while True:
+            if stop.is_set():
+                return ("cancelled", None)
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                if time.monotonic() - quiet > SCAN_HELPER_SILENCE:
+                    return ("error", "the scan helper stopped responding")
+                continue
+            if not chunk:
+                return ("error", "the scan helper closed the connection without a result")
+            quiet = time.monotonic()
+            buf += chunk
+            if len(buf) > SCAN_HELPER_MAX_REPLY:
+                return ("error", "the scan helper's reply was too large")
+            while True:
+                nl = buf.find(b"\n")
+                if nl < 0:
+                    break
+                line = bytes(buf[:nl])
+                del buf[:nl + 1]
+                try:
+                    msg = json.loads(line.decode("utf-8", "replace"))
+                except ValueError:
+                    return ("error", "the scan helper sent a reply that couldn't be read")
+                if not isinstance(msg, dict):
+                    return ("error", "the scan helper sent an unexpected reply")
+                if isinstance(msg.get("progress"), dict):
+                    on_progress(msg["progress"])
+                elif isinstance(msg.get("result"), dict):
+                    return ("result", msg["result"])
+                elif msg.get("cancelled") is True:
+                    return ("cancelled", None)
+                elif "error" in msg:
+                    return ("error", _clean(str(msg["error"]))[:300])
+    except OSError as e:
+        return ("error", _clean("couldn't talk to the scan helper: %s" % e)[:300])
+    finally:
+        sock.close()
 
 
 _SCANNER = _Scanner()
@@ -2656,6 +2909,8 @@ def main():
     ap.add_argument("--once", action="store_true", help="print one JSON sample to stdout and exit")
     ap.add_argument("--docker-helper", nargs="?", const=DOCKER_HELPER_SOCK, metavar="SOCKET",
                     help="run the Docker helper service (needs Docker access) on SOCKET")
+    ap.add_argument("--scan-helper", nargs="?", const=SCAN_HELPER_SOCK, metavar="SOCKET",
+                    help="run the root scan helper (read-only disk usage scans for the agent) on SOCKET")
     ap.add_argument("--enroll", metavar="NAME", help="join the server as NAME using SERVERSTATS_JOIN_KEY, print 'name token'")
     ap.add_argument("--url", default=env("SERVERSTATS_URL"), help="server base URL, e.g. https://stats.example.com")
     ap.add_argument("--token", default=env("SERVERSTATS_TOKEN"), help="per-host token from the server config")
@@ -2673,6 +2928,10 @@ def main():
     if args.docker_helper:
         # Always the installed code: the helper never runs a remote update.
         serve_docker_helper(args.docker_helper)
+        return
+    if args.scan_helper:
+        # Always the installed code, like the Docker helper: never a remote update.
+        serve_scan_helper(args.scan_helper)
         return
     if args.enroll:
         enroll(args.url, args.enroll, args.ca_file)

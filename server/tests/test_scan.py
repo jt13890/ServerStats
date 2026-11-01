@@ -346,3 +346,292 @@ def test_scan_cap_per_host(client, monkeypatch):
     client.post(f"/api/hosts/alpha/scans/{sid}/cancel", headers=USER)
     r = client.post("/api/hosts/alpha/scans", json={"path": "/"}, headers=USER)
     assert r.status_code == 409 and "delete some" in r.json()["detail"]
+
+
+# -- the root scan helper -------------------------------------------------------------
+
+import builtins
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+AGENT = Path(__file__).resolve().parents[2] / "agent"
+
+
+@pytest.fixture()
+def helper(monkeypatch):
+    """A scan helper listening on a short temp socket (unix socket paths are length-limited)."""
+    import agent_collector as ac
+
+    d = tempfile.mkdtemp(prefix="ss")
+    h = ac._ScanHelper(os.path.join(d, "s.sock"))
+    h.bind()
+    threading.Thread(target=h.serve_forever, daemon=True).start()
+    monkeypatch.setattr(ac, "SCAN_HELPER_SOCK", h.path)
+    yield h
+    h.close()
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def ask(path, **kw):
+    """Send a request line to the helper by hand and read its first reply line."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect(path)
+    s.sendall(kw["raw"])
+    data = b""
+    while b"\n" not in data:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    s.close()
+    return json.loads(data.split(b"\n")[0])
+
+
+def slow_visit(monkeypatch):
+    """Make every directory entry take a moment, so a scan stays in flight long enough to interrupt."""
+    import agent_collector as ac
+
+    real = ac._Scan._visit
+
+    def slow(self, entry, frame, stack):
+        time.sleep(0.002)
+        return real(self, entry, frame, stack)
+
+    monkeypatch.setattr(ac._Scan, "_visit", slow)
+
+
+def test_helper_gives_the_same_answer_as_scanning_directly(tree, helper):
+    import agent_collector as ac
+
+    progress = []
+    kind, got = ac._scan_via_helper(str(tree), False, threading.Event(), progress.append)
+    assert kind == "result"
+    _, direct = run_scan(tree)
+    assert (got["alloc"], got["files"], got["dirs"]) == (direct["alloc"], direct["files"], direct["dirs"])
+    assert got["tree"]["s"] == got["alloc"]
+    assert got["root"] == (os.geteuid() == 0)  # the result says who did the reading
+    assert progress and set(progress[0]) >= {"files", "dirs", "bytes", "unreadable", "current"}
+    assert oct(os.stat(helper.path).st_mode & 0o777) == "0o660"  # the agent's group and nobody else
+
+
+def test_helper_cancel_stops_the_scan_and_frees_it(tmp_path, helper, monkeypatch):
+    import agent_collector as ac
+
+    for i in range(1500):
+        write(str(tmp_path / f"f{i}.bin"), 10)
+    slow_visit(monkeypatch)
+    stop = threading.Event()
+    started = time.monotonic()
+    kind, _ = ac._scan_via_helper(str(tmp_path), False, stop, lambda info: stop.set())
+    assert kind == "cancelled" and time.monotonic() - started < 3  # not the ~3 s a full scan takes
+    # the helper notices the hang-up and takes the next request
+    for _ in range(40):
+        again = ac._scan_via_helper(str(tmp_path), False, threading.Event(), lambda i: None)
+        if again and again[0] != "error":
+            break
+        time.sleep(0.1)
+    assert again[0] in ("result", "cancelled")
+
+
+def test_helper_runs_one_scan_at_a_time(tmp_path, helper, monkeypatch):
+    import agent_collector as ac
+
+    for i in range(1200):
+        write(str(tmp_path / f"f{i}.bin"), 10)
+    slow_visit(monkeypatch)
+    first_stop = threading.Event()
+    first = []
+    t = threading.Thread(target=lambda: first.append(ac._scan_via_helper(str(tmp_path), False, first_stop, lambda i: None)))
+    t.start()
+    time.sleep(0.5)
+    kind, why = ac._scan_via_helper(str(tmp_path), False, threading.Event(), lambda i: None)
+    assert kind == "error" and "already running" in why
+    first_stop.set()
+    t.join(5)
+
+
+@pytest.mark.parametrize("raw", [
+    b"not json\n",
+    b"[]\n",
+    b'{"v":1,"path":"relative/dir","cross_fs":false}\n',
+    b'{"v":1,"path":"/a\\u0000b","cross_fs":false}\n',
+    b'{"v":1,"path":"/a\\nb","cross_fs":false}\n',
+    b'{"v":2,"path":"/","cross_fs":false}\n',
+    b'{"v":1,"path":"/","cross_fs":"yes"}\n',
+    b'{"v":1,"path":5,"cross_fs":false}\n',
+    b'{"v":1,"path":"/' + b"x" * 2000 + b'","cross_fs":false}\n',
+    b"x" * 6000,  # a request that never ends
+])
+def test_helper_rejects_bad_requests_and_keeps_serving(tree, helper, raw):
+    import agent_collector as ac
+
+    assert "error" in ask(helper.path, raw=raw)
+    kind, got = ac._scan_via_helper(str(tree), False, threading.Event(), lambda i: None)
+    assert kind == "result" and got["files"] > 0
+
+
+def test_scanning_never_opens_the_files_it_measures(tree, monkeypatch):
+    real_open = builtins.open
+
+    def guarded(path, *a, **k):
+        if str(path).startswith(str(tree)):
+            raise AssertionError("opened a scanned file: %s" % path)
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", guarded)
+    _, result = run_scan(tree)
+    assert result["files"] > 0
+
+
+def test_no_helper_means_the_agent_scans_for_itself(tree, tmp_path, monkeypatch):
+    import agent_collector as ac
+
+    monkeypatch.setattr(ac, "SCAN_HELPER_SOCK", str(tmp_path / "missing.sock"))
+    assert ac._scan_via_helper(str(tree), False, threading.Event(), lambda i: None) is None
+    stale = tmp_path / "stale.sock"  # a socket file with nothing listening, or one we may not use
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(str(stale))
+    s.close()
+    monkeypatch.setattr(ac, "SCAN_HELPER_SOCK", str(stale))
+    assert ac._scan_via_helper(str(tree), False, threading.Event(), lambda i: None) is None
+
+
+def posted_through_scanner(monkeypatch, tree):
+    """Run the agent's scan flow end to end with the network stubbed; returns what it would have sent."""
+    import agent_collector as ac
+
+    sent = []
+    monkeypatch.setattr(ac, "_post", lambda opener, url, token, payload, timeout=15: sent.append(payload) or {})
+    scanner = ac._Scanner()
+    scanner.maybe_start(None, "http://x", "t", {"id": 7, "path": str(tree), "cross_fs": False})
+    scanner.thread.join(20)
+    results = [p["scan_result"] for p in sent if "scan_result" in p]
+    assert len(results) == 1 and results[0]["id"] == 7
+    assert any("scan_progress" in p and p["scan_progress"]["id"] == 7 for p in sent)
+    return results[0]
+
+
+def posted_through_scanner_raw(monkeypatch, tree):
+    import agent_collector as ac
+
+    sent = []
+    monkeypatch.setattr(ac, "_post", lambda opener, url, token, payload, timeout=15: sent.append(payload) or {})
+    scanner = ac._Scanner()
+    scanner.maybe_start(None, "http://x", "t", {"id": 9, "path": str(tree), "cross_fs": False})
+    scanner.thread.join(20)
+    return [p["scan_result"] for p in sent if "scan_result" in p][0]
+
+
+def test_agent_hands_the_scan_to_the_helper_when_there_is_one(tree, helper, monkeypatch):
+    import agent_collector as ac
+
+    seen = []
+    real = ac._scan_via_helper
+    monkeypatch.setattr(ac, "_scan_via_helper", lambda *a, **k: seen.append(1) or real(*a, **k))
+    result = posted_through_scanner(monkeypatch, tree)["result"]
+    assert seen and result["files"] > 0 and result["root"] == (os.geteuid() == 0)
+
+
+def test_agent_scans_itself_when_there_is_no_helper(tree, tmp_path, monkeypatch):
+    import agent_collector as ac
+
+    monkeypatch.setattr(ac, "SCAN_HELPER_SOCK", str(tmp_path / "none.sock"))
+    result = posted_through_scanner(monkeypatch, tree)["result"]
+    assert result["files"] > 0 and result["root"] == (os.geteuid() == 0)
+
+
+def test_a_helper_error_is_reported_not_quietly_retried_without_root(tree, helper, monkeypatch):
+    import agent_collector as ac
+
+    monkeypatch.setattr(ac, "_scan_via_helper", lambda *a, **k: ("error", "the helper said no"))
+    direct = []
+    monkeypatch.setattr(ac._Scan, "run", lambda self: direct.append(1))  # would mean it scanned for itself
+    payload = posted_through_scanner_raw(monkeypatch, tree)
+    assert payload["error"] == "the helper said no" and "result" not in payload and not direct
+
+
+def test_helper_with_a_different_protocol_says_so(helper, monkeypatch):
+    import agent_collector as ac
+
+    monkeypatch.setattr(ac, "SCAN_HELPER_PROTOCOL", 99)  # a helper from a different release
+    reply = ask(helper.path, raw=b'{"v":1,"path":"/","cross_fs":false}\n')
+    assert "unsupported request" in reply["error"] and "re-run the installer" in reply["error"]
+
+
+def test_helper_process_starts_from_the_command_line(tree):
+    import agent_collector as ac
+
+    d = tempfile.mkdtemp(prefix="ss")
+    sock = os.path.join(d, "s.sock")
+    p = subprocess.Popen([sys.executable, str(AGENT / "serverstats_agent.py"), "--scan-helper", sock],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        for _ in range(100):
+            if os.path.exists(sock):
+                break
+            time.sleep(0.05)
+        old, ac.SCAN_HELPER_SOCK = ac.SCAN_HELPER_SOCK, sock
+        try:
+            kind, got = ac._scan_via_helper(str(tree), False, threading.Event(), lambda i: None)
+        finally:
+            ac.SCAN_HELPER_SOCK = old
+        assert kind == "result" and got["files"] > 0
+    finally:
+        p.terminate()
+        p.wait(5)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_server_keeps_only_a_real_root_flag():
+    from app.schema import normalize_scan
+
+    _, result = run_scan(Path(__file__).parent)
+    for given, kept in ((True, True), (False, False), ("yes", None), (1, None), (None, None)):
+        assert normalize_scan(dict(result, root=given))["root"] is kept
+
+
+# -- the installer -----------------------------------------------------------------------
+
+INSTALL = (AGENT / "install.sh").read_text()
+
+
+def scan_unit_text():
+    start = INSTALL.index('cat > "$SCAN_UNIT" <<\'EOF\'') + len('cat > "$SCAN_UNIT" <<\'EOF\'\n')
+    return INSTALL[start:INSTALL.index("\nEOF\n", start) + 1]
+
+
+def test_installer_is_valid_shell():
+    assert subprocess.run(["sh", "-n", str(AGENT / "install.sh")], capture_output=True).returncode == 0
+
+
+def test_scan_helper_unit_is_locked_down():
+    unit = scan_unit_text()
+    for needed in ("CapabilityBoundingSet=CAP_DAC_READ_SEARCH", "NoNewPrivileges=yes", "ProtectSystem=strict",
+                   "PrivateNetwork=yes", "RestrictAddressFamilies=AF_UNIX", "MemoryMax=", "TasksMax=",
+                   "OOMScoreAdjust=", "IOSchedulingClass=idle", "Group=serverstats-agent", "--scan-helper"):
+        assert needed in unit, needed
+    # nothing that would let it write or reach out: no extra capabilities, no writable paths, no network
+    assert "ReadWritePaths" not in unit and "AmbientCapabilities" not in unit and "PrivateNetwork=no" not in unit
+    assert unit.count("CapabilityBoundingSet=") == 1
+
+
+@pytest.mark.skipif(not shutil.which("systemd-analyze"), reason="needs systemd-analyze")
+def test_scan_helper_unit_is_accepted_by_systemd(tmp_path):
+    f = tmp_path / "serverstats-scan.service"
+    f.write_text(scan_unit_text())
+    out = subprocess.run(["systemd-analyze", "verify", str(f)], capture_output=True, text=True)
+    problems = [l for l in (out.stdout + out.stderr).splitlines()
+                if any(w in l for w in ("Unknown key", "Unknown lvalue", "Failed to parse", "Invalid"))]
+    assert not problems, problems
+
+
+def test_installer_can_opt_out_and_uninstall_removes_the_helper():
+    assert "--no-root-scan) NO_ROOT_SCAN=1" in INSTALL
+    uninstall = INSTALL[INSTALL.index('if [ "$UNINSTALL" -eq 1 ]'):INSTALL.index("MODES=0")]
+    assert "serverstats-scan" in uninstall and '"$SCAN_UNIT"' in uninstall and '"$SCAN_INITD"' in uninstall
+    assert "--no-root-scan" in INSTALL.split("set -eu")[0]  # documented in the header
